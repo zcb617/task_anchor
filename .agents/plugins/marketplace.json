@@ -1,0 +1,20 @@
+{
+  "name": "task-anchor-local",
+  "interface": {
+    "displayName": "Task Anchor Local"
+  },
+  "plugins": [
+    {
+      "name": "task-anchor",
+      "source": {
+        "source": "local",
+        "path": "./plugins/task-anchor"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
