@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Task Anchor 的两个命令 Hook：保存初始指令，压缩后原样注入。"""
+"""Task Anchor Hook：按 task_id 保存任务，并只恢复当前活动任务。"""
 
 from __future__ import annotations
 
@@ -9,10 +9,11 @@ import os
 import re
 import sys
 import tempfile
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-
+from typing import Any, Iterator
 
 SKILL_MARKER = "$task-anchor"
 SKILL_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])\$task-anchor(?![A-Za-z0-9_-])")
@@ -20,15 +21,55 @@ POST_COMPACT = "PostCompact"
 USER_PROMPT_SUBMIT = "UserPromptSubmit"
 AUDIT_LOG_RELATIVE_PATH = Path("audit") / "events.jsonl"
 WORKSPACE_SHA256_FIELD = "workspace_sha256"
+SESSION_KEY_FIELD = "session_key"
+TASK_STATUS_ACTIVE = 1
+TASK_STATUS_CLOSED = 0
+CLOSED_REASON_SUPERSEDED = "superseded_by_new_task"
+SCHEMA_VERSION = 2
+
+
+class StorageError(RuntimeError):
+    """任务存储不完整或不可信。"""
+
+
+class LockUnavailable(StorageError):
+    """同一会话正在切换任务。"""
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def session_key(session_id: str) -> str:
+    return sha256_bytes(session_id.encode("utf-8"))
+
+
 def session_directory(data_root: Path, session_id: str) -> Path:
-    session_key = sha256_bytes(session_id.encode("utf-8"))
-    return data_root / "sessions" / session_key
+    return data_root / "sessions" / session_key(session_id)
+
+
+def tasks_directory(data_root: Path, session_id: str) -> Path:
+    return session_directory(data_root, session_id) / "tasks"
+
+
+def current_task_path(data_root: Path, session_id: str) -> Path:
+    return session_directory(data_root, session_id) / "current_task.json"
+
+
+def task_directory(data_root: Path, session_id: str, task_id: str) -> Path:
+    return tasks_directory(data_root, session_id) / task_id
+
+
+def task_instruction_path(data_root: Path, session_id: str, task_id: str) -> Path:
+    return task_directory(data_root, session_id, task_id) / "initial_instruction.txt"
+
+
+def task_metadata_path(data_root: Path, session_id: str, task_id: str) -> Path:
+    return task_directory(data_root, session_id, task_id) / "metadata.json"
 
 
 def atomic_write(path: Path, content: bytes) -> None:
@@ -50,22 +91,23 @@ def atomic_write(path: Path, content: bytes) -> None:
             temporary_path.unlink()
 
 
+def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
+    atomic_write(
+        path,
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"),
+    )
+
+
 def warning(message: str) -> dict[str, Any]:
-    return {
-        "continue": True,
-        "systemMessage": message,
-    }
+    return {"continue": True, "systemMessage": message}
 
 
 def read_session_id(data: dict[str, Any]) -> str | None:
     value = data.get("session_id")
-    if isinstance(value, str) and value:
-        return value
-    return None
+    return value if isinstance(value, str) and value else None
 
 
 def workspace_identity(cwd: str) -> str | None:
-    """返回项目身份：Git 根目录优先；非 Git 目录则使用规范化工作目录。"""
     try:
         normalized_cwd = os.path.normcase(os.path.realpath(os.path.abspath(cwd)))
     except (OSError, ValueError):
@@ -86,18 +128,35 @@ def workspace_identity(cwd: str) -> str | None:
 
 
 def read_workspace_sha256(data: dict[str, Any]) -> str | None:
-    """返回项目身份的哈希，不把真实路径写入插件状态或审计。"""
-    value = data.get("cwd")
-    if not isinstance(value, str) or not value.strip():
+    cwd = data.get("cwd")
+    if not isinstance(cwd, str) or not cwd.strip():
         return None
-    identity = workspace_identity(value)
-    if identity is None:
-        return None
-    return sha256_bytes(identity.encode("utf-8"))
+    identity = workspace_identity(cwd)
+    return sha256_bytes(identity.encode("utf-8")) if identity is not None else None
 
 
 def is_sha256_digest(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def canonical_task_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return None
+    return str(parsed) if str(parsed) == value else None
+
+
+def read_json_object(path: Path, message: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StorageError(message) from exc
+    if not isinstance(value, dict):
+        raise StorageError(message)
+    return value
 
 
 def write_audit_event(
@@ -106,34 +165,30 @@ def write_audit_event(
     status: str,
     **details: Any,
 ) -> None:
-    """追加最小审计事件；失败不能影响 Hook 主流程。"""
+    """写入不包含任务正文和真实 session_id 的最小审计记录。"""
     if data_root is None:
         return
 
-    session_id = read_session_id(data)
+    current_session_id = read_session_id(data)
     event_name = data.get("hook_event_name")
     source = data.get("source")
     trigger = data.get("trigger")
-    workspace_sha256 = read_workspace_sha256(data)
     record: dict[str, Any] = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": utc_now(),
         "hook_event_name": event_name if isinstance(event_name, str) else None,
         "source": source if isinstance(source, str) else None,
         "trigger": trigger if isinstance(trigger, str) else None,
-        "session_key": (
-            sha256_bytes(session_id.encode("utf-8"))
-            if session_id is not None
-            else None
+        SESSION_KEY_FIELD: (
+            session_key(current_session_id) if current_session_id is not None else None
         ),
-        "workspace_sha256": workspace_sha256,
+        WORKSPACE_SHA256_FIELD: read_workspace_sha256(data),
         "status": status,
     }
     record.update(details)
-    line = (
-        json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
-    ).encode("utf-8")
+    line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
     audit_path = data_root / AUDIT_LOG_RELATIVE_PATH
-
     try:
         audit_path.parent.mkdir(parents=True, exist_ok=True)
         flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_BINARY", 0)
@@ -150,153 +205,398 @@ def is_explicit_activation(prompt: Any) -> bool:
     return isinstance(prompt, str) and SKILL_PATTERN.search(prompt) is not None
 
 
-def save_initial_instruction(
+def _acquire_lock(handle: Any) -> None:
+    handle.seek(0)
+    if handle.read(1) == b"":
+        handle.seek(0)
+        handle.write(b"\0")
+        handle.flush()
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _release_lock(handle: Any) -> None:
+    handle.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        return
+
+
+@contextmanager
+def session_lock(session_dir: Path) -> Iterator[None]:
+    session_dir.mkdir(parents=True, exist_ok=True)
+    handle = (session_dir / ".task-anchor.lock").open("a+b")
+    try:
+        try:
+            _acquire_lock(handle)
+        except OSError as exc:
+            raise LockUnavailable("Task Anchor 当前任务状态正由另一项操作切换。") from exc
+        try:
+            yield
+        finally:
+            _release_lock(handle)
+    finally:
+        handle.close()
+
+
+def validate_metadata(
+    metadata: dict[str, Any],
+    session_id: str,
+    task_id: str,
+) -> None:
+    if metadata.get("schema_version") != SCHEMA_VERSION:
+        raise StorageError("Task Anchor 的任务元数据版本无效，已停止恢复。")
+    if metadata.get("task_id") != task_id:
+        raise StorageError("Task Anchor 的 task_id 校验失败，已停止恢复。")
+    if metadata.get(SESSION_KEY_FIELD) != session_key(session_id):
+        raise StorageError("Task Anchor 的会话校验失败，已停止恢复。")
+    if not is_sha256_digest(metadata.get("sha256")):
+        raise StorageError("Task Anchor 的任务指令校验值无效，已停止恢复。")
+    if not is_sha256_digest(metadata.get(WORKSPACE_SHA256_FIELD)):
+        raise StorageError("Task Anchor 的既有任务记录没有项目边界绑定，已停止恢复。")
+    if type(metadata.get("status")) is not int or metadata["status"] not in {
+        TASK_STATUS_ACTIVE,
+        TASK_STATUS_CLOSED,
+    }:
+        raise StorageError("Task Anchor 的任务状态无效，已停止恢复。")
+
+
+def read_all_task_metadata(
+    data_root: Path,
+    session_id: str,
+) -> dict[str, dict[str, Any]]:
+    directory = tasks_directory(data_root, session_id)
+    if not directory.exists():
+        return {}
+    if not directory.is_dir():
+        raise StorageError("Task Anchor 的任务目录无效，已拒绝切换任务。")
+
+    records: dict[str, dict[str, Any]] = {}
+    try:
+        entries = list(directory.iterdir())
+    except OSError as exc:
+        raise StorageError("Task Anchor 无法读取既有任务记录。") from exc
+
+    for entry in entries:
+        task_id = canonical_task_id(entry.name)
+        if task_id is None or not entry.is_dir():
+            raise StorageError("Task Anchor 检测到无效任务记录，已拒绝切换任务。")
+        metadata = read_json_object(
+            entry / "metadata.json",
+            "Task Anchor 的既有任务元数据损坏，已拒绝切换任务。",
+        )
+        validate_metadata(metadata, session_id, task_id)
+        records[task_id] = metadata
+    return records
+
+
+def read_current_task_id(data_root: Path, session_id: str) -> str | None:
+    pointer_path = current_task_path(data_root, session_id)
+    if not pointer_path.exists():
+        return None
+    if not pointer_path.is_file():
+        raise StorageError("Task Anchor 的当前任务指针无效，已停止恢复。")
+    pointer = read_json_object(
+        pointer_path,
+        "Task Anchor 的当前任务指针损坏，已停止恢复。",
+    )
+    task_id = canonical_task_id(pointer.get("task_id"))
+    if (
+        pointer.get("schema_version") != SCHEMA_VERSION
+        or pointer.get(SESSION_KEY_FIELD) != session_key(session_id)
+        or task_id is None
+    ):
+        raise StorageError("Task Anchor 的当前任务指针校验失败，已停止恢复。")
+    return task_id
+
+
+def load_task(
+    data: dict[str, Any],
+    data_root: Path,
+    session_id: str,
+    task_id: str,
+) -> tuple[str, dict[str, Any]]:
+    instruction_path = task_instruction_path(data_root, session_id, task_id)
+    metadata_path = task_metadata_path(data_root, session_id, task_id)
+    if not instruction_path.is_file() or not metadata_path.is_file():
+        raise StorageError("Task Anchor 的当前任务记录不完整，已停止恢复。")
+
+    try:
+        instruction_bytes = instruction_path.read_bytes()
+        instruction = instruction_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise StorageError("Task Anchor 无法读取当前任务指令，已停止恢复。") from exc
+
+    metadata = read_json_object(
+        metadata_path,
+        "Task Anchor 的当前任务元数据损坏，已停止恢复。",
+    )
+    validate_metadata(metadata, session_id, task_id)
+    if metadata.get("sha256") != sha256_bytes(instruction_bytes):
+        raise StorageError("Task Anchor 的任务指令 SHA-256 校验失败，已停止恢复。")
+
+    workspace_sha256 = read_workspace_sha256(data)
+    if workspace_sha256 is None:
+        raise StorageError("Task Anchor 无法恢复任务指令：Hook 输入缺少 cwd。")
+    if metadata[WORKSPACE_SHA256_FIELD] != workspace_sha256:
+        raise StorageError("Task Anchor 检测到当前项目与任务锚点不一致，已拒绝跨项目注入。")
+    return instruction, metadata
+
+
+def has_legacy_session_layout(data_root: Path, session_id: str) -> bool:
+    directory = session_directory(data_root, session_id)
+    return any(
+        (directory / filename).exists()
+        for filename in ("initial_instruction.txt", "metadata.json")
+    )
+
+
+def transition_path(data_root: Path, session_id: str) -> Path:
+    return session_directory(data_root, session_id) / "transition.json"
+
+
+def read_pending_transition(
+    data_root: Path,
+    session_id: str,
+) -> dict[str, Any] | None:
+    path = transition_path(data_root, session_id)
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise StorageError("Task Anchor 的任务切换记录无效，已停止处理。")
+
+    transition = read_json_object(
+        path,
+        "Task Anchor 的任务切换记录损坏，已停止处理。",
+    )
+    new_task_id = canonical_task_id(transition.get("new_task_id"))
+    raw_old_task_ids = transition.get("old_task_ids")
+    if not isinstance(raw_old_task_ids, list):
+        raise StorageError("Task Anchor 的任务切换记录校验失败，已停止处理。")
+
+    old_task_ids: list[str] = []
+    for raw_task_id in raw_old_task_ids:
+        task_id = canonical_task_id(raw_task_id)
+        if task_id is None:
+            raise StorageError("Task Anchor 的任务切换记录校验失败，已停止处理。")
+        old_task_ids.append(task_id)
+
+    if (
+        transition.get("schema_version") != SCHEMA_VERSION
+        or transition.get(SESSION_KEY_FIELD) != session_key(session_id)
+        or new_task_id is None
+        or len(set(old_task_ids)) != len(old_task_ids)
+        or new_task_id in old_task_ids
+    ):
+        raise StorageError("Task Anchor 的任务切换记录校验失败，已停止处理。")
+
+    return {
+        **transition,
+        "new_task_id": new_task_id,
+        "old_task_ids": old_task_ids,
+    }
+
+
+def complete_pending_transition(
+    data_root: Path,
+    session_id: str,
+    transition: dict[str, Any],
+) -> list[str]:
+    """在会话锁内完成已持久化的任务切换。"""
+    new_task_id = transition["new_task_id"]
+    assert isinstance(new_task_id, str)
+
+    records = read_all_task_metadata(data_root, session_id)
+    new_metadata = records.get(new_task_id)
+    if new_metadata is None:
+        raise StorageError("Task Anchor 的待激活任务记录缺失，已停止处理。")
+
+    closed_task_ids: list[str] = []
+    for old_task_id, old_metadata in records.items():
+        if old_task_id == new_task_id or old_metadata["status"] == TASK_STATUS_CLOSED:
+            continue
+        closed_metadata = dict(old_metadata)
+        closed_metadata["status"] = TASK_STATUS_CLOSED
+        closed_metadata["closed_at"] = utc_now()
+        closed_metadata["closed_reason"] = CLOSED_REASON_SUPERSEDED
+        atomic_write_json(
+            task_metadata_path(data_root, session_id, old_task_id),
+            closed_metadata,
+        )
+        closed_task_ids.append(old_task_id)
+
+    active_metadata = dict(new_metadata)
+    active_metadata["status"] = TASK_STATUS_ACTIVE
+    active_metadata.pop("transition_state", None)
+    active_metadata["activated_at"] = utc_now()
+    atomic_write_json(
+        task_metadata_path(data_root, session_id, new_task_id),
+        active_metadata,
+    )
+    atomic_write_json(
+        current_task_path(data_root, session_id),
+        {
+            "schema_version": SCHEMA_VERSION,
+            SESSION_KEY_FIELD: session_key(session_id),
+            "task_id": new_task_id,
+            "updated_at": utc_now(),
+        },
+    )
+    try:
+        transition_path(data_root, session_id).unlink()
+    except OSError as exc:
+        raise StorageError("Task Anchor 无法完成任务切换清理，已停止处理。") from exc
+    return closed_task_ids
+
+
+def start_new_task(
     data: dict[str, Any],
     data_root: Path | None,
 ) -> dict[str, Any] | None:
     prompt = data.get("prompt")
     if not is_explicit_activation(prompt):
         return None
+    assert isinstance(prompt, str)
 
     if data_root is None:
-        return warning("Task Anchor 无法保存任务指令：Hook 未提供 PLUGIN_DATA。")
-
-    session_id = read_session_id(data)
-    if session_id is None:
+        return warning("Task Anchor 无法创建任务：Hook 未提供 PLUGIN_DATA。")
+    current_session_id = read_session_id(data)
+    if current_session_id is None:
         write_audit_event(data_root, data, "activation_missing_session_id")
-        return warning("Task Anchor 无法保存任务指令：Hook 输入缺少 session_id。")
-
+        return warning("Task Anchor 无法创建任务：Hook 输入缺少 session_id。")
     workspace_sha256 = read_workspace_sha256(data)
     if workspace_sha256 is None:
         write_audit_event(data_root, data, "activation_missing_cwd")
+        return warning("Task Anchor 无法创建任务：Hook 输入缺少 cwd，无法绑定项目边界。")
+
+    write_audit_event(data_root, data, "activation_received")
+    session_dir = session_directory(data_root, current_session_id)
+    new_task_id = str(uuid.uuid4())
+    instruction_bytes = prompt.encode("utf-8")
+    new_metadata = {
+        "schema_version": SCHEMA_VERSION,
+        "task_id": new_task_id,
+        SESSION_KEY_FIELD: session_key(current_session_id),
+        "sha256": sha256_bytes(instruction_bytes),
+        WORKSPACE_SHA256_FIELD: workspace_sha256,
+        "created_at": utc_now(),
+        "status": TASK_STATUS_ACTIVE,
+    }
+    closed_task_ids: list[str] = []
+    recovered_task_id: str | None = None
+    recovered_closed_task_ids: list[str] = []
+
+    try:
+        with session_lock(session_dir):
+            pending_transition = read_pending_transition(data_root, current_session_id)
+            if pending_transition is not None:
+                recovered_task_id = pending_transition["new_task_id"]
+                assert isinstance(recovered_task_id, str)
+                recovered_closed_task_ids = complete_pending_transition(
+                    data_root,
+                    current_session_id,
+                    pending_transition,
+                )
+
+            existing = read_all_task_metadata(data_root, current_session_id)
+            new_directory = task_directory(data_root, current_session_id, new_task_id)
+            if new_directory.exists():
+                raise StorageError("Task Anchor 生成的任务 ID 已存在，请重试。")
+
+            staged_metadata = dict(new_metadata)
+            staged_metadata["status"] = TASK_STATUS_CLOSED
+            staged_metadata["transition_state"] = "pending_activation"
+            atomic_write(
+                task_instruction_path(data_root, current_session_id, new_task_id),
+                instruction_bytes,
+            )
+            atomic_write_json(
+                task_metadata_path(data_root, current_session_id, new_task_id),
+                staged_metadata,
+            )
+            atomic_write_json(
+                transition_path(data_root, current_session_id),
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    SESSION_KEY_FIELD: session_key(current_session_id),
+                    "new_task_id": new_task_id,
+                    "old_task_ids": [
+                        task_id
+                        for task_id, metadata in existing.items()
+                        if metadata["status"] == TASK_STATUS_ACTIVE
+                    ],
+                    "created_at": utc_now(),
+                },
+            )
+            transition = read_pending_transition(data_root, current_session_id)
+            if transition is None:
+                raise StorageError("Task Anchor 的任务切换记录缺失，已停止处理。")
+            closed_task_ids = complete_pending_transition(
+                data_root,
+                current_session_id,
+                transition,
+            )
+    except LockUnavailable:
+        write_audit_event(data_root, data, "activation_lock_unavailable")
+        return warning("Task Anchor 当前任务状态正由另一项操作切换，请稍后重新调用。")
+    except (OSError, StorageError):
+        write_audit_event(data_root, data, "activation_write_failed")
         return warning(
-            "Task Anchor 无法保存任务指令：Hook 输入缺少 cwd，无法绑定项目边界。"
+            "Task Anchor 无法确认新任务已建立；请重新显式调用 $task-anchor。"
         )
 
-    write_audit_event(
-        data_root,
-        data,
-        "activation_received",
-        anchor_workspace_sha256=workspace_sha256,
-    )
-
-    session_dir = session_directory(data_root, session_id)
-    instruction_path = session_dir / "initial_instruction.txt"
-    metadata_path = session_dir / "metadata.json"
-
-    if instruction_path.exists() or metadata_path.exists():
-        if not instruction_path.is_file() or not metadata_path.is_file():
-            write_audit_event(data_root, data, "activation_existing_incomplete")
-            return warning("Task Anchor 检测到不完整的既有任务记录，已拒绝覆盖。")
-        instruction, problem = load_initial_instruction(data, data_root)
-        if problem is not None:
-            write_audit_event(data_root, data, "activation_existing_rejected")
-            return problem
-        assert instruction is not None
-        instruction_bytes = instruction.encode("utf-8")
+    if has_legacy_session_layout(data_root, current_session_id):
+        write_audit_event(data_root, data, "legacy_layout_superseded")
+    if recovered_task_id is not None:
+        for old_task_id in recovered_closed_task_ids:
+            write_audit_event(
+                data_root,
+                data,
+                "task_closed",
+                task_id=old_task_id,
+                closed_reason=CLOSED_REASON_SUPERSEDED,
+            )
         write_audit_event(
             data_root,
             data,
-            "activation_existing_preserved",
-            instruction_sha256=sha256_bytes(instruction_bytes),
-            instruction_bytes=len(instruction_bytes),
+            "activation_recovered",
+            task_id=recovered_task_id,
+            closed_task_count=len(recovered_closed_task_ids),
         )
-        return problem
-
-    instruction_bytes = prompt.encode("utf-8")
-    digest = sha256_bytes(instruction_bytes)
-    metadata = {
-        "session_id": session_id,
-        "sha256": digest,
-        WORKSPACE_SHA256_FIELD: workspace_sha256,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "active": True,
-    }
-
-    try:
-        atomic_write(instruction_path, instruction_bytes)
-        atomic_write(
-            metadata_path,
-            json.dumps(
-                metadata,
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            ).encode("utf-8"),
+    for old_task_id in closed_task_ids:
+        write_audit_event(
+            data_root,
+            data,
+            "task_closed",
+            task_id=old_task_id,
+            closed_reason=CLOSED_REASON_SUPERSEDED,
         )
-    except OSError:
-        write_audit_event(data_root, data, "activation_write_failed")
-        return warning("Task Anchor 写入任务指令失败，请检查插件数据目录权限。")
     write_audit_event(
         data_root,
         data,
-        "activation_saved",
-        instruction_sha256=digest,
+        "activation_completed",
+        task_id=new_task_id,
+        instruction_sha256=new_metadata["sha256"],
         instruction_bytes=len(instruction_bytes),
-        anchor_workspace_sha256=workspace_sha256,
+        closed_task_count=len(closed_task_ids),
     )
     return None
-
-
-def load_initial_instruction(
-    data: dict[str, Any],
-    data_root: Path | None,
-) -> tuple[str | None, dict[str, Any] | None]:
-    if data_root is None:
-        return None, warning("Task Anchor 无法恢复任务指令：Hook 未提供 PLUGIN_DATA。")
-
-    session_id = read_session_id(data)
-    if session_id is None:
-        return None, warning("Task Anchor 无法恢复任务指令：Hook 输入缺少 session_id。")
-
-    session_dir = session_directory(data_root, session_id)
-    instruction_path = session_dir / "initial_instruction.txt"
-    metadata_path = session_dir / "metadata.json"
-    if not instruction_path.exists() and not metadata_path.exists():
-        return None, None
-    if not instruction_path.is_file() or not metadata_path.is_file():
-        return None, warning("Task Anchor 的任务记录不完整，未注入可能损坏的指令。")
-
-    try:
-        instruction_bytes = instruction_path.read_bytes()
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        instruction = instruction_bytes.decode("utf-8")
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None, warning("Task Anchor 无法读取任务记录，未注入可能损坏的指令。")
-
-    if not isinstance(metadata, dict):
-        return None, warning("Task Anchor 的任务元数据格式无效，已停止注入。")
-    if metadata.get("session_id") != session_id:
-        return None, warning("Task Anchor 的 session_id 校验失败，已停止注入。")
-    if metadata.get("sha256") != sha256_bytes(instruction_bytes):
-        return None, warning("Task Anchor 的任务指令 SHA-256 校验失败，已停止注入。")
-
-    workspace_sha256 = read_workspace_sha256(data)
-    if workspace_sha256 is None:
-        write_audit_event(data_root, data, "workspace_cwd_missing")
-        return None, warning(
-            "Task Anchor 无法恢复任务指令：Hook 输入缺少 cwd，已拒绝跨项目注入。"
-        )
-
-    anchor_workspace_sha256 = metadata.get(WORKSPACE_SHA256_FIELD)
-    if not is_sha256_digest(anchor_workspace_sha256):
-        write_audit_event(data_root, data, "workspace_binding_missing")
-        return None, warning(
-            "Task Anchor 的既有任务记录没有项目边界绑定，已停止注入；"
-            "请新建任务并重新显式调用 $task-anchor。"
-        )
-    if anchor_workspace_sha256 != workspace_sha256:
-        write_audit_event(
-            data_root,
-            data,
-            "workspace_mismatch",
-            anchor_workspace_sha256=anchor_workspace_sha256,
-        )
-        return None, warning(
-            "Task Anchor 检测到当前项目与任务锚点不一致，已拒绝跨项目注入。"
-            "请在原项目继续任务，或在新项目新建并显式调用 $task-anchor。"
-        )
-    return instruction, None
 
 
 def restore_after_post_compact(
@@ -306,38 +606,81 @@ def restore_after_post_compact(
     if data.get("trigger") not in {"auto", "manual"}:
         write_audit_event(data_root, data, "post_compact_ignored_trigger")
         return None
-
-    write_audit_event(data_root, data, "post_compact_received")
-
-    instruction, problem = load_initial_instruction(data, data_root)
-    if problem is not None:
-        write_audit_event(data_root, data, "restore_rejected")
-        return problem
-    if instruction is None:
-        write_audit_event(data_root, data, "restore_no_anchor")
+    if data_root is None:
         return None
 
-    instruction_bytes = instruction.encode("utf-8")
-    digest = sha256_bytes(instruction_bytes)
-    write_audit_event(
-        data_root,
-        data,
-        "anchor_loaded",
-        instruction_sha256=digest,
-        instruction_bytes=len(instruction_bytes),
-        anchor_workspace_sha256=read_workspace_sha256(data),
-    )
+    write_audit_event(data_root, data, "post_compact_received")
+    current_session_id = read_session_id(data)
+    if current_session_id is None:
+        write_audit_event(data_root, data, "restore_missing_session_id")
+        return warning("Task Anchor 无法恢复任务：Hook 输入缺少 session_id。")
+
+    try:
+        with session_lock(session_directory(data_root, current_session_id)):
+            pending_transition = read_pending_transition(data_root, current_session_id)
+            if pending_transition is not None:
+                task_id = pending_transition["new_task_id"]
+                assert isinstance(task_id, str)
+                write_audit_event(
+                    data_root,
+                    data,
+                    "restore_pending_transition",
+                    task_id=task_id,
+                )
+                return warning(
+                    "Task Anchor 检测到未完成的任务切换，未恢复任务指令；"
+                    "请重新显式调用 $task-anchor。"
+                )
+
+            task_id = read_current_task_id(data_root, current_session_id)
+            if task_id is None:
+                if has_legacy_session_layout(data_root, current_session_id):
+                    write_audit_event(data_root, data, "legacy_layout_skipped")
+                    return warning(
+                        "Task Anchor 检测到旧版任务记录，未恢复旧指令；"
+                        "请重新显式调用 $task-anchor 创建当前任务。"
+                    )
+                write_audit_event(data_root, data, "restore_no_current_task")
+                return None
+
+            instruction, metadata = load_task(
+                data,
+                data_root,
+                current_session_id,
+                task_id,
+            )
+            if metadata["status"] == TASK_STATUS_CLOSED:
+                write_audit_event(
+                    data_root,
+                    data,
+                    "restore_closed",
+                    task_id=task_id,
+                    closed_reason=metadata.get("closed_reason"),
+                )
+                return None
+    except LockUnavailable:
+        write_audit_event(data_root, data, "restore_lock_unavailable")
+        return warning("Task Anchor 当前任务状态正由另一项操作切换，未恢复任务指令。")
+    except StorageError as exc:
+        write_audit_event(data_root, data, "restore_rejected")
+        return warning(str(exc))
 
     additional_context = (
         f"必须使用 {SKILL_MARKER} Skill 继续当前任务。\n\n"
+        "[Task Anchor 状态提醒]\n"
+        f"- task_id: {task_id}\n"
+        "- status: 1（进行中；自动完成状态无法验证）\n"
+        "- 本提醒不要求作答，不改变任务状态，也不阻断当前任务。\n\n"
         f"[最初任务指令]\n{instruction}"
     )
     write_audit_event(
         data_root,
         data,
         "restore_emitted",
-        instruction_sha256=digest,
-        instruction_bytes=len(instruction_bytes),
+        task_id=task_id,
+        instruction_sha256=metadata["sha256"],
+        instruction_bytes=len(instruction.encode("utf-8")),
+        task_status=metadata["status"],
     )
     return {
         "hookSpecificOutput": {
@@ -353,7 +696,7 @@ def handle_hook(
 ) -> dict[str, Any] | None:
     event_name = data.get("hook_event_name")
     if event_name == USER_PROMPT_SUBMIT:
-        return save_initial_instruction(data, data_root)
+        return start_new_task(data, data_root)
     if event_name == POST_COMPACT:
         return restore_after_post_compact(data, data_root)
     return None
@@ -363,13 +706,14 @@ def main() -> int:
     try:
         data = json.load(sys.stdin)
     except json.JSONDecodeError:
-        payload = warning("Task Anchor 收到无效的 Hook JSON 输入。")
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+        sys.stdout.write(
+            json.dumps(warning("Task Anchor 收到无效的 Hook JSON 输入。"), ensure_ascii=False)
+        )
         return 0
-
     if not isinstance(data, dict):
-        payload = warning("Task Anchor 收到的 Hook 输入不是 JSON 对象。")
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+        sys.stdout.write(
+            json.dumps(warning("Task Anchor 收到的 Hook 输入不是 JSON 对象。"), ensure_ascii=False)
+        )
         return 0
 
     raw_data_root = os.environ.get("PLUGIN_DATA")

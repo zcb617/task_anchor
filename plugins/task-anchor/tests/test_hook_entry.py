@@ -6,12 +6,15 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
+import shutil
 import unittest
+import uuid
 from pathlib import Path
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+WORKSPACE_ROOT = PLUGIN_ROOT.parents[1]
+TEST_TEMP_ROOT = WORKSPACE_ROOT / ".tmp" / "task-anchor-tests"
 SCRIPT_PATH = PLUGIN_ROOT / "scripts" / "hook_entry.py"
 SPEC = importlib.util.spec_from_file_location("task_anchor_hook_entry", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -21,8 +24,9 @@ SPEC.loader.exec_module(HOOK)
 
 class HookEntryTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary_directory = tempfile.TemporaryDirectory()
-        self.data_root = Path(self.temporary_directory.name)
+        TEST_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+        self.data_root = TEST_TEMP_ROOT / f"case-{uuid.uuid4().hex}"
+        self.data_root.mkdir()
         self.session_id = "session/含中文/../安全"
         self.workspace = self.data_root / "workspace-a"
         self.other_workspace = self.data_root / "workspace-b"
@@ -30,253 +34,362 @@ class HookEntryTests(unittest.TestCase):
         self.other_workspace.mkdir()
 
     def tearDown(self) -> None:
-        self.temporary_directory.cleanup()
+        shutil.rmtree(self.data_root)
 
-    def user_prompt(self, prompt: str) -> dict[str, object]:
+    def user_prompt(
+        self,
+        prompt: str,
+        *,
+        session_id: str | None = None,
+        cwd: Path | None = None,
+    ) -> dict[str, object]:
         return {
             "hook_event_name": "UserPromptSubmit",
-            "session_id": self.session_id,
+            "session_id": session_id or self.session_id,
             "turn_id": "turn-1",
             "prompt": prompt,
-            "cwd": str(self.workspace),
+            "cwd": str(cwd or self.workspace),
         }
 
-    def post_compact(self, trigger: str = "auto") -> dict[str, object]:
+    def post_compact(
+        self,
+        trigger: str = "auto",
+        *,
+        session_id: str | None = None,
+        cwd: Path | None = None,
+    ) -> dict[str, object]:
         return {
             "hook_event_name": "PostCompact",
-            "session_id": self.session_id,
+            "session_id": session_id or self.session_id,
             "trigger": trigger,
-            "cwd": str(self.workspace),
+            "cwd": str(cwd or self.workspace),
         }
 
-    def instruction_path(self) -> Path:
-        return (
-            HOOK.session_directory(self.data_root, self.session_id)
-            / "initial_instruction.txt"
+    def session_dir(self, session_id: str | None = None) -> Path:
+        return HOOK.session_directory(self.data_root, session_id or self.session_id)
+
+    def current_task_id(self, session_id: str | None = None) -> str:
+        current_session_id = session_id or self.session_id
+        pointer = json.loads(
+            HOOK.current_task_path(self.data_root, current_session_id).read_text(
+                encoding="utf-8"
+            )
+        )
+        return pointer["task_id"]
+
+    def task_ids(self, session_id: str | None = None) -> set[str]:
+        current_session_id = session_id or self.session_id
+        directory = HOOK.tasks_directory(self.data_root, current_session_id)
+        if not directory.exists():
+            return set()
+        return {entry.name for entry in directory.iterdir() if entry.is_dir()}
+
+    def task_metadata(self, task_id: str, session_id: str | None = None) -> dict[str, object]:
+        current_session_id = session_id or self.session_id
+        return json.loads(
+            HOOK.task_metadata_path(self.data_root, current_session_id, task_id).read_text(
+                encoding="utf-8"
+            )
         )
 
-    def metadata_path(self) -> Path:
-        return HOOK.session_directory(self.data_root, self.session_id) / "metadata.json"
+    def write_task_metadata(
+        self,
+        task_id: str,
+        metadata: dict[str, object],
+        session_id: str | None = None,
+    ) -> None:
+        current_session_id = session_id or self.session_id
+        HOOK.task_metadata_path(self.data_root, current_session_id, task_id).write_text(
+            json.dumps(metadata, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def task_instruction(self, task_id: str, session_id: str | None = None) -> str:
+        current_session_id = session_id or self.session_id
+        return HOOK.task_instruction_path(
+            self.data_root, current_session_id, task_id
+        ).read_text(encoding="utf-8")
 
     def audit_events(self) -> list[dict[str, object]]:
-        audit_path = self.data_root / HOOK.AUDIT_LOG_RELATIVE_PATH
-        if not audit_path.exists():
+        path = self.data_root / HOOK.AUDIT_LOG_RELATIVE_PATH
+        if not path.exists():
             return []
-        return [
-            json.loads(line)
-            for line in audit_path.read_text(encoding="utf-8").splitlines()
-        ]
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def activate(self, prompt: str) -> str:
+        self.assertIsNone(HOOK.handle_hook(self.user_prompt(prompt), self.data_root))
+        return self.current_task_id()
 
     def test_ordinary_prompt_is_ignored(self) -> None:
-        result = HOOK.handle_hook(self.user_prompt("普通消息"), self.data_root)
-        self.assertIsNone(result)
-        self.assertFalse((self.data_root / "sessions").exists())
+        self.assertIsNone(HOOK.handle_hook(self.user_prompt("普通对话"), self.data_root))
+        self.assertFalse(HOOK.current_task_path(self.data_root, self.session_id).exists())
 
-    def test_explicit_activation_is_saved_exactly(self) -> None:
-        prompt = "$task-anchor 第一行\r\n第二行：中文🙂"
-        result = HOOK.handle_hook(self.user_prompt(prompt), self.data_root)
-        self.assertIsNone(result)
-        self.assertEqual(self.instruction_path().read_bytes(), prompt.encode("utf-8"))
+    def test_explicit_activation_creates_a_task_record(self) -> None:
+        prompt = "$task-anchor 保留这条最初任务指令。"
+        task_id = self.activate(prompt)
 
-        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
-        self.assertEqual(metadata["session_id"], self.session_id)
+        self.assertEqual(str(uuid.UUID(task_id)), task_id)
+        self.assertEqual(self.task_instruction(task_id), prompt)
+        metadata = self.task_metadata(task_id)
+        self.assertEqual(metadata["task_id"], task_id)
+        self.assertEqual(metadata["status"], HOOK.TASK_STATUS_ACTIVE)
+        self.assertEqual(metadata[HOOK.SESSION_KEY_FIELD], HOOK.session_key(self.session_id))
         self.assertEqual(
             metadata["sha256"],
             hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         )
+        self.assertNotIn("session_id", metadata)
+
+    def test_every_explicit_activation_creates_a_new_task_and_closes_old_one(self) -> None:
+        first_prompt = "$task-anchor 第一个独立任务"
+        second_prompt = "$task-anchor 第二个独立任务"
+        first_task_id = self.activate(first_prompt)
+        second_task_id = self.activate(second_prompt)
+
+        self.assertNotEqual(first_task_id, second_task_id)
+        self.assertEqual(self.current_task_id(), second_task_id)
+        self.assertEqual(self.task_instruction(first_task_id), first_prompt)
+        self.assertEqual(self.task_instruction(second_task_id), second_prompt)
+        old_metadata = self.task_metadata(first_task_id)
+        self.assertEqual(old_metadata["status"], HOOK.TASK_STATUS_CLOSED)
+        self.assertEqual(old_metadata["closed_reason"], HOOK.CLOSED_REASON_SUPERSEDED)
+        self.assertIn("closed_at", old_metadata)
         self.assertEqual(
-            metadata[HOOK.WORKSPACE_SHA256_FIELD],
-            HOOK.read_workspace_sha256(self.user_prompt(prompt)),
-        )
-        events = self.audit_events()
-        self.assertEqual(
-            [event["status"] for event in events],
-            ["activation_received", "activation_saved"],
-        )
-        audit_text = (self.data_root / HOOK.AUDIT_LOG_RELATIVE_PATH).read_text(
-            encoding="utf-8"
-        )
-        self.assertNotIn(prompt, audit_text)
-        self.assertNotIn(self.session_id, audit_text)
-        self.assertNotIn(str(self.workspace), audit_text)
-        self.assertEqual(events[-1]["instruction_bytes"], len(prompt.encode("utf-8")))
-        self.assertEqual(events[-1]["instruction_sha256"], metadata["sha256"])
-        self.assertEqual(
-            events[-1]["anchor_workspace_sha256"],
-            metadata[HOOK.WORKSPACE_SHA256_FIELD],
+            self.task_metadata(second_task_id)["status"], HOOK.TASK_STATUS_ACTIVE
         )
 
-    def test_repeated_activation_does_not_overwrite(self) -> None:
-        first = "$task-anchor 最初指令"
-        second = "$task-anchor 后来的调用"
-        HOOK.handle_hook(self.user_prompt(first), self.data_root)
-        HOOK.handle_hook(self.user_prompt(second), self.data_root)
-        self.assertEqual(self.instruction_path().read_text(encoding="utf-8"), first)
+    def test_new_activation_closes_every_existing_active_task_record(self) -> None:
+        first_task_id = self.activate("$task-anchor 任务一")
+        second_task_id = self.activate("$task-anchor 任务二")
+        first_metadata = self.task_metadata(first_task_id)
+        first_metadata["status"] = HOOK.TASK_STATUS_ACTIVE
+        first_metadata.pop("closed_at", None)
+        first_metadata.pop("closed_reason", None)
+        self.write_task_metadata(first_task_id, first_metadata)
 
-    def test_invalid_post_compact_trigger_is_ignored(self) -> None:
-        HOOK.handle_hook(self.user_prompt("$task-anchor 指令"), self.data_root)
-        data = self.post_compact("unexpected")
-        self.assertIsNone(HOOK.handle_hook(data, self.data_root))
+        third_task_id = self.activate("$task-anchor 任务三")
 
-    def test_post_compact_injects_exact_instruction(self) -> None:
-        prompt = "$task-anchor 实现功能，不得改写这句话。"
-        HOOK.handle_hook(self.user_prompt(prompt), self.data_root)
+        for task_id in (first_task_id, second_task_id):
+            metadata = self.task_metadata(task_id)
+            self.assertEqual(metadata["status"], HOOK.TASK_STATUS_CLOSED)
+            self.assertEqual(metadata["closed_reason"], HOOK.CLOSED_REASON_SUPERSEDED)
+        self.assertEqual(self.current_task_id(), third_task_id)
+
+    def test_post_compact_restores_only_current_task_with_passive_reminder(self) -> None:
+        first_task_id = self.activate("$task-anchor 旧任务不得恢复")
+        second_prompt = "$task-anchor 当前任务必须恢复"
+        second_task_id = self.activate(second_prompt)
+
         result = HOOK.handle_hook(self.post_compact(), self.data_root)
+
+        self.assertIsNotNone(result)
+        context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(result["hookSpecificOutput"]["hookEventName"], "PostCompact")
+        self.assertIn(second_prompt, context)
+        self.assertNotIn(self.task_instruction(first_task_id), context)
+        self.assertIn(f"task_id: {second_task_id}", context)
+        self.assertIn("status: 1", context)
+        self.assertIn("自动完成状态无法验证", context)
+        self.assertIn("不要求作答，不改变任务状态，也不阻断当前任务", context)
+        self.assertNotIn("$task-anchor-end", context)
+
+    def test_many_compactions_restore_the_same_active_task(self) -> None:
+        task_id = self.activate("$task-anchor 长任务")
+        outputs = [
+            HOOK.handle_hook(self.post_compact(), self.data_root)
+            for _ in range(20)
+        ]
+        self.assertTrue(all(item == outputs[0] for item in outputs))
+        self.assertIn(task_id, outputs[0]["hookSpecificOutput"]["additionalContext"])
+
+    def test_normal_reply_and_end_marker_do_not_close_task(self) -> None:
+        task_id = self.activate("$task-anchor 仍在进行")
+        self.assertIsNone(
+            HOOK.handle_hook(self.user_prompt("任务已完成，给用户交付。"), self.data_root)
+        )
+        self.assertIsNone(
+            HOOK.handle_hook(self.user_prompt("$task-anchor-end"), self.data_root)
+        )
+        self.assertEqual(self.current_task_id(), task_id)
         self.assertEqual(
-            result,
+            self.task_metadata(task_id)["status"], HOOK.TASK_STATUS_ACTIVE
+        )
+
+    def test_end_marker_without_anchor_is_not_an_activation(self) -> None:
+        self.assertIsNone(HOOK.handle_hook(self.user_prompt("$task-anchor-end"), self.data_root))
+        self.assertFalse(HOOK.current_task_path(self.data_root, self.session_id).exists())
+
+    def test_post_compact_does_not_complete_pending_task_transition(self) -> None:
+        old_task_id = self.activate("$task-anchor 旧任务仍保持活动")
+        pending_task_id = str(uuid.uuid4())
+        pending_prompt = "$task-anchor 尚未完成切换的任务"
+        pending_metadata = {
+            "schema_version": HOOK.SCHEMA_VERSION,
+            "task_id": pending_task_id,
+            HOOK.SESSION_KEY_FIELD: HOOK.session_key(self.session_id),
+            "sha256": hashlib.sha256(pending_prompt.encode("utf-8")).hexdigest(),
+            HOOK.WORKSPACE_SHA256_FIELD: HOOK.read_workspace_sha256(
+                self.user_prompt("普通消息")
+            ),
+            "created_at": HOOK.utc_now(),
+            "status": HOOK.TASK_STATUS_CLOSED,
+            "transition_state": "pending_activation",
+        }
+        HOOK.atomic_write(
+            HOOK.task_instruction_path(self.data_root, self.session_id, pending_task_id),
+            pending_prompt.encode("utf-8"),
+        )
+        HOOK.atomic_write_json(
+            HOOK.task_metadata_path(self.data_root, self.session_id, pending_task_id),
+            pending_metadata,
+        )
+        HOOK.atomic_write_json(
+            HOOK.transition_path(self.data_root, self.session_id),
             {
-                "hookSpecificOutput": {
-                    "hookEventName": "PostCompact",
-                    "additionalContext": (
-                        "必须使用 $task-anchor Skill 继续当前任务。\n\n"
-                        f"[最初任务指令]\n{prompt}"
-                    ),
-                }
+                "schema_version": HOOK.SCHEMA_VERSION,
+                HOOK.SESSION_KEY_FIELD: HOOK.session_key(self.session_id),
+                "new_task_id": pending_task_id,
+                "old_task_ids": [old_task_id],
+                "created_at": HOOK.utc_now(),
             },
         )
-        events = self.audit_events()
+
+        result = HOOK.handle_hook(self.post_compact(), self.data_root)
+
+        self.assertIn("未完成的任务切换", result["systemMessage"])
+        self.assertEqual(self.current_task_id(), old_task_id)
         self.assertEqual(
-            [event["status"] for event in events[-3:]],
-            ["post_compact_received", "anchor_loaded", "restore_emitted"],
+            self.task_metadata(old_task_id)["status"], HOOK.TASK_STATUS_ACTIVE
         )
-        self.assertEqual(events[-1]["trigger"], "auto")
         self.assertEqual(
-            events[-1]["instruction_sha256"],
-            hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            self.task_metadata(pending_task_id)["status"], HOOK.TASK_STATUS_CLOSED
+        )
+        self.assertTrue(HOOK.transition_path(self.data_root, self.session_id).exists())
+        self.assertIn(
+            "restore_pending_transition",
+            [event["status"] for event in self.audit_events()],
         )
 
-    def test_manual_post_compact_injects_anchor(self) -> None:
-        prompt = "$task-anchor 手动压缩也必须恢复。"
-        HOOK.handle_hook(self.user_prompt(prompt), self.data_root)
+    def test_closed_current_task_is_not_injected(self) -> None:
+        task_id = self.activate("$task-anchor 已关闭任务")
+        metadata = self.task_metadata(task_id)
+        metadata["status"] = HOOK.TASK_STATUS_CLOSED
+        metadata["closed_reason"] = HOOK.CLOSED_REASON_SUPERSEDED
+        self.write_task_metadata(task_id, metadata)
+
+        self.assertIsNone(HOOK.handle_hook(self.post_compact(), self.data_root))
+        self.assertIn("restore_closed", [event["status"] for event in self.audit_events()])
+
+    def test_manual_post_compact_restores_active_task(self) -> None:
+        task_id = self.activate("$task-anchor 手动压缩")
         result = HOOK.handle_hook(self.post_compact("manual"), self.data_root)
-        self.assertIn(prompt, result["hookSpecificOutput"]["additionalContext"])
-        self.assertEqual(result["hookSpecificOutput"]["hookEventName"], "PostCompact")
+        self.assertIn(task_id, result["hookSpecificOutput"]["additionalContext"])
+
+    def test_invalid_post_compact_trigger_is_ignored(self) -> None:
+        self.activate("$task-anchor 指令")
+        self.assertIsNone(
+            HOOK.handle_hook(self.post_compact("unexpected"), self.data_root)
+        )
 
     def test_cross_workspace_post_compact_is_not_injected(self) -> None:
-        prompt = "$task-anchor 不得跨项目继续。"
-        HOOK.handle_hook(self.user_prompt(prompt), self.data_root)
-        cross_workspace = self.post_compact()
-        cross_workspace["cwd"] = str(self.other_workspace)
-
-        result = HOOK.handle_hook(cross_workspace, self.data_root)
-
+        (self.other_workspace / ".git").mkdir()
+        self.activate("$task-anchor 不得跨项目继续")
+        result = HOOK.handle_hook(
+            self.post_compact(cwd=self.other_workspace), self.data_root
+        )
         self.assertIn("当前项目与任务锚点不一致", result["systemMessage"])
         self.assertNotIn("hookSpecificOutput", result)
-        self.assertEqual(
-            [event["status"] for event in self.audit_events()[-3:]],
-            ["post_compact_received", "workspace_mismatch", "restore_rejected"],
-        )
 
     def test_missing_cwd_is_rejected_on_activation_and_restore(self) -> None:
-        activation = self.user_prompt("$task-anchor 必须绑定项目。")
+        activation = self.user_prompt("$task-anchor 必须绑定项目")
         del activation["cwd"]
         activation_result = HOOK.handle_hook(activation, self.data_root)
         self.assertIn("缺少 cwd", activation_result["systemMessage"])
-        self.assertFalse(self.instruction_path().exists())
+        self.assertFalse(HOOK.current_task_path(self.data_root, self.session_id).exists())
 
-        HOOK.handle_hook(self.user_prompt("$task-anchor 有效任务"), self.data_root)
+        self.activate("$task-anchor 有效任务")
         compact = self.post_compact()
         del compact["cwd"]
         compact_result = HOOK.handle_hook(compact, self.data_root)
         self.assertIn("缺少 cwd", compact_result["systemMessage"])
         self.assertNotIn("hookSpecificOutput", compact_result)
 
-    def test_legacy_anchor_without_workspace_binding_is_not_injected(self) -> None:
-        HOOK.handle_hook(self.user_prompt("$task-anchor 老任务"), self.data_root)
-        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
-        del metadata[HOOK.WORKSPACE_SHA256_FIELD]
-        self.metadata_path().write_text(
-            json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
+    def test_corrupted_instruction_is_not_injected(self) -> None:
+        task_id = self.activate("$task-anchor 原始指令")
+        HOOK.task_instruction_path(self.data_root, self.session_id, task_id).write_text(
+            "已被修改", encoding="utf-8"
         )
-
-        result = HOOK.handle_hook(self.post_compact(), self.data_root)
-
-        self.assertIn("没有项目边界绑定", result["systemMessage"])
-        self.assertNotIn("hookSpecificOutput", result)
-        self.assertIn(
-            "workspace_binding_missing",
-            [event["status"] for event in self.audit_events()],
-        )
-
-    def test_same_git_project_subdirectories_share_anchor(self) -> None:
-        project = self.data_root / "git-project"
-        source = project / "source"
-        tests = project / "tests"
-        (project / ".git").mkdir(parents=True)
-        source.mkdir()
-        tests.mkdir()
-
-        activation = self.user_prompt("$task-anchor 同一项目可在子目录继续。")
-        activation["cwd"] = str(source)
-        HOOK.handle_hook(activation, self.data_root)
-
-        compact = self.post_compact()
-        compact["cwd"] = str(tests)
-        result = HOOK.handle_hook(compact, self.data_root)
-
-        self.assertIn(
-            "同一项目可在子目录继续",
-            result["hookSpecificOutput"]["additionalContext"],
-        )
-
-    def test_many_compactions_return_the_same_instruction(self) -> None:
-        prompt = "$task-anchor 长任务"
-        HOOK.handle_hook(self.user_prompt(prompt), self.data_root)
-        outputs = [
-            HOOK.handle_hook(self.post_compact(), self.data_root)
-            for _ in range(1000)
-        ]
-        self.assertTrue(all(item == outputs[0] for item in outputs))
-        self.assertEqual(self.instruction_path().read_text(encoding="utf-8"), prompt)
-
-    def test_corruption_is_not_injected(self) -> None:
-        HOOK.handle_hook(self.user_prompt("$task-anchor 原文"), self.data_root)
-        self.instruction_path().write_text("已被修改", encoding="utf-8")
         result = HOOK.handle_hook(self.post_compact(), self.data_root)
         self.assertIn("SHA-256 校验失败", result["systemMessage"])
         self.assertNotIn("hookSpecificOutput", result)
 
-    def test_invalid_metadata_shape_is_not_injected(self) -> None:
-        HOOK.handle_hook(self.user_prompt("$task-anchor 原文"), self.data_root)
-        self.metadata_path().write_text("[]", encoding="utf-8")
+    def test_legacy_session_layout_is_not_restored(self) -> None:
+        directory = self.session_dir()
+        directory.mkdir(parents=True)
+        (directory / "initial_instruction.txt").write_text(
+            "$task-anchor 旧版任务", encoding="utf-8"
+        )
+        (directory / "metadata.json").write_text("{}", encoding="utf-8")
+
         result = HOOK.handle_hook(self.post_compact(), self.data_root)
-        self.assertIn("元数据格式无效", result["systemMessage"])
+
+        self.assertIn("旧版任务记录", result["systemMessage"])
         self.assertNotIn("hookSpecificOutput", result)
 
-    def test_missing_plugin_data_warns_only_on_activation(self) -> None:
-        ordinary = HOOK.handle_hook(self.user_prompt("普通消息"), None)
-        activation = HOOK.handle_hook(self.user_prompt("$task-anchor 指令"), None)
-        self.assertIsNone(ordinary)
-        self.assertIn("PLUGIN_DATA", activation["systemMessage"])
-
     def test_sessions_are_isolated(self) -> None:
-        first = "$task-anchor 第一个任务"
-        second = "$task-anchor 第二个任务"
-        HOOK.handle_hook(self.user_prompt(first), self.data_root)
-        other = self.user_prompt(second)
-        other["session_id"] = "another-session"
-        HOOK.handle_hook(other, self.data_root)
+        first_task_id = self.activate("$task-anchor 第一个会话")
+        other_session = "another-session"
+        second = self.user_prompt("$task-anchor 第二个会话", session_id=other_session)
+        self.assertIsNone(HOOK.handle_hook(second, self.data_root))
+        second_task_id = self.current_task_id(other_session)
 
         first_result = HOOK.handle_hook(self.post_compact(), self.data_root)
-        other_start = self.post_compact()
-        other_start["session_id"] = "another-session"
-        second_result = HOOK.handle_hook(other_start, self.data_root)
-        self.assertIn(first, first_result["hookSpecificOutput"]["additionalContext"])
-        self.assertIn(second, second_result["hookSpecificOutput"]["additionalContext"])
+        second_result = HOOK.handle_hook(
+            self.post_compact(session_id=other_session), self.data_root
+        )
+        self.assertIn(first_task_id, first_result["hookSpecificOutput"]["additionalContext"])
+        self.assertIn(second_task_id, second_result["hookSpecificOutput"]["additionalContext"])
 
-    def test_command_entrypoint(self) -> None:
+    def test_audit_log_excludes_instruction_and_real_session_id(self) -> None:
+        prompt = "$task-anchor 保密任务正文"
+        self.activate(prompt)
+        HOOK.handle_hook(self.post_compact(), self.data_root)
+
+        serialized = json.dumps(self.audit_events(), ensure_ascii=False)
+        self.assertNotIn(prompt, serialized)
+        self.assertNotIn(self.session_id, serialized)
+        self.assertIn(HOOK.SESSION_KEY_FIELD, serialized)
+
+    def test_command_entrypoint_creates_a_new_task_on_each_activation(self) -> None:
         environment = os.environ.copy()
         environment["PLUGIN_DATA"] = str(self.data_root)
-        activation = subprocess.run(
+        first_prompt = "$task-anchor 命令行任务一"
+        second_prompt = "$task-anchor 命令行任务二"
+
+        first = subprocess.run(
             [sys.executable, str(SCRIPT_PATH)],
-            input=json.dumps(self.user_prompt("$task-anchor 命令行测试")),
+            input=json.dumps(self.user_prompt(first_prompt)),
             text=True,
             capture_output=True,
             env=environment,
             check=False,
         )
-        self.assertEqual(activation.returncode, 0)
-        self.assertEqual(activation.stdout, "")
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(first.stdout, "")
+        first_task_id = self.current_task_id()
+
+        second = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH)],
+            input=json.dumps(self.user_prompt(second_prompt)),
+            text=True,
+            capture_output=True,
+            env=environment,
+            check=False,
+        )
+        self.assertEqual(second.returncode, 0)
+        self.assertEqual(second.stdout, "")
+        second_task_id = self.current_task_id()
+        self.assertNotEqual(first_task_id, second_task_id)
 
         compact = subprocess.run(
             [sys.executable, str(SCRIPT_PATH)],
@@ -288,10 +401,9 @@ class HookEntryTests(unittest.TestCase):
         )
         self.assertEqual(compact.returncode, 0)
         payload = json.loads(compact.stdout)
-        self.assertIn(
-            "$task-anchor 命令行测试",
-            payload["hookSpecificOutput"]["additionalContext"],
-        )
+        context = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(second_prompt, context)
+        self.assertNotIn(first_prompt, context)
 
 
 class PluginContractTests(unittest.TestCase):
@@ -309,13 +421,10 @@ class PluginContractTests(unittest.TestCase):
         config = json.loads(
             (PLUGIN_ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(
-            set(config["hooks"]),
-            {"UserPromptSubmit", "PostCompact"},
-        )
+        self.assertEqual(set(config["hooks"]), {"UserPromptSubmit", "PostCompact"})
         self.assertNotIn("matcher", config["hooks"]["PostCompact"][0])
 
-    def test_skill_is_explicit_and_uses_native_tolist(self) -> None:
+    def test_only_task_anchor_skill_remains(self) -> None:
         skill = (PLUGIN_ROOT / "skills" / "task-anchor" / "SKILL.md").read_text(
             encoding="utf-8"
         )
@@ -323,7 +432,9 @@ class PluginContractTests(unittest.TestCase):
             PLUGIN_ROOT / "skills" / "task-anchor" / "agents" / "openai.yaml"
         ).read_text(encoding="utf-8")
         self.assertIn("Codex 原生 TOLIST", skill)
+        self.assertNotIn("$task-anchor-end", skill)
         self.assertIn("allow_implicit_invocation: false", metadata)
+        self.assertFalse((PLUGIN_ROOT / "skills" / "task-anchor-end").exists())
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 {
   "name": "task-anchor",
-  "version": "0.1.0+codex.20260715170137",
-  "description": "Preserve the original task instruction across Codex context compactions.",
+  "version": "0.1.0+codex.20260716083417",
+  "description": "Keep the current explicitly started task across Codex context compactions.",
   "author": {
     "name": "Local developer"
   },
@@ -14,8 +14,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Task Anchor",
-    "shortDescription": "Keep original task instructions across compactions.",
-    "longDescription": "Stores an explicitly anchored instruction once, then injects it after compaction only while the task remains in the same Git project or non-Git workspace.",
+    "shortDescription": "Start a task and restore it after compaction.",
+    "longDescription": "Each explicit invocation creates a new task, supersedes prior tasks in the same conversation, and restores only the current active task after compaction with a passive status reminder.",
     "developerName": "Local developer",
     "category": "Productivity",
     "capabilities": [

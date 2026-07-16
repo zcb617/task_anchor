@@ -1,95 +1,74 @@
 # Task Anchor
 
-Task Anchor 是一个 Codex 插件，用于在上下文压缩后重新注入同一份最初任务指令。
+Task Anchor 是一个 Codex 插件：用户显式调用 `$task-anchor` 时创建一项独立任务；发生上下文压缩后，只恢复该会话当前仍为活动状态的任务指令。
 
 > [!IMPORTANT]
-> **安装并启用插件，不代表 Hook 已启用。** 安装后必须进入 Codex 的 Hook 设置，把 Task Anchor 的 Hook 设为**允许**并完成**信任**。未完成这一步时，Codex 会跳过插件 Hook：最初任务指令不会保存，压缩后也不会注入，插件核心功能等于没有安装。
+> 安装并启用插件不等于 Hook 已启用。必须在 Codex 的 Hook 设置中允许并信任 Task Anchor Hook；否则最初任务不会保存，压缩后也不会恢复。
 
-## 环境要求
+## 已验证环境与运行方式
 
-- Codex 桌面版与 Codex CLI 0.144.1。
-- 命令行可以执行 codex。
-- 命令行可以执行 python。
+- 已验证基线：`codex-cli 0.144.4`。
+- 需要可执行的 `codex` 和 `python`。
+- 插件仅在 Hook 触发时运行一次 Python 脚本；不启动 Node、MCP、守护进程、App Server 客户端或其他常驻第三方进程。
 
 ## 从源码安装
 
-克隆仓库并进入仓库根目录：
-
-    git clone <仓库地址>
-    cd task-anchor
-
-注册本仓库提供的 Marketplace：
+在仓库根目录注册 Marketplace 并安装插件：
 
     codex plugin marketplace add .
+    codex plugin add task-anchor@task-anchor-local
 
-然后：
+然后在 Codex 的 Plugins 中确认 Task Anchor 已启用，并在 Hooks 设置（CLI 可用 `/hooks`）中允许、信任该插件的两个 Hook：
 
-1. 重启 Codex 桌面版。
-2. 打开 Plugins。
-3. 选择 Task Anchor Local Marketplace。
-4. 安装并启用 Task Anchor。
-5. 打开 Codex 设置中的 Hooks 页面；CLI 也可以输入 `/hooks`。
-6. 找到 Task Anchor 提供的 Hook，将其设为**允许**，并完成**信任**。
-7. 确认 Task Anchor Hook 不再显示“待审查”“未信任”或“已禁用”。
-8. 新建一个 Codex 任务进行测试。
+- `UserPromptSubmit`
+- `PostCompact`
 
-只有同时满足“插件已启用”和“Hook 已允许且已信任”，安装才算完成。
+Hook 文件变化后，Codex 会要求重新审查和信任；在重新信任前，更新后的 Hook 会被跳过。
 
-如果曾在 Hook 获得信任前调用 `$task-anchor`，那次调用不会自动补存。完成信任后，必须重新显式调用一次 `$task-anchor` 并附上要锚定的任务指令。
+## 更新本地插件
 
-Codex CLI 0.144.1 没有 codex plugin install 或 codex plugin add 子命令。CLI 负责注册 Marketplace，插件安装动作在桌面版 Plugins 界面完成。
+更新源码并通过缓存版本号生成器更新版本后，重新安装当前 Marketplace 中的插件：
 
-## 不克隆直接注册 Git 仓库
+    python C:\Users\zhang\.codex\skills\.system\plugin-creator\scripts\update_plugin_cachebuster.py plugins\task-anchor
+    codex plugin add task-anchor@task-anchor-local
 
-仓库发布到 GitHub 后，也可以直接执行：
-
-    codex plugin marketplace add owner/repository
-
-需要固定分支或标签时：
-
-    codex plugin marketplace add owner/repository --ref main
-
-## 从 ZIP 安装
-
-ZIP 不是 Codex 的专用安装包。先完整解压，再进入包含 .agents 目录的仓库根目录执行：
-
-    codex plugin marketplace add .
-
-之后仍然在桌面版 Plugins 界面安装。
-
-## 更新
-
-先更新源码：
-
-    git pull
-
-Codex CLI 0.144.1 的 `marketplace upgrade` 不支持本地 Marketplace。请在桌面版 Plugins 中卸载 Task Anchor，再从 Task Anchor Local Marketplace 重新安装并启用。
-
-随后重新允许并信任 Task Anchor Hook，重启 Codex 桌面版，并在新任务中测试。
-
-Hook 文件发生变化后，Codex 会按新 Hook 哈希重新要求审查；重新信任之前，更新后的 Hook 会被跳过。
-
-## Hook 审计日志
-
-插件在 `PLUGIN_DATA/audit/events.jsonl` 中记录最小运行证据。日志只包含：Hook 事件、UTC 时间、会话哈希、执行状态、指令字节数和 SHA-256，不保存任务指令正文，也不记录普通用户消息。
-
-压缩恢复成功时，同一次压缩应依次出现：
-
-    compact_received
-    anchor_loaded
-    restore_emitted
-
-如果没有 `compact_received`，说明 Codex 没有执行该恢复 Hook；如果有前两项但没有 `restore_emitted`，说明恢复处理没有完成。
+重新信任 Hook，并在新的 Codex 对话中验证。已经创建的对话不会自动重新加载修改后的 Skill 内容。
 
 ## 使用
 
-开始长任务时显式调用：
+开始任务 A：
 
-    $task-anchor <你的任务指令>
+    $task-anchor <任务 A 的完整指令>
 
-插件只在第一次显式调用时保存最初任务指令。同一个 Codex 任务内再次调用不会覆盖原文。
+同一对话中开始任务 B：
 
-调用前必须确认 Task Anchor Hook 已允许且已信任；否则只会加载 Skill，不会保存任务锚点。
+    $task-anchor <任务 B 的完整指令>
+
+每一次显式调用都会生成新的 `task_id`。调用任务 B 时，插件会把该会话中已有任务标记为 `status = 0`，并以 `closed_reason = superseded_by_new_task` 记录关闭原因，再创建任务 B 为 `status = 1`。
+
+没有 `$task-anchor-end`。不要通过最终回复、原生 TOLIST 清空、普通工具调用或 `Stop` 事件结束任务。
+
+## 压缩后的状态
+
+`PostCompact` 只读取当前 `task_id`：
+
+- `status = 1`：重新注入原始任务指令，并附加 `task_id`、`status = 1` 和“自动完成状态无法验证”的被动提醒。
+- `status = 0`：不注入任务指令。
+
+当前 Codex 插件接口没有插件可订阅的可靠“语义任务已完成”事件。因此普通最终交付后，任务仍保持 `status = 1`；压缩时会继续恢复它。提醒不提问、不提供选项、不等待用户回应、不打断任务，也不会改变状态。下一次显式 `$task-anchor` 才会关闭旧任务并创建新任务。
+
+## Hook 审计日志
+
+审计日志位于 `PLUGIN_DATA/audit/events.jsonl`。它仅保存 Hook 事件、UTC 时间、会话哈希、项目哈希、任务 ID、状态及指令字节数/SHA-256；不保存任务正文、普通用户消息或真实 `session_id`。
+
+常见事件包括：
+
+    activation_received
+    task_closed
+    activation_completed
+    post_compact_received
+    restore_emitted
+    restore_closed
 
 ## 仓库结构
 
@@ -99,4 +78,4 @@ Hook 文件发生变化后，Codex 会按新 Hook 哈希重新要求审查；重
     plugins/task-anchor/scripts/hook_entry.py
     plugins/task-anchor/skills/task-anchor/SKILL.md
 
-插件不包含 MCP、小模型、自定义 TOLIST、PostToolUse 或 PreCompact。
+插件不包含 MCP、小模型、自定义 TOLIST、`PostToolUse`、`PreCompact` 或常驻外部进程。
