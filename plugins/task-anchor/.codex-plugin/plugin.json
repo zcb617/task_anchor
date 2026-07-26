@@ -1,6 +1,6 @@
 {
   "name": "task-anchor",
-  "version": "0.1.0+codex.20260716083417",
+  "version": "0.1.1+codex.20260726141247",
   "description": "Keep the current explicitly started task across Codex context compactions.",
   "author": {
     "name": "Local developer"
@@ -15,7 +15,7 @@
   "interface": {
     "displayName": "Task Anchor",
     "shortDescription": "Start a task and restore it after compaction.",
-    "longDescription": "Each explicit invocation creates a new task, supersedes prior tasks in the same conversation, and restores only the current active task after compaction with a passive status reminder.",
+    "longDescription": "Each explicit invocation creates a new task, supersedes prior tasks in the same conversation, and restores only the current active task after compaction. Users can explicitly end the current task when it is complete.",
     "developerName": "Local developer",
     "category": "Productivity",
     "capabilities": [

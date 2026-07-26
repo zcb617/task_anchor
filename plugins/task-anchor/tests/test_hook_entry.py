@@ -202,22 +202,57 @@ class HookEntryTests(unittest.TestCase):
         self.assertTrue(all(item == outputs[0] for item in outputs))
         self.assertIn(task_id, outputs[0]["hookSpecificOutput"]["additionalContext"])
 
-    def test_normal_reply_and_end_marker_do_not_close_task(self) -> None:
+    def test_normal_reply_does_not_close_task(self) -> None:
         task_id = self.activate("$task-anchor 仍在进行")
         self.assertIsNone(
             HOOK.handle_hook(self.user_prompt("任务已完成，给用户交付。"), self.data_root)
-        )
-        self.assertIsNone(
-            HOOK.handle_hook(self.user_prompt("$task-anchor-end"), self.data_root)
         )
         self.assertEqual(self.current_task_id(), task_id)
         self.assertEqual(
             self.task_metadata(task_id)["status"], HOOK.TASK_STATUS_ACTIVE
         )
 
-    def test_end_marker_without_anchor_is_not_an_activation(self) -> None:
-        self.assertIsNone(HOOK.handle_hook(self.user_prompt("$task-anchor-end"), self.data_root))
+    def test_explicit_end_closes_current_task_and_stops_restoration(self) -> None:
+        task_id = self.activate("$task-anchor 需要手工结束")
+
+        self.assertIsNone(
+            HOOK.handle_hook(self.user_prompt("$task-anchor-end"), self.data_root)
+        )
+
+        self.assertEqual(self.current_task_id(), task_id)
+        metadata = self.task_metadata(task_id)
+        self.assertEqual(metadata["status"], HOOK.TASK_STATUS_CLOSED)
+        self.assertEqual(metadata["closed_reason"], HOOK.CLOSED_REASON_MANUAL)
+        self.assertIn("closed_at", metadata)
+        self.assertIsNone(HOOK.handle_hook(self.post_compact(), self.data_root))
+        closed_events = [
+            event
+            for event in self.audit_events()
+            if event["status"] == "task_closed"
+        ]
+        self.assertEqual(closed_events[-1]["task_id"], task_id)
+        self.assertEqual(
+            closed_events[-1]["closed_reason"], HOOK.CLOSED_REASON_MANUAL
+        )
+
+    def test_explicit_end_without_current_task_reports_no_task(self) -> None:
+        result = HOOK.handle_hook(self.user_prompt("$task-anchor-end"), self.data_root)
+
+        self.assertIn("没有可手工结束的任务", result["systemMessage"])
         self.assertFalse(HOOK.current_task_path(self.data_root, self.session_id).exists())
+
+    def test_explicit_end_rejects_cross_workspace_request(self) -> None:
+        self.activate("$task-anchor 不得跨项目结束")
+        (self.other_workspace / ".git").mkdir()
+
+        result = HOOK.handle_hook(
+            self.user_prompt("$task-anchor-end", cwd=self.other_workspace), self.data_root
+        )
+
+        self.assertIn("当前项目与任务锚点不一致", result["systemMessage"])
+        self.assertEqual(
+            self.task_metadata(self.current_task_id())["status"], HOOK.TASK_STATUS_ACTIVE
+        )
 
     def test_post_compact_does_not_complete_pending_task_transition(self) -> None:
         old_task_id = self.activate("$task-anchor 旧任务仍保持活动")
@@ -424,17 +459,24 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(set(config["hooks"]), {"UserPromptSubmit", "PostCompact"})
         self.assertNotIn("matcher", config["hooks"]["PostCompact"][0])
 
-    def test_only_task_anchor_skill_remains(self) -> None:
+    def test_start_and_end_skills_are_registered(self) -> None:
         skill = (PLUGIN_ROOT / "skills" / "task-anchor" / "SKILL.md").read_text(
             encoding="utf-8"
         )
         metadata = (
             PLUGIN_ROOT / "skills" / "task-anchor" / "agents" / "openai.yaml"
         ).read_text(encoding="utf-8")
+        end_skill = (
+            PLUGIN_ROOT / "skills" / "task-anchor-end" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        end_metadata = (
+            PLUGIN_ROOT / "skills" / "task-anchor-end" / "agents" / "openai.yaml"
+        ).read_text(encoding="utf-8")
         self.assertIn("Codex 原生 TOLIST", skill)
-        self.assertNotIn("$task-anchor-end", skill)
+        self.assertIn("$task-anchor-end", skill)
         self.assertIn("allow_implicit_invocation: false", metadata)
-        self.assertFalse((PLUGIN_ROOT / "skills" / "task-anchor-end").exists())
+        self.assertIn("手工结束", end_skill)
+        self.assertIn("allow_implicit_invocation: false", end_metadata)
 
 
 if __name__ == "__main__":

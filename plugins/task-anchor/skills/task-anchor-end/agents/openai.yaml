@@ -1,0 +1,7 @@
+interface:
+  display_name: "Task Anchor End"
+  short_description: "手工结束当前锚定任务，使其不再在压缩后恢复"
+  default_prompt: "使用 $task-anchor-end 手工结束当前 Task Anchor 任务。"
+
+policy:
+  allow_implicit_invocation: false

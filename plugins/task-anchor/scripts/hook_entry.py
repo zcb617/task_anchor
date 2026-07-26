@@ -17,6 +17,10 @@ from typing import Any, Iterator
 
 SKILL_MARKER = "$task-anchor"
 SKILL_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])\$task-anchor(?![A-Za-z0-9_-])")
+END_SKILL_MARKER = "$task-anchor-end"
+END_SKILL_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])\$task-anchor-end(?![A-Za-z0-9_-])"
+)
 POST_COMPACT = "PostCompact"
 USER_PROMPT_SUBMIT = "UserPromptSubmit"
 AUDIT_LOG_RELATIVE_PATH = Path("audit") / "events.jsonl"
@@ -25,6 +29,7 @@ SESSION_KEY_FIELD = "session_key"
 TASK_STATUS_ACTIVE = 1
 TASK_STATUS_CLOSED = 0
 CLOSED_REASON_SUPERSEDED = "superseded_by_new_task"
+CLOSED_REASON_MANUAL = "manually_ended"
 SCHEMA_VERSION = 2
 
 
@@ -203,6 +208,10 @@ def write_audit_event(
 
 def is_explicit_activation(prompt: Any) -> bool:
     return isinstance(prompt, str) and SKILL_PATTERN.search(prompt) is not None
+
+
+def is_explicit_end(prompt: Any) -> bool:
+    return isinstance(prompt, str) and END_SKILL_PATTERN.search(prompt) is not None
 
 
 def _acquire_lock(handle: Any) -> None:
@@ -599,6 +608,76 @@ def start_new_task(
     return None
 
 
+def end_current_task(
+    data: dict[str, Any],
+    data_root: Path | None,
+) -> dict[str, Any] | None:
+    prompt = data.get("prompt")
+    if not is_explicit_end(prompt):
+        return None
+
+    if data_root is None:
+        return warning("Task Anchor 无法结束任务：Hook 未提供 PLUGIN_DATA。")
+    current_session_id = read_session_id(data)
+    if current_session_id is None:
+        write_audit_event(data_root, data, "manual_end_missing_session_id")
+        return warning("Task Anchor 无法结束任务：Hook 输入缺少 session_id。")
+
+    try:
+        with session_lock(session_directory(data_root, current_session_id)):
+            if read_pending_transition(data_root, current_session_id) is not None:
+                write_audit_event(data_root, data, "manual_end_pending_transition")
+                return warning(
+                    "Task Anchor 检测到未完成的任务切换，无法确认要结束的任务；"
+                    "请稍后重新调用 $task-anchor-end。"
+                )
+
+            task_id = read_current_task_id(data_root, current_session_id)
+            if task_id is None:
+                write_audit_event(data_root, data, "manual_end_no_current_task")
+                return warning("Task Anchor 当前会话没有可手工结束的任务。")
+
+            _, metadata = load_task(
+                data,
+                data_root,
+                current_session_id,
+                task_id,
+            )
+            if metadata["status"] == TASK_STATUS_CLOSED:
+                write_audit_event(
+                    data_root,
+                    data,
+                    "manual_end_already_closed",
+                    task_id=task_id,
+                    closed_reason=metadata.get("closed_reason"),
+                )
+                return warning("Task Anchor 当前任务已经结束。")
+
+            closed_metadata = dict(metadata)
+            closed_metadata["status"] = TASK_STATUS_CLOSED
+            closed_metadata["closed_at"] = utc_now()
+            closed_metadata["closed_reason"] = CLOSED_REASON_MANUAL
+            atomic_write_json(
+                task_metadata_path(data_root, current_session_id, task_id),
+                closed_metadata,
+            )
+    except LockUnavailable:
+        write_audit_event(data_root, data, "manual_end_lock_unavailable")
+        return warning("Task Anchor 当前任务状态正由另一项操作切换，请稍后重新调用。")
+    except (OSError, StorageError) as exc:
+        write_audit_event(data_root, data, "manual_end_failed")
+        return warning(f"Task Anchor 无法结束当前任务：{exc}")
+
+    write_audit_event(
+        data_root,
+        data,
+        "task_closed",
+        task_id=task_id,
+        closed_reason=CLOSED_REASON_MANUAL,
+    )
+    return None
+
+
 def restore_after_post_compact(
     data: dict[str, Any],
     data_root: Path | None,
@@ -696,6 +775,8 @@ def handle_hook(
 ) -> dict[str, Any] | None:
     event_name = data.get("hook_event_name")
     if event_name == USER_PROMPT_SUBMIT:
+        if is_explicit_end(data.get("prompt")):
+            return end_current_task(data, data_root)
         return start_new_task(data, data_root)
     if event_name == POST_COMPACT:
         return restore_after_post_compact(data, data_root)
