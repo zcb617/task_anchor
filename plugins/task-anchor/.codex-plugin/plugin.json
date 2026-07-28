@@ -1,6 +1,6 @@
 {
   "name": "task-anchor",
-  "version": "0.1.1+codex.20260726141247",
+  "version": "0.1.2+codex.20260729003917",
   "description": "Keep the current explicitly started task across Codex context compactions.",
   "author": {
     "name": "Local developer"
