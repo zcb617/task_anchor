@@ -23,6 +23,9 @@ END_SKILL_PATTERN = re.compile(
 )
 POST_COMPACT = "PostCompact"
 USER_PROMPT_SUBMIT = "UserPromptSubmit"
+CHINESE_COMMUNICATION_SKILL_INSTRUCTION = (
+    "请使用 chinese-communication Skill 与用户进行沟通。"
+)
 AUDIT_LOG_RELATIVE_PATH = Path("audit") / "events.jsonl"
 WORKSPACE_SHA256_FIELD = "workspace_sha256"
 SESSION_KEY_FIELD = "session_key"
@@ -105,6 +108,18 @@ def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
 
 def warning(message: str) -> dict[str, Any]:
     return {"continue": True, "systemMessage": message}
+
+
+def add_chinese_communication_skill_instruction(
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    result = dict(payload or {})
+    hook_output = result.get("hookSpecificOutput")
+    specific_output = dict(hook_output) if isinstance(hook_output, dict) else {}
+    specific_output["hookEventName"] = USER_PROMPT_SUBMIT
+    specific_output["additionalContext"] = CHINESE_COMMUNICATION_SKILL_INSTRUCTION
+    result["hookSpecificOutput"] = specific_output
+    return result
 
 
 def read_session_id(data: dict[str, Any]) -> str | None:
@@ -776,8 +791,10 @@ def handle_hook(
     event_name = data.get("hook_event_name")
     if event_name == USER_PROMPT_SUBMIT:
         if is_explicit_end(data.get("prompt")):
-            return end_current_task(data, data_root)
-        return start_new_task(data, data_root)
+            return add_chinese_communication_skill_instruction(
+                end_current_task(data, data_root)
+            )
+        return add_chinese_communication_skill_instruction(start_new_task(data, data_root))
     if event_name == POST_COMPACT:
         return restore_after_post_compact(data, data_root)
     return None

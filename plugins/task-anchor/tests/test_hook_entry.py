@@ -117,11 +117,27 @@ class HookEntryTests(unittest.TestCase):
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
     def activate(self, prompt: str) -> str:
-        self.assertIsNone(HOOK.handle_hook(self.user_prompt(prompt), self.data_root))
+        self.assert_chinese_communication_instruction(
+            HOOK.handle_hook(self.user_prompt(prompt), self.data_root)
+        )
         return self.current_task_id()
 
+    def assert_chinese_communication_instruction(
+        self, result: dict[str, object] | None
+    ) -> None:
+        self.assertIsNotNone(result)
+        assert result is not None
+        output = result["hookSpecificOutput"]
+        self.assertEqual(output["hookEventName"], HOOK.USER_PROMPT_SUBMIT)
+        self.assertEqual(
+            output["additionalContext"],
+            "请使用 chinese-communication Skill 与用户进行沟通。",
+        )
+
     def test_ordinary_prompt_is_ignored(self) -> None:
-        self.assertIsNone(HOOK.handle_hook(self.user_prompt("普通对话"), self.data_root))
+        self.assert_chinese_communication_instruction(
+            HOOK.handle_hook(self.user_prompt("普通对话"), self.data_root)
+        )
         self.assertFalse(HOOK.current_task_path(self.data_root, self.session_id).exists())
 
     def test_explicit_activation_creates_a_task_record(self) -> None:
@@ -204,7 +220,7 @@ class HookEntryTests(unittest.TestCase):
 
     def test_normal_reply_does_not_close_task(self) -> None:
         task_id = self.activate("$task-anchor 仍在进行")
-        self.assertIsNone(
+        self.assert_chinese_communication_instruction(
             HOOK.handle_hook(self.user_prompt("任务已完成，给用户交付。"), self.data_root)
         )
         self.assertEqual(self.current_task_id(), task_id)
@@ -215,7 +231,7 @@ class HookEntryTests(unittest.TestCase):
     def test_explicit_end_closes_current_task_and_stops_restoration(self) -> None:
         task_id = self.activate("$task-anchor 需要手工结束")
 
-        self.assertIsNone(
+        self.assert_chinese_communication_instruction(
             HOOK.handle_hook(self.user_prompt("$task-anchor-end"), self.data_root)
         )
 
@@ -239,6 +255,7 @@ class HookEntryTests(unittest.TestCase):
         result = HOOK.handle_hook(self.user_prompt("$task-anchor-end"), self.data_root)
 
         self.assertIn("没有可手工结束的任务", result["systemMessage"])
+        self.assert_chinese_communication_instruction(result)
         self.assertFalse(HOOK.current_task_path(self.data_root, self.session_id).exists())
 
     def test_explicit_end_rejects_cross_workspace_request(self) -> None:
@@ -250,6 +267,7 @@ class HookEntryTests(unittest.TestCase):
         )
 
         self.assertIn("当前项目与任务锚点不一致", result["systemMessage"])
+        self.assert_chinese_communication_instruction(result)
         self.assertEqual(
             self.task_metadata(self.current_task_id())["status"], HOOK.TASK_STATUS_ACTIVE
         )
@@ -340,6 +358,7 @@ class HookEntryTests(unittest.TestCase):
         del activation["cwd"]
         activation_result = HOOK.handle_hook(activation, self.data_root)
         self.assertIn("缺少 cwd", activation_result["systemMessage"])
+        self.assert_chinese_communication_instruction(activation_result)
         self.assertFalse(HOOK.current_task_path(self.data_root, self.session_id).exists())
 
         self.activate("$task-anchor 有效任务")
@@ -375,7 +394,7 @@ class HookEntryTests(unittest.TestCase):
         first_task_id = self.activate("$task-anchor 第一个会话")
         other_session = "another-session"
         second = self.user_prompt("$task-anchor 第二个会话", session_id=other_session)
-        self.assertIsNone(HOOK.handle_hook(second, self.data_root))
+        self.assert_chinese_communication_instruction(HOOK.handle_hook(second, self.data_root))
         second_task_id = self.current_task_id(other_session)
 
         first_result = HOOK.handle_hook(self.post_compact(), self.data_root)
@@ -410,7 +429,7 @@ class HookEntryTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(first.returncode, 0)
-        self.assertEqual(first.stdout, "")
+        self.assert_chinese_communication_instruction(json.loads(first.stdout))
         first_task_id = self.current_task_id()
 
         second = subprocess.run(
@@ -422,7 +441,7 @@ class HookEntryTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(second.returncode, 0)
-        self.assertEqual(second.stdout, "")
+        self.assert_chinese_communication_instruction(json.loads(second.stdout))
         second_task_id = self.current_task_id()
         self.assertNotEqual(first_task_id, second_task_id)
 
@@ -459,7 +478,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(set(config["hooks"]), {"UserPromptSubmit", "PostCompact"})
         self.assertNotIn("matcher", config["hooks"]["PostCompact"][0])
 
-    def test_start_and_end_skills_are_registered(self) -> None:
+    def test_start_end_and_chinese_communication_skills_are_registered(self) -> None:
         skill = (PLUGIN_ROOT / "skills" / "task-anchor" / "SKILL.md").read_text(
             encoding="utf-8"
         )
@@ -472,11 +491,24 @@ class PluginContractTests(unittest.TestCase):
         end_metadata = (
             PLUGIN_ROOT / "skills" / "task-anchor-end" / "agents" / "openai.yaml"
         ).read_text(encoding="utf-8")
+        chinese_communication_skill = (
+            PLUGIN_ROOT / "skills" / "chinese-communication" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        chinese_communication_metadata = (
+            PLUGIN_ROOT
+            / "skills"
+            / "chinese-communication"
+            / "agents"
+            / "openai.yaml"
+        ).read_text(encoding="utf-8")
         self.assertIn("Codex 原生 TOLIST", skill)
         self.assertIn("$task-anchor-end", skill)
         self.assertIn("allow_implicit_invocation: false", metadata)
         self.assertIn("手工结束", end_skill)
         self.assertIn("allow_implicit_invocation: false", end_metadata)
+        self.assertIn("name: chinese-communication", chinese_communication_skill)
+        self.assertIn("体貌助词", chinese_communication_skill)
+        self.assertIn("display_name: \"中文沟通\"", chinese_communication_metadata)
 
 
 if __name__ == "__main__":
