@@ -299,7 +299,7 @@ def _process_alive(pid: int) -> bool:
                 ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=10,
                 check=False,
             )
             output = result.stdout.strip().lower()
@@ -344,7 +344,7 @@ def _terminate_pid(pid: int, grace_seconds: float = 2.0) -> dict[str, Any]:
         process = _LIVE_PROCESSES.pop(pid, None)
         if process is not None:
             try:
-                process.wait(timeout=5)
+                process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 pass
         return {"status": "already_stopped", "pid": pid}
@@ -354,7 +354,7 @@ def _terminate_pid(pid: int, grace_seconds: float = 2.0) -> dict[str, Any]:
             ["taskkill", "/PID", str(pid), "/T", "/F"],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=30,
             check=False,
         )
         if result.returncode != 0 and _process_alive(pid):
@@ -364,7 +364,7 @@ def _terminate_pid(pid: int, grace_seconds: float = 2.0) -> dict[str, Any]:
         process = _LIVE_PROCESSES.pop(pid, None)
         if process is not None:
             try:
-                process.wait(timeout=5)
+                process.wait(timeout=10)
             except subprocess.TimeoutExpired as exc:
                 raise ResourceError(f"PID {pid} 已请求结束但未能回收。") from exc
         return {"status": "stopped", "pid": pid}
@@ -378,7 +378,7 @@ def _terminate_pid(pid: int, grace_seconds: float = 2.0) -> dict[str, Any]:
         raise ResourceError(f"无法结束 PID {pid} 所在进程组：{exc}") from exc
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline and _process_alive(pid):
-        time.sleep(0.05)
+        time.sleep(0.1)
     if _process_alive(pid):
         try:
             os.killpg(group_id, signal.SIGKILL)
@@ -388,7 +388,7 @@ def _terminate_pid(pid: int, grace_seconds: float = 2.0) -> dict[str, Any]:
             raise ResourceError(f"无法强制结束 PID {pid} 所在进程组：{exc}") from exc
     process = _LIVE_PROCESSES.pop(pid, None)
     if process is not None:
-        process.wait(timeout=5)
+        process.wait(timeout=10)
     return {"status": "stopped", "pid": pid}
 
 
@@ -426,7 +426,7 @@ def start_process(
     command: str | None = None,
     shell: bool = False,
     wait: bool = True,
-    timeout_ms: int | None = 120_000,
+    timeout_ms: int | None = 1_800_000,
     stop_policy: Any = None,
     name: str | None = None,
     session_id: str | None = None,

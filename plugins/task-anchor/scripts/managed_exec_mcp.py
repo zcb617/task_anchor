@@ -40,7 +40,7 @@ TOOL_SCHEMA = {
         "shell": {"type": "boolean", "default": False},
         "cwd": {"type": "string", "description": "工作目录，默认当前工作目录。"},
         "wait": {"type": "boolean", "default": True, "description": "是否等待命令退出。"},
-        "timeout_ms": {"type": ["integer", "null"], "default": 120000},
+            "timeout_ms": {"type": ["integer", "null"], "default": 1800000},
         "stop_policy": {
             "type": "string",
             "enum": ["cleanup", "keep"],
@@ -98,7 +98,7 @@ def execute_tool(arguments: dict[str, Any]) -> dict[str, Any]:
             command=arguments.get("command"),
             shell=bool(arguments.get("shell", False)),
             wait=bool(arguments.get("wait", True)),
-            timeout_ms=arguments.get("timeout_ms", 120000),
+            timeout_ms=arguments.get("timeout_ms", 1800000),
             stop_policy=arguments.get("stop_policy"),
             name=arguments.get("name"),
         )

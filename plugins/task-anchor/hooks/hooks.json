@@ -7,7 +7,7 @@
             "type": "command",
             "command": "python3 \"$PLUGIN_ROOT/scripts/hook_entry.py\"",
             "commandWindows": "python -c \"import os,runpy;runpy.run_path(os.path.join(os.environ['PLUGIN_ROOT'],'scripts','hook_entry.py'),run_name='__main__')\"",
-            "timeout": 5
+            "timeout": 10
           }
         ]
       }
@@ -19,7 +19,7 @@
             "type": "command",
             "command": "python3 \"$PLUGIN_ROOT/scripts/hook_entry.py\"",
             "commandWindows": "python -c \"import os,runpy;runpy.run_path(os.path.join(os.environ['PLUGIN_ROOT'],'scripts','hook_entry.py'),run_name='__main__')\"",
-            "timeout": 5
+            "timeout": 10
           }
         ]
       }
@@ -32,7 +32,7 @@
             "type": "command",
             "command": "python3 \"$PLUGIN_ROOT/scripts/hook_entry.py\"",
             "commandWindows": "python -c \"import os,runpy;runpy.run_path(os.path.join(os.environ['PLUGIN_ROOT'],'scripts','hook_entry.py'),run_name='__main__')\"",
-            "timeout": 5
+            "timeout": 10
           }
         ]
       }
@@ -44,7 +44,7 @@
             "type": "command",
             "command": "python3 \"$PLUGIN_ROOT/scripts/hook_entry.py\"",
             "commandWindows": "python -c \"import os,runpy;runpy.run_path(os.path.join(os.environ['PLUGIN_ROOT'],'scripts','hook_entry.py'),run_name='__main__')\"",
-            "timeout": 15
+            "timeout": 30
           }
         ]
       }
