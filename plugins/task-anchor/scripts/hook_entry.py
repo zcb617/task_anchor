@@ -910,8 +910,8 @@ def guard_pre_tool_use(data: dict[str, Any]) -> dict[str, Any] | None:
             "hookEventName": PRE_TOOL_USE,
             "permissionDecision": "deny",
             "permissionDecisionReason": (
-                f"命令包含进程关键词 {matched_keyword!r}，必须通过 "
-                "mcp__task_anchor__managed_exec 执行。"
+                f"Process keyword {matched_keyword!r} requires "
+                "mcp__task_anchor__managed_exec."
             ),
         },
     }

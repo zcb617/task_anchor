@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import importlib.util
 import json
 import os
@@ -356,6 +357,9 @@ class HookEntryTests(unittest.TestCase):
             self.assertEqual(
                 denied["hookSpecificOutput"]["permissionDecision"], "deny"
             )
+            self.assertTrue(
+                denied["hookSpecificOutput"]["permissionDecisionReason"].isascii()
+            )
             self.assertNotIn("continue", denied)
 
         for command in ["rg -n pattern .", "Get-Content -Path README.md"]:
@@ -380,6 +384,38 @@ class HookEntryTests(unittest.TestCase):
                 self.data_root,
             )
         )
+
+    def test_pre_tool_use_response_is_safe_for_windows_legacy_encoding(self) -> None:
+        command = "".join(["n", "p", "m"]) + " run dev"
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "session_id": self.session_id,
+            "cwd": str(self.workspace),
+            "tool_name": "exec",
+            "tool_input": {"cmd": command},
+        }
+        previous_stdin = sys.stdin
+        previous_stdout = sys.stdout
+        previous_plugin_data = os.environ.get("PLUGIN_DATA")
+        output = io.BytesIO()
+        try:
+            os.environ["PLUGIN_DATA"] = str(self.data_root)
+            sys.stdin = io.TextIOWrapper(
+                io.BytesIO(json.dumps(payload, ensure_ascii=False).encode("utf-8")),
+                encoding="utf-8",
+            )
+            sys.stdout = io.TextIOWrapper(output, encoding="cp1252")
+            self.assertEqual(HOOK.main(), 0)
+            sys.stdout.flush()
+            serialized = output.getvalue().decode("cp1252")
+            self.assertIn('"permissionDecision": "deny"', serialized)
+        finally:
+            sys.stdin = previous_stdin
+            sys.stdout = previous_stdout
+            if previous_plugin_data is None:
+                os.environ.pop("PLUGIN_DATA", None)
+            else:
+                os.environ["PLUGIN_DATA"] = previous_plugin_data
 
     def test_stop_cleans_default_resources_but_keeps_explicit_keep_resource(self) -> None:
         HOOK.resource_manager.set_active_context(
