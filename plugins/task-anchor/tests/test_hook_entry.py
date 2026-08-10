@@ -343,19 +343,33 @@ class HookEntryTests(unittest.TestCase):
             HOOK.handle_hook(self.post_compact("unexpected"), self.data_root)
         )
 
-    def test_pre_tool_use_denies_raw_shell_and_allows_managed_exec(self) -> None:
-        denied = HOOK.handle_hook(
-            {
-                "hook_event_name": "PreToolUse",
-                "tool_name": "exec",
-                "tool_input": {"cmd": "npm run dev"},
-            },
-            self.data_root,
-        )
-        self.assertEqual(
-            denied["hookSpecificOutput"]["permissionDecision"], "deny"
-        )
-        self.assertNotIn("continue", denied)
+    def test_pre_tool_use_requires_managed_exec_for_process_commands(self) -> None:
+        for command in ["npm run dev", r"C:\Java\bin\java.exe -jar app.jar"]:
+            denied = HOOK.handle_hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "exec",
+                    "tool_input": {"cmd": command},
+                },
+                self.data_root,
+            )
+            self.assertEqual(
+                denied["hookSpecificOutput"]["permissionDecision"], "deny"
+            )
+            self.assertNotIn("continue", denied)
+
+        for command in ["rg -n pattern .", "Get-Content -Path README.md"]:
+            self.assertIsNone(
+                HOOK.handle_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "exec",
+                        "tool_input": {"cmd": command},
+                    },
+                    self.data_root,
+                )
+            )
+
         self.assertIsNone(
             HOOK.handle_hook(
                 {

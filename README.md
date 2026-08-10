@@ -2,11 +2,11 @@
 
 ## 受管进程执行
 
-插件提供 `mcp__task_anchor__managed_exec` 工具。所有本地命令都应通过该工具执行，插件会登记 PID、工作目录、命令和停止策略。
+插件提供 `mcp__task_anchor__managed_exec` 工具。包含进程型关键词的本地命令应通过该工具执行，插件会登记 PID、工作目录、命令和停止策略；短命查询命令可以直接执行。
 
 - 默认 `stop_policy` 为 `cleanup`：Stop 时关闭该任务登记的进程树。
 - `stop_policy: "keep"`：Stop 时保留服务；建议同时设置 `name`，不再需要时使用 `operation: "stop"` 关闭。
-- `PreToolUse` Hook 会拒绝直接调用 Shell、`exec`、PowerShell、Bash 和 `local_shell`。
+- `PreToolUse` Hook 会检查命令字符串；命中 `java`、`python`、`node`、`npm`、`mvn`、`gradle` 等进程型关键词时，必须通过 `managed_exec`，`rg`、`Get-Content` 等查询命令直接放行。
 - `Stop` Hook 只清理受管且策略为 `cleanup` 的资源，不会按进程名扫描或误杀用户手工启动的程序。
 - 受控管理器会自动识别 Windows、macOS 和 Linux：Windows 使用 `taskkill /T` 结束进程树；macOS/Linux 使用独立进程组和 `killpg` 结束进程组。
 - 资源归属按“项目工作区 + 会话”隔离；同一会话内登记的资源由该会话统一管理，其他会话以及其他项目的资源都不会被当前 Stop 清理。

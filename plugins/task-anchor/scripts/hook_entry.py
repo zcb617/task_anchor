@@ -44,16 +44,39 @@ MANAGED_EXEC_TOOL_NAMES = {
     "mcp__task_anchor__managed_exec",
     "mcp__task-anchor__managed_exec",
 }
-COMMAND_TOOL_NAMES = {
-    "bash",
+PROCESS_COMMAND_KEYWORDS = (
+    "java",
+    "python",
+    "node",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "mvn",
+    "maven",
+    "gradle",
+    "go",
+    "cargo",
+    "dotnet",
+    "docker",
+    "podman",
+    "adb",
+    "ffmpeg",
+    "deno",
+    "bun",
+    "php",
+    "ruby",
+    "perl",
+)
+COMMAND_TEXT_KEYS = (
+    "command",
     "cmd",
-    "exec",
-    "exec_command",
-    "local_shell",
-    "powershell",
-    "shell",
-    "terminal",
-}
+    "shell_command",
+    "command_line",
+    "script",
+    "program",
+)
+NESTED_COMMAND_KEYS = ("tool_input", "toolInput", "arguments", "input")
 
 
 class StorageError(RuntimeError):
@@ -843,23 +866,52 @@ def _is_managed_exec_tool(tool_name: str) -> bool:
     return normalized.endswith("__managed_exec")
 
 
-def _is_command_tool(tool_name: str) -> bool:
-    return tool_name.strip().lower() in COMMAND_TOOL_NAMES
+def _command_text(data: dict[str, Any]) -> str:
+    """提取 Hook 输入中的命令字符串，不解析命令结构。"""
+
+    parts: list[str] = []
+
+    def visit(value: Any, depth: int = 0) -> None:
+        if not isinstance(value, dict) or depth > 2:
+            return
+        for key in COMMAND_TEXT_KEYS:
+            item = value.get(key)
+            if isinstance(item, str):
+                parts.append(item)
+        for key in NESTED_COMMAND_KEYS:
+            visit(value.get(key), depth + 1)
+
+    visit(data)
+    return " ".join(parts)
+
+
+def _matched_process_keyword(command_text: str) -> str | None:
+    normalized = command_text.lower()
+    return next(
+        (keyword for keyword in PROCESS_COMMAND_KEYWORDS if keyword in normalized),
+        None,
+    )
 
 
 def guard_pre_tool_use(data: dict[str, Any]) -> dict[str, Any] | None:
-    """阻止模型绕过 managed_exec 直接启动本地命令。"""
+    """命令字符串命中进程关键词时，要求通过 managed_exec 执行。"""
 
     tool_name = _tool_name(data)
-    if not tool_name or _is_managed_exec_tool(tool_name) or not _is_command_tool(tool_name):
+    if _is_managed_exec_tool(tool_name):
         return None
+
+    command_text = _command_text(data)
+    matched_keyword = _matched_process_keyword(command_text)
+    if matched_keyword is None:
+        return None
+
     return {
         "hookSpecificOutput": {
             "hookEventName": PRE_TOOL_USE,
             "permissionDecision": "deny",
             "permissionDecisionReason": (
-                "本地命令必须通过 mcp__task_anchor__managed_exec 执行；"
-                "请不要直接调用 Shell/exec。"
+                f"命令包含进程关键词 {matched_keyword!r}，必须通过 "
+                "mcp__task_anchor__managed_exec 执行。"
             ),
         },
     }
