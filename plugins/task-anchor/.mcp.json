@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "task_anchor": {
+      "command": "python",
+      "args": ["scripts/managed_exec_mcp.py"],
+      "cwd": "."
+    }
+  }
+}

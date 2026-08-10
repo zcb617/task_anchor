@@ -5,6 +5,8 @@
 目标 Codex CLI：0.144.1  
 目标目录：`D:\work\task_anchor`
 
+> **2026-08-10 实现增补**：本文原版本只描述任务锚定与压缩恢复。当前实现已在不改变任务状态语义的前提下增加受管进程执行能力：通过 `.mcp.json` 暴露 `mcp__task_anchor__managed_exec`，由资源登记器记录 PID/工作目录/停止策略，`PreToolUse` 拒绝直接 Shell 调用，`Stop` 清理默认资源；`stop_policy = keep` 的资源保留到显式停止。本文中“插件不使用 MCP/Stop Hook”及仅列出两个 Hook 的旧描述以当前代码、README 和 Skill 为准。
+
 ## 1. 唯一目标
 
 本插件只解决一个问题：

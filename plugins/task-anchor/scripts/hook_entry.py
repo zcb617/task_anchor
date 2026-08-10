@@ -15,6 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+if str(SCRIPT_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIRECTORY))
+import resource_manager
+
 SKILL_MARKER = "$task-anchor"
 SKILL_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])\$task-anchor(?![A-Za-z0-9_-])")
 END_SKILL_MARKER = "$task-anchor-end"
@@ -23,6 +28,8 @@ END_SKILL_PATTERN = re.compile(
 )
 POST_COMPACT = "PostCompact"
 USER_PROMPT_SUBMIT = "UserPromptSubmit"
+PRE_TOOL_USE = "PreToolUse"
+STOP = "Stop"
 AUDIT_LOG_RELATIVE_PATH = Path("audit") / "events.jsonl"
 WORKSPACE_SHA256_FIELD = "workspace_sha256"
 SESSION_KEY_FIELD = "session_key"
@@ -31,6 +38,22 @@ TASK_STATUS_CLOSED = 0
 CLOSED_REASON_SUPERSEDED = "superseded_by_new_task"
 CLOSED_REASON_MANUAL = "manually_ended"
 SCHEMA_VERSION = 2
+
+MANAGED_EXEC_TOOL_NAMES = {
+    "managed_exec",
+    "mcp__task_anchor__managed_exec",
+    "mcp__task-anchor__managed_exec",
+}
+COMMAND_TOOL_NAMES = {
+    "bash",
+    "cmd",
+    "exec",
+    "exec_command",
+    "local_shell",
+    "powershell",
+    "shell",
+    "terminal",
+}
 
 
 class StorageError(RuntimeError):
@@ -605,6 +628,18 @@ def start_new_task(
         instruction_bytes=len(instruction_bytes),
         closed_task_count=len(closed_task_ids),
     )
+    cwd = data.get("cwd")
+    if isinstance(cwd, str) and cwd.strip():
+        try:
+            resource_manager.set_active_context(cwd, current_session_id, new_task_id)
+        except (OSError, resource_manager.ResourceError) as exc:
+            write_audit_event(
+                data_root,
+                data,
+                "resource_context_failed",
+                task_id=new_task_id,
+                error=str(exc),
+            )
     return None
 
 
@@ -675,6 +710,30 @@ def end_current_task(
         task_id=task_id,
         closed_reason=CLOSED_REASON_MANUAL,
     )
+    cwd = data.get("cwd")
+    if isinstance(cwd, str) and cwd.strip():
+        try:
+            cleanup_result = resource_manager.cleanup_for_stop(
+                cwd=cwd,
+                session_id=current_session_id,
+                task_id=task_id,
+            )
+            write_audit_event(
+                data_root,
+                data,
+                "resources_cleaned_on_manual_end",
+                task_id=task_id,
+                stopped_count=len(cleanup_result.get("stopped", [])),
+                kept_count=len(cleanup_result.get("kept", [])),
+            )
+        except (OSError, resource_manager.ResourceError) as exc:
+            write_audit_event(
+                data_root,
+                data,
+                "resource_cleanup_failed_on_manual_end",
+                task_id=task_id,
+                error=str(exc),
+            )
     return None
 
 
@@ -769,6 +828,69 @@ def restore_after_post_compact(
     }
 
 
+def _tool_name(data: dict[str, Any]) -> str:
+    for key in ("tool_name", "toolName", "name"):
+        value = data.get(key)
+        if isinstance(value, str):
+            return value.strip()
+    return ""
+
+
+def _is_managed_exec_tool(tool_name: str) -> bool:
+    normalized = tool_name.strip().lower()
+    if normalized in {item.lower() for item in MANAGED_EXEC_TOOL_NAMES}:
+        return True
+    return normalized.endswith("__managed_exec")
+
+
+def _is_command_tool(tool_name: str) -> bool:
+    return tool_name.strip().lower() in COMMAND_TOOL_NAMES
+
+
+def guard_pre_tool_use(data: dict[str, Any]) -> dict[str, Any] | None:
+    """阻止模型绕过 managed_exec 直接启动本地命令。"""
+
+    tool_name = _tool_name(data)
+    if not tool_name or _is_managed_exec_tool(tool_name) or not _is_command_tool(tool_name):
+        return None
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": PRE_TOOL_USE,
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                "本地命令必须通过 mcp__task_anchor__managed_exec 执行；"
+                "请不要直接调用 Shell/exec。"
+            ),
+        },
+    }
+
+
+def cleanup_after_stop(data: dict[str, Any], data_root: Path | None) -> None:
+    """Stop 时清理当前会话登记的默认资源，keep 资源保持不动。"""
+
+    cwd = data.get("cwd")
+    current_session_id = read_session_id(data)
+    if not isinstance(cwd, str) or not cwd.strip() or current_session_id is None:
+        write_audit_event(data_root, data, "resource_cleanup_skipped_missing_context")
+        return
+    try:
+        result = resource_manager.cleanup_for_stop(
+            cwd=cwd,
+            session_id=current_session_id,
+        )
+        write_audit_event(
+            data_root,
+            data,
+            "resources_cleaned_on_stop",
+            stopped_count=len(result.get("stopped", [])),
+            failed_count=len(result.get("failed", [])),
+            kept_count=len(result.get("kept", [])),
+        )
+    except (OSError, resource_manager.ResourceError) as exc:
+        # Stop 清理失败不能阻塞宿主结束当前回合，但必须留下审计线索。
+        write_audit_event(data_root, data, "resource_cleanup_failed_on_stop", error=str(exc))
+
+
 def handle_hook(
     data: dict[str, Any],
     data_root: Path | None,
@@ -780,6 +902,11 @@ def handle_hook(
         return start_new_task(data, data_root)
     if event_name == POST_COMPACT:
         return restore_after_post_compact(data, data_root)
+    if event_name == PRE_TOOL_USE:
+        return guard_pre_tool_use(data)
+    if event_name == STOP:
+        cleanup_after_stop(data, data_root)
+        return None
     return None
 
 

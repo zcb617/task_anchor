@@ -1,5 +1,17 @@
 # Task Anchor
 
+## 受管进程执行
+
+插件提供 `mcp__task_anchor__managed_exec` 工具。所有本地命令都应通过该工具执行，插件会登记 PID、工作目录、命令和停止策略。
+
+- 默认 `stop_policy` 为 `cleanup`：Stop 时关闭该任务登记的进程树。
+- `stop_policy: "keep"`：Stop 时保留服务；建议同时设置 `name`，不再需要时使用 `operation: "stop"` 关闭。
+- `PreToolUse` Hook 会拒绝直接调用 Shell、`exec`、PowerShell、Bash 和 `local_shell`。
+- `Stop` Hook 只清理受管且策略为 `cleanup` 的资源，不会按进程名扫描或误杀用户手工启动的程序。
+- 受控管理器会自动识别 Windows、macOS 和 Linux：Windows 使用 `taskkill /T` 结束进程树；macOS/Linux 使用独立进程组和 `killpg` 结束进程组。
+- 资源归属按“项目工作区 + 会话”隔离；同一会话内登记的资源由该会话统一管理，其他会话以及其他项目的资源都不会被当前 Stop 清理。
+- `task_id` 只作为内部审计字段，不作为清理边界。没有明确会话上下文的资源不会进入自动清理范围；需要单独关闭某个资源时使用它的 `run_id` 或 `name`。
+
 Task Anchor 是一个 Codex 插件：用户显式调用 `$task-anchor` 时创建一项独立任务；发生上下文压缩后，只恢复该会话当前仍为活动状态的任务指令。
 
 > [!IMPORTANT]
@@ -8,8 +20,8 @@ Task Anchor 是一个 Codex 插件：用户显式调用 `$task-anchor` 时创建
 ## 已验证环境与运行方式
 
 - 已验证基线：`codex-cli 0.144.4`。
-- 需要可执行的 `codex` 和 `python`。
-- 插件仅在 Hook 触发时运行一次 Python 脚本；不启动 Node、MCP、守护进程、App Server 客户端或其他常驻第三方进程。
+- 需要可执行的 `codex` 和 Python 3；Hook 在 Windows 使用 `python`，在 macOS/Linux 使用 `python3`，MCP 配置使用 `python` 作为启动入口。
+- Hook 触发时运行一次 Python 脚本；`managed_exec` MCP 服务由 Codex 按 MCP 生命周期管理，受管业务进程由工具登记并按策略清理。
 
 ## 从源码安装
 
@@ -18,10 +30,12 @@ Task Anchor 是一个 Codex 插件：用户显式调用 `$task-anchor` 时创建
     codex plugin marketplace add .
     codex plugin add task-anchor@task-anchor-local
 
-然后在 Codex 的 Plugins 中确认 Task Anchor 已启用，并在 Hooks 设置（CLI 可用 `/hooks`）中允许、信任该插件的两个 Hook：
+然后在 Codex 的 Plugins 中确认 Task Anchor 已启用，并在 Hooks 设置（CLI 可用 `/hooks`）中允许、信任该插件的四个 Hook：
 
 - `UserPromptSubmit`
 - `PostCompact`
+- `PreToolUse`
+- `Stop`
 
 Hook 文件变化后，Codex 会要求重新审查和信任；在重新信任前，更新后的 Hook 会被跳过。
 
@@ -80,8 +94,11 @@ Hook 文件变化后，Codex 会要求重新审查和信任；在重新信任前
 
     .agents/plugins/marketplace.json
     plugins/task-anchor/.codex-plugin/plugin.json
+    plugins/task-anchor/.mcp.json
     plugins/task-anchor/hooks/hooks.json
     plugins/task-anchor/scripts/hook_entry.py
+    plugins/task-anchor/scripts/resource_manager.py
+    plugins/task-anchor/scripts/managed_exec_mcp.py
     plugins/task-anchor/skills/task-anchor/SKILL.md
 
-插件不包含 MCP、小模型、自定义 TOLIST、`PostToolUse`、`PreCompact` 或常驻外部进程。
+插件不包含小模型、自定义 TOLIST、`PostToolUse` 或 `PreCompact`；MCP 服务只提供受管命令执行工具。

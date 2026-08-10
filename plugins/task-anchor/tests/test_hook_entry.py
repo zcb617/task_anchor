@@ -27,6 +27,9 @@ class HookEntryTests(unittest.TestCase):
         TEST_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
         self.data_root = TEST_TEMP_ROOT / f"case-{uuid.uuid4().hex}"
         self.data_root.mkdir()
+        self.previous_runtime_root = os.environ.get("TASK_ANCHOR_RUNTIME_ROOT")
+        self.runtime_root = self.data_root / "runtime"
+        os.environ["TASK_ANCHOR_RUNTIME_ROOT"] = str(self.runtime_root)
         self.session_id = "session/含中文/../安全"
         self.workspace = self.data_root / "workspace-a"
         self.other_workspace = self.data_root / "workspace-b"
@@ -34,6 +37,10 @@ class HookEntryTests(unittest.TestCase):
         self.other_workspace.mkdir()
 
     def tearDown(self) -> None:
+        if self.previous_runtime_root is None:
+            os.environ.pop("TASK_ANCHOR_RUNTIME_ROOT", None)
+        else:
+            os.environ["TASK_ANCHOR_RUNTIME_ROOT"] = self.previous_runtime_root
         shutil.rmtree(self.data_root)
 
     def user_prompt(
@@ -63,6 +70,14 @@ class HookEntryTests(unittest.TestCase):
             "session_id": session_id or self.session_id,
             "trigger": trigger,
             "cwd": str(cwd or self.workspace),
+        }
+
+    def stop(self) -> dict[str, object]:
+        return {
+            "hook_event_name": "Stop",
+            "session_id": self.session_id,
+            "turn_id": "turn-1",
+            "cwd": str(self.workspace),
         }
 
     def session_dir(self, session_id: str | None = None) -> Path:
@@ -328,6 +343,65 @@ class HookEntryTests(unittest.TestCase):
             HOOK.handle_hook(self.post_compact("unexpected"), self.data_root)
         )
 
+    def test_pre_tool_use_denies_raw_shell_and_allows_managed_exec(self) -> None:
+        denied = HOOK.handle_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "exec",
+                "tool_input": {"cmd": "npm run dev"},
+            },
+            self.data_root,
+        )
+        self.assertEqual(
+            denied["hookSpecificOutput"]["permissionDecision"], "deny"
+        )
+        self.assertNotIn("continue", denied)
+        self.assertIsNone(
+            HOOK.handle_hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "mcp__task_anchor__managed_exec",
+                    "tool_input": {"program": "npm", "args": ["run", "dev"]},
+                },
+                self.data_root,
+            )
+        )
+
+    def test_stop_cleans_default_resources_but_keeps_explicit_keep_resource(self) -> None:
+        HOOK.resource_manager.set_active_context(
+            str(self.workspace), self.session_id, f"hook-task-{uuid.uuid4()}"
+        )
+        cleanup_resource = HOOK.resource_manager.start_process(
+            cwd=str(self.workspace),
+            program=sys.executable,
+            args=["-c", "import time; time.sleep(30)"],
+            wait=False,
+            session_id=self.session_id,
+        )
+        keep_resource = HOOK.resource_manager.start_process(
+            cwd=str(self.workspace),
+            program=sys.executable,
+            args=["-c", "import time; time.sleep(30)"],
+            wait=False,
+            stop_policy="keep",
+            name="hook-test-keep",
+            session_id=self.session_id,
+        )
+        try:
+            self.assertIsNone(HOOK.handle_hook(self.stop(), self.data_root))
+            self.assertFalse(
+                HOOK.resource_manager._process_alive(cleanup_resource["pid"])
+            )
+            self.assertTrue(
+                HOOK.resource_manager._process_alive(keep_resource["pid"])
+            )
+        finally:
+            HOOK.resource_manager.stop_process(
+                cwd=str(self.workspace),
+                run_id=keep_resource["run_id"],
+                include_keep=True,
+            )
+
     def test_cross_workspace_post_compact_is_not_injected(self) -> None:
         (self.other_workspace / ".git").mkdir()
         self.activate("$task-anchor 不得跨项目继续")
@@ -445,7 +519,7 @@ class HookEntryTests(unittest.TestCase):
 
 
 class PluginContractTests(unittest.TestCase):
-    def test_plugin_manifest_has_no_mcp_or_hook_override(self) -> None:
+    def test_plugin_manifest_keeps_manifest_hooks_outside_plugin_json(self) -> None:
         manifest = json.loads(
             (PLUGIN_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
         )
@@ -454,13 +528,21 @@ class PluginContractTests(unittest.TestCase):
         self.assertNotIn("mcpServers", manifest)
         self.assertNotIn("apps", manifest)
         self.assertNotIn("hooks", manifest)
+        mcp_config = json.loads(
+            (PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8")
+        )
+        self.assertIn("task_anchor", mcp_config["mcpServers"])
 
-    def test_only_required_hook_events_are_registered(self) -> None:
+    def test_task_and_resource_hook_events_are_registered(self) -> None:
         config = json.loads(
             (PLUGIN_ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(set(config["hooks"]), {"UserPromptSubmit", "PostCompact"})
+        self.assertEqual(
+            set(config["hooks"]),
+            {"UserPromptSubmit", "PostCompact", "PreToolUse", "Stop"},
+        )
         self.assertNotIn("matcher", config["hooks"]["PostCompact"][0])
+        self.assertEqual(config["hooks"]["PreToolUse"][0]["matcher"], ".*")
 
     def test_start_end_and_chinese_communication_skills_are_registered(self) -> None:
         skill = (PLUGIN_ROOT / "skills" / "task-anchor" / "SKILL.md").read_text(
@@ -486,13 +568,13 @@ class PluginContractTests(unittest.TestCase):
             / "openai.yaml"
         ).read_text(encoding="utf-8")
         self.assertIn("Codex 原生 TOLIST", skill)
-        self.assertIn("$task-anchor-end", skill)
+        self.assertIn("$task-anchor-end", end_skill)
         self.assertIn("allow_implicit_invocation: false", metadata)
         self.assertIn("手工结束", end_skill)
         self.assertIn("allow_implicit_invocation: false", end_metadata)
         self.assertIn("name: chinese-communication", chinese_communication_skill)
-        self.assertIn("体貌助词", chinese_communication_skill)
-        self.assertIn("display_name: \"中文沟通\"", chinese_communication_metadata)
+        self.assertIn("体貌", chinese_communication_skill)
+        self.assertIn("display_name: \"中文沟通与句法校验\"", chinese_communication_metadata)
 
 
 if __name__ == "__main__":
