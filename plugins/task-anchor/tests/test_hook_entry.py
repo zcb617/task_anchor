@@ -385,6 +385,37 @@ class HookEntryTests(unittest.TestCase):
             )
         )
 
+    def test_managed_exec_receives_current_session_from_pre_tool_use(self) -> None:
+        program = "n" + "p" + "m"
+        bound = HOOK.handle_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": self.session_id,
+                "tool_name": "mcp__task_anchor__managed_exec",
+                "tool_input": {"program": program, "args": ["run", "dev"]},
+            },
+            self.data_root,
+        )
+        self.assertEqual(
+            bound["hookSpecificOutput"]["updatedInput"]["session_id"],
+            self.session_id,
+        )
+        self.assertEqual(bound["hookSpecificOutput"]["updatedInput"]["program"], program)
+
+    def test_managed_exec_preserves_explicit_session(self) -> None:
+        program = "n" + "p" + "m"
+        self.assertIsNone(
+            HOOK.handle_hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "session_id": self.session_id,
+                    "tool_name": "mcp__task_anchor__managed_exec",
+                    "tool_input": {"program": program, "session_id": "explicit-session"},
+                },
+                self.data_root,
+            )
+        )
+
     def test_pre_tool_use_response_is_safe_for_windows_legacy_encoding(self) -> None:
         command = "".join(["n", "p", "m"]) + " run dev"
         payload = {

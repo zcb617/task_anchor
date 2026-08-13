@@ -866,6 +866,41 @@ def _is_managed_exec_tool(tool_name: str) -> bool:
     return normalized.endswith("__managed_exec")
 
 
+def _managed_exec_input(data: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """返回 managed_exec 的输入字段和值，兼容 Codex 的字段命名变体。"""
+
+    for key in ("tool_input", "toolInput", "input"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            return key, value
+    return None
+
+
+def _bind_managed_exec_to_session(data: dict[str, Any]) -> dict[str, Any] | None:
+    """在工具实际执行前，将当前 Hook 会话绑定到 managed_exec。"""
+
+    current_session_id = read_session_id(data)
+    tool_input = _managed_exec_input(data)
+    if current_session_id is None or tool_input is None:
+        return None
+
+    _, original_input = tool_input
+    explicit_session_id = original_input.get("session_id")
+    if isinstance(explicit_session_id, str) and explicit_session_id.strip():
+        return None
+
+    updated_input = dict(original_input)
+    updated_input["session_id"] = current_session_id
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": PRE_TOOL_USE,
+            "permissionDecision": "allow",
+            "permissionDecisionReason": "bound managed_exec to the current session",
+            "updatedInput": updated_input,
+        }
+    }
+
+
 def _command_text(data: dict[str, Any]) -> str:
     """提取 Hook 输入中的命令字符串，不解析命令结构。"""
 
@@ -898,7 +933,7 @@ def guard_pre_tool_use(data: dict[str, Any]) -> dict[str, Any] | None:
 
     tool_name = _tool_name(data)
     if _is_managed_exec_tool(tool_name):
-        return None
+        return _bind_managed_exec_to_session(data)
 
     command_text = _command_text(data)
     matched_keyword = _matched_process_keyword(command_text)
