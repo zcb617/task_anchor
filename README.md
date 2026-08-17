@@ -8,6 +8,7 @@
 - `stop_policy: "keep"`：Stop 时保留服务；建议同时设置 `name`，不再需要时使用 `operation: "stop"` 关闭。
 - `PreToolUse` Hook 会检查命令字符串；命中 `java`、`python`、`node`、`npm`、`mvn`、`gradle` 等进程型关键词时，必须通过 `managed_exec`，`rg`、`Get-Content` 等查询命令直接放行。
 - `Stop` Hook 只清理受管且策略为 `cleanup` 的资源，不会按进程名扫描或误杀用户手工启动的程序。
+- 对已存在的 `mcp__fastctx__*` 工具名，仅放行 `inspect_local_file`、`grep`、`glob` 三个只读工具；其余工具一律拒绝。该规则不注册、不启动也不依赖 FastCtx。
 - 受控管理器会自动识别 Windows、macOS 和 Linux：Windows 使用 `taskkill /T` 结束进程树；macOS/Linux 使用独立进程组和 `killpg` 结束进程组。
 - 资源归属按“项目工作区 + 会话”隔离；同一会话内登记的资源由该会话统一管理，其他会话以及其他项目的资源都不会被当前 Stop 清理。
 - `task_id` 只作为内部审计字段，不作为清理边界。没有明确会话上下文的资源不会进入自动清理范围；需要单独关闭某个资源时使用它的 `run_id` 或 `name`。

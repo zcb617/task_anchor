@@ -385,6 +385,45 @@ class HookEntryTests(unittest.TestCase):
             )
         )
 
+    def test_pre_tool_use_allows_only_fastctx_read_only_tools(self) -> None:
+        for tool_name in [
+            "mcp__fastctx__inspect_local_file",
+            "MCP__FASTCTX__GREP",
+            "mcp__fastctx__glob",
+        ]:
+            self.assertIsNone(
+                HOOK.handle_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": tool_name,
+                        "tool_input": {"path": "README.md"},
+                    },
+                    self.data_root,
+                )
+            )
+
+        for tool_name in [
+            "mcp__fastctx__replace",
+            "mcp__fastctx__run",
+            "mcp__fastctx__run_background",
+            "mcp__fastctx__job_kill",
+            "mcp__fastctx__future_tool",
+        ]:
+            denied = HOOK.handle_hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": tool_name,
+                    "tool_input": {"command": "echo hello"},
+                },
+                self.data_root,
+            )
+            self.assertEqual(
+                denied["hookSpecificOutput"]["permissionDecision"], "deny"
+            )
+            self.assertTrue(
+                denied["hookSpecificOutput"]["permissionDecisionReason"].isascii()
+            )
+
     def test_managed_exec_receives_current_session_from_pre_tool_use(self) -> None:
         program = "n" + "p" + "m"
         bound = HOOK.handle_hook(

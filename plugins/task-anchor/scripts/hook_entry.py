@@ -44,6 +44,12 @@ MANAGED_EXEC_TOOL_NAMES = {
     "mcp__task_anchor__managed_exec",
     "mcp__task-anchor__managed_exec",
 }
+FASTCTX_TOOL_NAME_PREFIX = "mcp__fastctx__"
+FASTCTX_READ_ONLY_TOOL_NAMES = {
+    "mcp__fastctx__inspect_local_file",
+    "mcp__fastctx__grep",
+    "mcp__fastctx__glob",
+}
 PROCESS_COMMAND_KEYWORDS = (
     "java",
     "python",
@@ -866,6 +872,16 @@ def _is_managed_exec_tool(tool_name: str) -> bool:
     return normalized.endswith("__managed_exec")
 
 
+def _is_fastctx_tool(tool_name: str) -> bool:
+    """只按 MCP 工具名称识别 FastCtx，不依赖其安装、配置或运行状态。"""
+
+    return tool_name.strip().lower().startswith(FASTCTX_TOOL_NAME_PREFIX)
+
+
+def _is_fastctx_read_only_tool(tool_name: str) -> bool:
+    return tool_name.strip().lower() in FASTCTX_READ_ONLY_TOOL_NAMES
+
+
 def _managed_exec_input(data: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
     """返回 managed_exec 的输入字段和值，兼容 Codex 的字段命名变体。"""
 
@@ -929,9 +945,21 @@ def _matched_process_keyword(command_text: str) -> str | None:
 
 
 def guard_pre_tool_use(data: dict[str, Any]) -> dict[str, Any] | None:
-    """命令字符串命中进程关键词时，要求通过 managed_exec 执行。"""
+    """限制 FastCtx 工具，并要求进程型命令通过 managed_exec 执行。"""
 
     tool_name = _tool_name(data)
+    if _is_fastctx_tool(tool_name):
+        if _is_fastctx_read_only_tool(tool_name):
+            return None
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": PRE_TOOL_USE,
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    "FastCtx only permits inspect_local_file, grep, and glob."
+                ),
+            }
+        }
     if _is_managed_exec_tool(tool_name):
         return _bind_managed_exec_to_session(data)
 
