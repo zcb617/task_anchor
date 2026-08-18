@@ -289,6 +289,7 @@ class ManagedExecMcpTests(unittest.TestCase):
             }
         )
         self.assertEqual(initialize["result"]["serverInfo"]["name"], "task-anchor")
+        self.assertEqual(initialize["result"]["protocolVersion"], "2025-06-18")
         tools = MCP.handle_request(
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
         )
@@ -299,6 +300,54 @@ class ManagedExecMcpTests(unittest.TestCase):
             ],
             "cleanup",
         )
+        output_schema = tools["result"]["tools"][0]["outputSchema"]
+        self.assertEqual(output_schema["type"], "object")
+        self.assertIn("oneOf", output_schema)
+        run_schema = next(
+            item for item in output_schema["oneOf"] if item["title"] == "run 操作结果"
+        )
+        self.assertIn("不应按固定字段解析", run_schema["properties"]["output"]["description"])
+
+    def test_tool_call_returns_only_structured_content(self) -> None:
+        response = MCP.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "managed_exec",
+                    "arguments": {
+                        "operation": "list",
+                        "cwd": str(self.workspace),
+                        "session_id": "mcp-session",
+                    },
+                },
+            }
+        )
+        result = response["result"]
+        self.assertEqual(result["content"], [])
+        self.assertEqual(result["structuredContent"], {"resources": []})
+        self.assertFalse(result["isError"])
+
+    def test_tool_error_returns_structured_content(self) -> None:
+        response = MCP.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "managed_exec",
+                    "arguments": {"operation": "unknown"},
+                },
+            }
+        )
+        result = response["result"]
+        self.assertEqual(result["content"], [])
+        self.assertEqual(
+            result["structuredContent"],
+            {"error": "operation 只能是 run、stop、list 或 cleanup。"},
+        )
+        self.assertTrue(result["isError"])
 
     def test_tool_call_starts_and_stops_a_managed_process(self) -> None:
         resource = MCP.execute_tool(

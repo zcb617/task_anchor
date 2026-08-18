@@ -18,6 +18,7 @@ except ImportError:
 
 SERVER_NAME = "task-anchor"
 SERVER_VERSION = "0.1.0"
+PROTOCOL_VERSION = "2025-06-18"
 TOOL_NAME = "managed_exec"
 
 
@@ -57,13 +58,187 @@ TOOL_SCHEMA = {
 }
 
 
-def _json_text(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+TOOL_OUTPUT_SCHEMA = {
+    "type": "object",
+    "description": (
+        "managed_exec 自身保证的稳定结果外壳。output 字段是被执行程序产生的原始文本，"
+        "其内部格式不固定，不应按特定结构解析。"
+    ),
+    "$defs": {
+        "stoppedResource": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["stopped", "already_stopped"],
+                    "description": "资源已被本次调用停止，或调用前已经停止。",
+                },
+                "pid": {"type": "integer", "description": "操作系统进程 ID。"},
+                "run_id": {
+                    "type": ["string", "null"],
+                    "description": "Task Anchor 为该次运行分配的唯一标识。",
+                },
+                "name": {
+                    "type": ["string", "null"],
+                    "description": "调用方为受管资源设置的可选名称。",
+                },
+            },
+            "required": ["status", "pid", "run_id", "name"],
+            "additionalProperties": False,
+        },
+        "failedResource": {
+            "type": "object",
+            "properties": {
+                "run_id": {
+                    "type": ["string", "null"],
+                    "description": "停止失败的受管运行标识。",
+                },
+                "error": {"type": "string", "description": "停止失败的原因。"},
+            },
+            "required": ["run_id", "error"],
+            "additionalProperties": False,
+        },
+        "registeredResource": {
+            "type": "object",
+            "properties": {
+                "schema_version": {"type": "integer", "description": "资源记录格式版本。"},
+                "run_id": {"type": "string", "description": "受管运行的唯一标识。"},
+                "owner_key": {"type": "string", "description": "资源所属会话的内部标识。"},
+                "session_key": {"type": "string", "description": "资源所属会话标识。"},
+                "task_id": {
+                    "type": ["string", "null"],
+                    "description": "资源所属任务标识；无法解析时为空。",
+                },
+                "workspace_key": {"type": "string", "description": "资源所属工作区标识。"},
+                "cwd": {"type": "string", "description": "进程工作目录的规范化绝对路径。"},
+                "platform": {"type": "string", "description": "进程运行平台。"},
+                "program": {
+                    "type": ["string", "null"],
+                    "description": "直接启动的可执行程序；shell 命令模式下可能为空。",
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "传给可执行程序的参数。",
+                },
+                "command": {"type": "string", "description": "用于展示和登记的完整命令。"},
+                "pid": {"type": "integer", "description": "操作系统进程 ID。"},
+                "started_at": {"type": "string", "description": "UTC ISO 8601 启动时间。"},
+                "started_at_epoch": {"type": "number", "description": "Unix 启动时间戳。"},
+                "stop_policy": {
+                    "type": "string",
+                    "enum": ["cleanup", "keep"],
+                    "description": "任务停止时清理该资源，或保留到显式停止。",
+                },
+                "name": {
+                    "type": ["string", "null"],
+                    "description": "调用方设置的可选资源名称。",
+                },
+                "log_path": {"type": "string", "description": "合并输出日志文件路径。"},
+                "status": {
+                    "type": "string",
+                    "enum": ["running"],
+                    "description": "已登记资源的当前状态。",
+                },
+            },
+            "required": [
+                "schema_version", "run_id", "owner_key", "session_key", "task_id",
+                "workspace_key", "cwd", "platform", "program", "args", "command", "pid",
+                "started_at", "started_at_epoch", "stop_policy", "name", "log_path", "status",
+            ],
+            "additionalProperties": False,
+        },
+    },
+    "oneOf": [
+        {
+            "title": "run 操作结果",
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "受管运行的唯一标识。"},
+                "pid": {"type": "integer", "description": "操作系统进程 ID。"},
+                "status": {
+                    "type": "string",
+                    "enum": ["running", "exited"],
+                    "description": "进程仍在运行，或已经退出。",
+                },
+                "timed_out": {
+                    "type": "boolean",
+                    "description": "等待已超时，但进程仍在受管运行。",
+                },
+                "exit_code": {"type": "integer", "description": "进程退出码；仅退出后返回。"},
+                "stop_policy": {
+                    "type": "string",
+                    "enum": ["cleanup", "keep"],
+                    "description": "任务停止时清理该资源，或保留到显式停止。",
+                },
+                "command": {"type": "string", "description": "用于展示和登记的完整命令。"},
+                "cwd": {"type": "string", "description": "进程工作目录的规范化绝对路径。"},
+                "platform": {"type": "string", "description": "进程运行平台；运行中可能返回。"},
+                "log_path": {"type": "string", "description": "合并输出日志文件路径。"},
+                "output": {
+                    "type": "string",
+                    "description": (
+                        "被执行程序写入 stdout 和 stderr 的原始合并文本。内容与格式完全由外部程序决定，"
+                        "不保证是 JSON，也不应按固定字段解析。"
+                    ),
+                },
+            },
+            "required": ["run_id", "pid", "status", "stop_policy", "command", "cwd", "log_path"],
+            "additionalProperties": False,
+        },
+        {
+            "title": "stop 或 cleanup 操作结果",
+            "type": "object",
+            "properties": {
+                "stopped": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/stoppedResource"},
+                    "description": "成功停止或此前已经停止的资源。",
+                },
+                "failed": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/failedResource"},
+                    "description": "未能停止的资源及原因。",
+                },
+                "kept": {
+                    "type": "array",
+                    "items": {"type": ["string", "null"]},
+                    "description": "因 stop_policy=keep 而继续保留的运行标识。",
+                },
+            },
+            "required": ["stopped", "failed", "kept"],
+            "additionalProperties": False,
+        },
+        {
+            "title": "list 操作结果",
+            "type": "object",
+            "properties": {
+                "resources": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/registeredResource"},
+                    "description": "当前会话登记且仍受管理的进程资源。",
+                }
+            },
+            "required": ["resources"],
+            "additionalProperties": False,
+        },
+        {
+            "title": "工具错误结果",
+            "type": "object",
+            "properties": {
+                "error": {"type": "string", "description": "工具调用失败的原因。"}
+            },
+            "required": ["error"],
+            "additionalProperties": False,
+        },
+    ],
+}
 
 
 def _tool_result(value: Any, *, is_error: bool = False) -> dict[str, Any]:
     return {
-        "content": [{"type": "text", "text": _json_text(value)}],
+        "content": [],
+        "structuredContent": value,
         "isError": is_error,
     }
 
@@ -127,13 +302,11 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     if method == "initialize":
-        params = request.get("params") if isinstance(request.get("params"), dict) else {}
-        protocol_version = params.get("protocolVersion", "2024-11-05")
         return {
             "jsonrpc": "2.0",
             "id": request_id,
             "result": {
-                "protocolVersion": protocol_version,
+                "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
             },
@@ -153,6 +326,7 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
                             "默认 Stop 时清理；需要保留的服务必须显式设置 stop_policy=keep。"
                         ),
                         "inputSchema": TOOL_SCHEMA,
+                        "outputSchema": TOOL_OUTPUT_SCHEMA,
                     }
                 ]
             },
