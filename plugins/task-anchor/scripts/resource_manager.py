@@ -431,6 +431,7 @@ def start_process(
     name: str | None = None,
     session_id: str | None = None,
     task_id: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     platform_name = current_platform()
     normalized_cwd = normalize_path(cwd)
@@ -464,6 +465,7 @@ def start_process(
         "stdin": subprocess.DEVNULL,
         "stdout": log_handle,
         "stderr": subprocess.STDOUT,
+        "env": env,
     }
     popen_kwargs.update(_process_launch_options(platform_name))
 

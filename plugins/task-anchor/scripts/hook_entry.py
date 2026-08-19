@@ -907,6 +907,7 @@ def _bind_managed_exec_to_session(data: dict[str, Any]) -> dict[str, Any] | None
 
     updated_input = dict(original_input)
     updated_input["session_id"] = current_session_id
+    updated_input["env"] = dict(os.environ)
     return {
         "hookSpecificOutput": {
             "hookEventName": PRE_TOOL_USE,

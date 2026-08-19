@@ -440,6 +440,7 @@ class HookEntryTests(unittest.TestCase):
             self.session_id,
         )
         self.assertEqual(bound["hookSpecificOutput"]["updatedInput"]["program"], program)
+        self.assertEqual(bound["hookSpecificOutput"]["updatedInput"]["env"], dict(os.environ))
 
     def test_managed_exec_preserves_explicit_session(self) -> None:
         program = "n" + "p" + "m"

@@ -276,6 +276,7 @@ def execute_tool(arguments: dict[str, Any]) -> dict[str, Any]:
             timeout_ms=arguments.get("timeout_ms", 1800000),
             stop_policy=arguments.get("stop_policy"),
             name=arguments.get("name"),
+            env=arguments.get("env"),
         )
     if operation == "stop":
         return resource_manager.stop_process(

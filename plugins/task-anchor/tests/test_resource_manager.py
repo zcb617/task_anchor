@@ -60,6 +60,22 @@ class ResourceManagerTests(unittest.TestCase):
             session_id=self.session_id,
         )
 
+    def test_start_process_uses_provided_environment(self) -> None:
+        environment = dict(os.environ)
+        environment["TASK_ANCHOR_ENV_TEST"] = "managed-environment"
+        result = RESOURCE_MANAGER.start_process(
+            cwd=str(self.workspace),
+            program=sys.executable,
+            args=[
+                "-c",
+                "import os; print(os.environ['TASK_ANCHOR_ENV_TEST'])",
+            ],
+            env=environment,
+            session_id=self.session_id,
+        )
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["output"], "managed-environment\n")
+
     def test_platform_detection_and_launch_options(self) -> None:
         cases = {
             "Windows": RESOURCE_MANAGER.PLATFORM_WINDOWS,
@@ -348,6 +364,24 @@ class ManagedExecMcpTests(unittest.TestCase):
             {"error": "operation 只能是 run、stop、list 或 cleanup。"},
         )
         self.assertTrue(result["isError"])
+
+    def test_tool_call_passes_environment_to_managed_process(self) -> None:
+        environment = dict(os.environ)
+        environment["TASK_ANCHOR_MCP_ENV_TEST"] = "mcp-environment"
+        result = MCP.execute_tool(
+            {
+                "program": sys.executable,
+                "args": [
+                    "-c",
+                    "import os; print(os.environ['TASK_ANCHOR_MCP_ENV_TEST'])",
+                ],
+                "cwd": str(self.workspace),
+                "env": environment,
+                "session_id": "mcp-environment-session",
+            }
+        )
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["output"], "mcp-environment\n")
 
     def test_tool_call_starts_and_stops_a_managed_process(self) -> None:
         resource = MCP.execute_tool(
