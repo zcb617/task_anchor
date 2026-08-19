@@ -67,6 +67,16 @@ Hook 文件变化后，Codex 会要求重新审查和信任；在重新信任前
 
 结束命令只关闭当前会话、当前项目绑定下的任务：它会将该任务标为 `status = 0`，记录 `closed_reason = manually_ended`，并保留历史记录。结束后压缩不会再恢复该任务。它不会中止已经开始的工具调用。
 
+切换为只读模式：
+
+    $task-anchor-readonly
+
+恢复修改权限：
+
+    $task-anchor-write
+
+只读标记按“会话 + 项目”保存，首次使用默认为可写。只读状态下，`PreToolUse` 会拒绝 `apply_patch`、Shell、Unified exec、`managed_exec` 以及名称明确表示文件修改的工具；文件检查工具仍可使用。Shell 和 `managed_exec` 能运行任意命令，无法可靠证明命令不写入，因此只读状态下整体拒绝。`$task-anchor-write` 只解除这层只读门控，不绕过 Codex 自身权限、审批流程或插件原有规则。
+
 不要通过最终回复、原生 TOLIST 清空、普通工具调用或 `Stop` 事件结束任务。
 
 ## 压缩后的状态
@@ -101,5 +111,7 @@ Hook 文件变化后，Codex 会要求重新审查和信任；在重新信任前
     plugins/task-anchor/scripts/resource_manager.py
     plugins/task-anchor/scripts/managed_exec_mcp.py
     plugins/task-anchor/skills/task-anchor/SKILL.md
+    plugins/task-anchor/skills/task-anchor-readonly/SKILL.md
+    plugins/task-anchor/skills/task-anchor-write/SKILL.md
 
 插件不包含小模型、自定义 TOLIST、`PostToolUse` 或 `PreCompact`；MCP 服务只提供受管命令执行工具。

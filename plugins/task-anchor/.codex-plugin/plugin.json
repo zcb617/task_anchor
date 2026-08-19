@@ -1,6 +1,6 @@
 {
   "name": "task-anchor",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Keep the current explicitly started task across Codex context compactions.",
   "author": {
     "name": "Local developer"
@@ -15,7 +15,7 @@
   "interface": {
     "displayName": "Task Anchor",
     "shortDescription": "Start a task and restore it after compaction.",
-    "longDescription": "Each explicit invocation creates a new task, supersedes prior tasks in the same conversation, and restores only the current active task after compaction. Users can explicitly end the current task when it is complete.",
+    "longDescription": "Each explicit invocation creates a new task, supersedes prior tasks in the same conversation, and restores only the current active task after compaction. Read-only and write skills can gate mutation-capable tools per conversation and workspace.",
     "developerName": "Local developer",
     "category": "Productivity",
     "capabilities": [

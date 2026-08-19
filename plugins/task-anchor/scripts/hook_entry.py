@@ -26,6 +26,14 @@ END_SKILL_MARKER = "$task-anchor-end"
 END_SKILL_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_-])\$task-anchor-end(?![A-Za-z0-9_-])"
 )
+READ_ONLY_SKILL_MARKER = "$task-anchor-readonly"
+READ_ONLY_SKILL_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])\$task-anchor-readonly(?![A-Za-z0-9_-])"
+)
+WRITE_SKILL_MARKER = "$task-anchor-write"
+WRITE_SKILL_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])\$task-anchor-write(?![A-Za-z0-9_-])"
+)
 POST_COMPACT = "PostCompact"
 USER_PROMPT_SUBMIT = "UserPromptSubmit"
 PRE_TOOL_USE = "PreToolUse"
@@ -38,6 +46,7 @@ TASK_STATUS_CLOSED = 0
 CLOSED_REASON_SUPERSEDED = "superseded_by_new_task"
 CLOSED_REASON_MANUAL = "manually_ended"
 SCHEMA_VERSION = 2
+MUTATION_POLICY_SCHEMA_VERSION = 1
 
 MANAGED_EXEC_TOOL_NAMES = {
     "managed_exec",
@@ -50,6 +59,33 @@ FASTCTX_READ_ONLY_TOOL_NAMES = {
     "mcp__fastctx__grep",
     "mcp__fastctx__glob",
 }
+COMMAND_TOOL_NAMES = {
+    "bash",
+    "cmd",
+    "exec",
+    "exec_command",
+    "local_shell",
+    "powershell",
+    "shell",
+}
+MUTATION_TOOL_TOKENS = {
+    "copy",
+    "delete",
+    "edit",
+    "mkdir",
+    "move",
+    "patch",
+    "remove",
+    "rename",
+    "replace",
+    "rmdir",
+    "touch",
+    "truncate",
+    "unlink",
+    "upload",
+    "write",
+}
+FILE_RESOURCE_TOKENS = {"directory", "file", "folder", "path"}
 PROCESS_COMMAND_KEYWORDS = (
     "java",
     "python",
@@ -127,6 +163,18 @@ def task_instruction_path(data_root: Path, session_id: str, task_id: str) -> Pat
 
 def task_metadata_path(data_root: Path, session_id: str, task_id: str) -> Path:
     return task_directory(data_root, session_id, task_id) / "metadata.json"
+
+
+def mutation_policy_path(
+    data_root: Path,
+    session_id: str,
+    workspace_sha256: str,
+) -> Path:
+    return (
+        session_directory(data_root, session_id)
+        / "mutation-policies"
+        / f"{workspace_sha256}.json"
+    )
 
 
 def atomic_write(path: Path, content: bytes) -> None:
@@ -264,6 +312,91 @@ def is_explicit_activation(prompt: Any) -> bool:
 
 def is_explicit_end(prompt: Any) -> bool:
     return isinstance(prompt, str) and END_SKILL_PATTERN.search(prompt) is not None
+
+
+def is_explicit_read_only(prompt: Any) -> bool:
+    return isinstance(prompt, str) and READ_ONLY_SKILL_PATTERN.search(prompt) is not None
+
+
+def is_explicit_write(prompt: Any) -> bool:
+    return isinstance(prompt, str) and WRITE_SKILL_PATTERN.search(prompt) is not None
+
+
+def read_mutation_policy(
+    data: dict[str, Any],
+    data_root: Path,
+) -> bool:
+    """读取当前会话、当前项目的只读标记；损坏记录拒绝按可写状态解释。"""
+
+    current_session_id = read_session_id(data)
+    if current_session_id is None:
+        raise StorageError("Task Anchor 只读门控缺少 session_id。")
+    workspace_sha256 = read_workspace_sha256(data)
+    if workspace_sha256 is None:
+        raise StorageError("Task Anchor 只读门控缺少 cwd。")
+
+    path = mutation_policy_path(data_root, current_session_id, workspace_sha256)
+    if not path.exists():
+        return False
+    if not path.is_file():
+        raise StorageError("Task Anchor 只读门控状态无效。")
+    policy = read_json_object(path, "Task Anchor 只读门控状态损坏。")
+    if (
+        policy.get("schema_version") != MUTATION_POLICY_SCHEMA_VERSION
+        or policy.get(SESSION_KEY_FIELD) != session_key(current_session_id)
+        or policy.get(WORKSPACE_SHA256_FIELD) != workspace_sha256
+        or type(policy.get("read_only")) is not bool
+    ):
+        raise StorageError("Task Anchor 只读门控状态校验失败。")
+    return policy["read_only"]
+
+
+def set_mutation_policy(
+    data: dict[str, Any],
+    data_root: Path | None,
+    *,
+    read_only: bool,
+) -> dict[str, Any] | None:
+    """按当前会话和项目设置只读门控。"""
+
+    if data_root is None:
+        return warning("Task Anchor 无法切换只读门控：Hook 未提供 PLUGIN_DATA。")
+    current_session_id = read_session_id(data)
+    if current_session_id is None:
+        write_audit_event(data_root, data, "mutation_policy_missing_session_id")
+        return warning("Task Anchor 无法切换只读门控：Hook 输入缺少 session_id。")
+    workspace_sha256 = read_workspace_sha256(data)
+    if workspace_sha256 is None:
+        write_audit_event(data_root, data, "mutation_policy_missing_cwd")
+        return warning("Task Anchor 无法切换只读门控：Hook 输入缺少 cwd。")
+
+    policy = {
+        "schema_version": MUTATION_POLICY_SCHEMA_VERSION,
+        SESSION_KEY_FIELD: session_key(current_session_id),
+        WORKSPACE_SHA256_FIELD: workspace_sha256,
+        "read_only": read_only,
+        "updated_at": utc_now(),
+    }
+    try:
+        with session_lock(session_directory(data_root, current_session_id)):
+            atomic_write_json(
+                mutation_policy_path(data_root, current_session_id, workspace_sha256),
+                policy,
+            )
+    except LockUnavailable:
+        write_audit_event(data_root, data, "mutation_policy_lock_unavailable")
+        return warning("Task Anchor 只读门控状态正由另一项操作切换，请稍后重新调用。")
+    except OSError:
+        write_audit_event(data_root, data, "mutation_policy_write_failed")
+        return warning("Task Anchor 无法确认只读门控状态已切换，请重新显式调用。")
+
+    write_audit_event(
+        data_root,
+        data,
+        "mutation_policy_updated",
+        read_only=read_only,
+    )
+    return None
 
 
 def _acquire_lock(handle: Any) -> None:
@@ -882,6 +1015,36 @@ def _is_fastctx_read_only_tool(tool_name: str) -> bool:
     return tool_name.strip().lower() in FASTCTX_READ_ONLY_TOOL_NAMES
 
 
+def _tool_name_tokens(tool_name: str) -> set[str]:
+    return {
+        token
+        for token in re.split(r"[^a-z0-9]+", tool_name.strip().lower())
+        if token
+    }
+
+
+def _is_mutation_capable_tool(tool_name: str) -> bool:
+    normalized = tool_name.strip().lower()
+    if normalized in COMMAND_TOOL_NAMES:
+        return True
+    if _is_managed_exec_tool(normalized):
+        return True
+    tokens = _tool_name_tokens(normalized)
+    if tokens & MUTATION_TOOL_TOKENS:
+        return True
+    return "create" in tokens and bool(tokens & FILE_RESOURCE_TOKENS)
+
+
+def _deny_read_only(reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": PRE_TOOL_USE,
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
 def _managed_exec_input(data: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
     """返回 managed_exec 的输入字段和值，兼容 Codex 的字段命名变体。"""
 
@@ -945,7 +1108,10 @@ def _matched_process_keyword(command_text: str) -> str | None:
     )
 
 
-def guard_pre_tool_use(data: dict[str, Any]) -> dict[str, Any] | None:
+def guard_pre_tool_use(
+    data: dict[str, Any],
+    data_root: Path | None,
+) -> dict[str, Any] | None:
     """限制 FastCtx 工具，并要求进程型命令通过 managed_exec 执行。"""
 
     tool_name = _tool_name(data)
@@ -961,6 +1127,31 @@ def guard_pre_tool_use(data: dict[str, Any]) -> dict[str, Any] | None:
                 ),
             }
         }
+    if _is_mutation_capable_tool(tool_name):
+        if data_root is None:
+            return _deny_read_only("Read-only policy context is unavailable.")
+        try:
+            read_only = read_mutation_policy(data, data_root)
+        except StorageError as exc:
+            write_audit_event(
+                data_root,
+                data,
+                "mutation_policy_rejected",
+                tool_name=tool_name,
+                error=str(exc),
+            )
+            return _deny_read_only("Read-only policy state could not be verified.")
+        if read_only:
+            write_audit_event(
+                data_root,
+                data,
+                "mutation_blocked",
+                tool_name=tool_name,
+            )
+            return _deny_read_only(
+                f"{READ_ONLY_SKILL_MARKER} blocks mutation-capable tools; "
+                f"invoke {WRITE_SKILL_MARKER} to allow modifications."
+            )
     if _is_managed_exec_tool(tool_name):
         return _bind_managed_exec_to_session(data)
 
@@ -1013,13 +1204,24 @@ def handle_hook(
 ) -> dict[str, Any] | None:
     event_name = data.get("hook_event_name")
     if event_name == USER_PROMPT_SUBMIT:
+        prompt = data.get("prompt")
+        read_only_requested = is_explicit_read_only(prompt)
+        write_requested = is_explicit_write(prompt)
+        if read_only_requested and write_requested:
+            return warning(
+                "Task Anchor 同一条消息同时调用了只读和可写 Skill，门控状态未改变。"
+            )
+        if read_only_requested:
+            return set_mutation_policy(data, data_root, read_only=True)
+        if write_requested:
+            return set_mutation_policy(data, data_root, read_only=False)
         if is_explicit_end(data.get("prompt")):
             return end_current_task(data, data_root)
         return start_new_task(data, data_root)
     if event_name == POST_COMPACT:
         return restore_after_post_compact(data, data_root)
     if event_name == PRE_TOOL_USE:
-        return guard_pre_tool_use(data)
+        return guard_pre_tool_use(data, data_root)
     if event_name == STOP:
         cleanup_after_stop(data, data_root)
         return None

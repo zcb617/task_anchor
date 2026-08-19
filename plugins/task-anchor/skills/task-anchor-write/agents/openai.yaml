@@ -1,0 +1,7 @@
+interface:
+  display_name: "Task Anchor Write"
+  short_description: "解除当前会话和项目的只读门控并恢复修改权限"
+  default_prompt: "使用 $task-anchor-write 恢复当前会话、当前项目的修改权限。"
+
+policy:
+  allow_implicit_invocation: false

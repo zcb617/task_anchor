@@ -81,6 +81,23 @@ class HookEntryTests(unittest.TestCase):
             "cwd": str(self.workspace),
         }
 
+    def pre_tool_use(
+        self,
+        tool_name: str,
+        tool_input: dict[str, object],
+        *,
+        session_id: str | None = None,
+        cwd: Path | None = None,
+    ) -> dict[str, object]:
+        return {
+            "hook_event_name": "PreToolUse",
+            "session_id": session_id or self.session_id,
+            "turn_id": "turn-1",
+            "cwd": str(cwd or self.workspace),
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+        }
+
     def session_dir(self, session_id: str | None = None) -> Path:
         return HOOK.session_directory(self.data_root, session_id or self.session_id)
 
@@ -344,11 +361,142 @@ class HookEntryTests(unittest.TestCase):
             HOOK.handle_hook(self.post_compact("unexpected"), self.data_root)
         )
 
+    def test_read_only_and_write_skills_toggle_workspace_policy(self) -> None:
+        self.assertIsNone(
+            HOOK.handle_hook(self.user_prompt("$task-anchor-readonly"), self.data_root)
+        )
+        policy_input = self.user_prompt("普通消息")
+        self.assertTrue(HOOK.read_mutation_policy(policy_input, self.data_root))
+
+        workspace_sha256 = HOOK.read_workspace_sha256(policy_input)
+        policy_path = HOOK.mutation_policy_path(
+            self.data_root,
+            self.session_id,
+            workspace_sha256,
+        )
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        self.assertTrue(policy["read_only"])
+        self.assertEqual(policy[HOOK.SESSION_KEY_FIELD], HOOK.session_key(self.session_id))
+        self.assertNotIn("session_id", policy)
+        HOOK.handle_hook(self.post_compact(), self.data_root)
+        self.assertTrue(HOOK.read_mutation_policy(policy_input, self.data_root))
+
+        self.assertIsNone(
+            HOOK.handle_hook(self.user_prompt("$task-anchor-write"), self.data_root)
+        )
+        self.assertFalse(HOOK.read_mutation_policy(policy_input, self.data_root))
+
+    def test_read_only_policy_is_isolated_by_session_and_workspace(self) -> None:
+        (self.other_workspace / ".git").mkdir()
+        HOOK.handle_hook(self.user_prompt("$task-anchor-readonly"), self.data_root)
+
+        self.assertTrue(
+            HOOK.read_mutation_policy(self.user_prompt("普通消息"), self.data_root)
+        )
+        self.assertFalse(
+            HOOK.read_mutation_policy(
+                self.user_prompt("普通消息", session_id="other-session"),
+                self.data_root,
+            )
+        )
+        self.assertFalse(
+            HOOK.read_mutation_policy(
+                self.user_prompt("普通消息", cwd=self.other_workspace),
+                self.data_root,
+            )
+        )
+
+    def test_read_only_policy_blocks_mutation_capable_tools(self) -> None:
+        HOOK.handle_hook(self.user_prompt("$task-anchor-readonly"), self.data_root)
+
+        for tool_name, tool_input in [
+            ("apply_patch", {"command": "*** Begin Patch"}),
+            ("Bash", {"command": "git status"}),
+            ("exec_command", {"cmd": "rg pattern ."}),
+            ("mcp__task_anchor__managed_exec", {"program": "git", "args": ["status"]}),
+            ("mcp__filesystem__write_file", {"path": "a.txt", "content": "x"}),
+            ("mcp__filesystem__rename_file", {"source": "a", "destination": "b"}),
+        ]:
+            denied = HOOK.handle_hook(
+                self.pre_tool_use(tool_name, tool_input),
+                self.data_root,
+            )
+            self.assertEqual(
+                denied["hookSpecificOutput"]["permissionDecision"],
+                "deny",
+                tool_name,
+            )
+            self.assertIn(
+                "$task-anchor-write",
+                denied["hookSpecificOutput"]["permissionDecisionReason"],
+            )
+
+        self.assertIsNone(
+            HOOK.handle_hook(
+                self.pre_tool_use("mcp__fastctx__grep", {"path": "README.md"}),
+                self.data_root,
+            )
+        )
+
+    def test_write_skill_removes_only_the_read_only_gate(self) -> None:
+        HOOK.handle_hook(self.user_prompt("$task-anchor-readonly"), self.data_root)
+        HOOK.handle_hook(self.user_prompt("$task-anchor-write"), self.data_root)
+
+        self.assertIsNone(
+            HOOK.handle_hook(
+                self.pre_tool_use("apply_patch", {"command": "*** Begin Patch"}),
+                self.data_root,
+            )
+        )
+        managed = HOOK.handle_hook(
+            self.pre_tool_use(
+                "mcp__task_anchor__managed_exec",
+                {"program": "git", "args": ["status"]},
+            ),
+            self.data_root,
+        )
+        self.assertEqual(
+            managed["hookSpecificOutput"]["updatedInput"]["session_id"],
+            self.session_id,
+        )
+
+    def test_invalid_or_missing_policy_context_fails_closed_for_mutation(self) -> None:
+        missing_cwd = self.pre_tool_use("apply_patch", {"command": "patch"})
+        del missing_cwd["cwd"]
+        denied = HOOK.handle_hook(missing_cwd, self.data_root)
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        workspace_sha256 = HOOK.read_workspace_sha256(self.user_prompt("普通消息"))
+        policy_path = HOOK.mutation_policy_path(
+            self.data_root,
+            self.session_id,
+            workspace_sha256,
+        )
+        policy_path.parent.mkdir(parents=True)
+        policy_path.write_text("{}", encoding="utf-8")
+        corrupted = HOOK.handle_hook(
+            self.pre_tool_use("apply_patch", {"command": "patch"}),
+            self.data_root,
+        )
+        self.assertEqual(corrupted["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_conflicting_policy_skills_do_not_change_state(self) -> None:
+        result = HOOK.handle_hook(
+            self.user_prompt("$task-anchor-readonly $task-anchor-write"),
+            self.data_root,
+        )
+        self.assertIn("同时调用", result["systemMessage"])
+        self.assertFalse(
+            HOOK.read_mutation_policy(self.user_prompt("普通消息"), self.data_root)
+        )
+
     def test_pre_tool_use_requires_managed_exec_for_process_commands(self) -> None:
         for command in ["npm run dev", r"C:\Java\bin\java.exe -jar app.jar"]:
             denied = HOOK.handle_hook(
                 {
                     "hook_event_name": "PreToolUse",
+                    "session_id": self.session_id,
+                    "cwd": str(self.workspace),
                     "tool_name": "exec",
                     "tool_input": {"cmd": command},
                 },
@@ -367,6 +515,8 @@ class HookEntryTests(unittest.TestCase):
                 HOOK.handle_hook(
                     {
                         "hook_event_name": "PreToolUse",
+                        "session_id": self.session_id,
+                        "cwd": str(self.workspace),
                         "tool_name": "exec",
                         "tool_input": {"cmd": command},
                     },
@@ -374,15 +524,28 @@ class HookEntryTests(unittest.TestCase):
                 )
             )
 
-        self.assertIsNone(
+        self.assertIsNotNone(
             HOOK.handle_hook(
                 {
                     "hook_event_name": "PreToolUse",
+                    "session_id": self.session_id,
+                    "cwd": str(self.workspace),
                     "tool_name": "mcp__task_anchor__managed_exec",
                     "tool_input": {"program": "npm", "args": ["run", "dev"]},
                 },
                 self.data_root,
             )
+        )
+        managed = HOOK.handle_hook(
+            self.pre_tool_use(
+                "mcp__task_anchor__managed_exec",
+                {"program": "n" + "p" + "m", "args": ["run", "dev"]},
+            ),
+            self.data_root,
+        )
+        self.assertEqual(
+            managed["hookSpecificOutput"]["permissionDecision"],
+            "allow",
         )
 
     def test_pre_tool_use_allows_only_fastctx_read_only_tools(self) -> None:
@@ -395,6 +558,8 @@ class HookEntryTests(unittest.TestCase):
                 HOOK.handle_hook(
                     {
                         "hook_event_name": "PreToolUse",
+                        "session_id": self.session_id,
+                        "cwd": str(self.workspace),
                         "tool_name": tool_name,
                         "tool_input": {"path": "README.md"},
                     },
@@ -412,6 +577,8 @@ class HookEntryTests(unittest.TestCase):
             denied = HOOK.handle_hook(
                 {
                     "hook_event_name": "PreToolUse",
+                    "session_id": self.session_id,
+                    "cwd": str(self.workspace),
                     "tool_name": tool_name,
                     "tool_input": {"command": "echo hello"},
                 },
@@ -430,6 +597,7 @@ class HookEntryTests(unittest.TestCase):
             {
                 "hook_event_name": "PreToolUse",
                 "session_id": self.session_id,
+                "cwd": str(self.workspace),
                 "tool_name": "mcp__task_anchor__managed_exec",
                 "tool_input": {"program": program, "args": ["run", "dev"]},
             },
@@ -449,6 +617,7 @@ class HookEntryTests(unittest.TestCase):
                 {
                     "hook_event_name": "PreToolUse",
                     "session_id": self.session_id,
+                    "cwd": str(self.workspace),
                     "tool_name": "mcp__task_anchor__managed_exec",
                     "tool_input": {"program": program, "session_id": "explicit-session"},
                 },
@@ -665,7 +834,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertNotIn("matcher", config["hooks"]["PostCompact"][0])
         self.assertEqual(config["hooks"]["PreToolUse"][0]["matcher"], ".*")
 
-    def test_start_end_and_chinese_communication_skills_are_registered(self) -> None:
+    def test_all_plugin_skills_are_registered(self) -> None:
         skill = (PLUGIN_ROOT / "skills" / "task-anchor" / "SKILL.md").read_text(
             encoding="utf-8"
         )
@@ -688,6 +857,26 @@ class PluginContractTests(unittest.TestCase):
             / "agents"
             / "openai.yaml"
         ).read_text(encoding="utf-8")
+        read_only_skill = (
+            PLUGIN_ROOT / "skills" / "task-anchor-readonly" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        read_only_metadata = (
+            PLUGIN_ROOT
+            / "skills"
+            / "task-anchor-readonly"
+            / "agents"
+            / "openai.yaml"
+        ).read_text(encoding="utf-8")
+        write_skill = (
+            PLUGIN_ROOT / "skills" / "task-anchor-write" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        write_metadata = (
+            PLUGIN_ROOT
+            / "skills"
+            / "task-anchor-write"
+            / "agents"
+            / "openai.yaml"
+        ).read_text(encoding="utf-8")
         self.assertIn("Codex 原生 TOLIST", skill)
         self.assertIn("$task-anchor-end", end_skill)
         self.assertIn("allow_implicit_invocation: false", metadata)
@@ -696,6 +885,12 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn("name: chinese-communication", chinese_communication_skill)
         self.assertIn("体貌", chinese_communication_skill)
         self.assertIn("display_name: \"中文沟通与句法校验\"", chinese_communication_metadata)
+        self.assertIn("name: task-anchor-readonly", read_only_skill)
+        self.assertIn("$task-anchor-write", read_only_skill)
+        self.assertIn("allow_implicit_invocation: false", read_only_metadata)
+        self.assertIn("name: task-anchor-write", write_skill)
+        self.assertIn("$task-anchor-readonly", write_skill)
+        self.assertIn("allow_implicit_invocation: false", write_metadata)
 
 
 if __name__ == "__main__":

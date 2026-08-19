@@ -1,0 +1,7 @@
+interface:
+  display_name: "Task Anchor Readonly"
+  short_description: "将当前会话和项目切换为只读模式并拦截修改操作"
+  default_prompt: "使用 $task-anchor-readonly 将当前会话、当前项目切换为只读模式。"
+
+policy:
+  allow_implicit_invocation: false
