@@ -1,11 +1,13 @@
 ---
 name: task-anchor
-description: "仅在用户显式调用 $task-anchor 时使用。用于启动需要跨上下文压缩持续的独立任务；每次显式调用都会创建新的 task_id，并取代当前会话中的旧任务。"
+description: "仅在用户显式调用 $task-anchor 时使用。用于解除当前项目的只读门控并启动需要跨上下文压缩持续的独立任务；每次显式调用都会创建新的 task_id，并取代当前会话中的旧任务。"
 ---
 
 # Task Anchor
 
 将当前显式调用的完整用户消息视为一项新的独立任务的最初任务指令。
+
+`UserPromptSubmit` Hook 会先将当前会话、当前项目的 `read_only` 设为 `false`，再创建任务。若解除只读失败，不创建新任务，并以 Hook 提示为准。
 
 ## 开始与推进
 

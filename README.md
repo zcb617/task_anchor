@@ -55,6 +55,8 @@ Hook 文件变化后，Codex 会要求重新审查和信任；在重新信任前
 
     $task-anchor <任务 A 的完整指令>
 
+显式调用 `$task-anchor` 表示开始执行任务，因此 Hook 会先把当前“会话 + 项目”的 `read_only` 设为 `false`，再创建新任务。若解除只读失败，则不会创建任务。
+
 同一对话中开始任务 B：
 
     $task-anchor <任务 B 的完整指令>

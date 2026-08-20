@@ -173,6 +173,41 @@ class HookEntryTests(unittest.TestCase):
         )
         self.assertNotIn("session_id", metadata)
 
+    def test_explicit_activation_clears_read_only_policy_before_starting_task(self) -> None:
+        self.assertIsNone(
+            HOOK.handle_hook(self.user_prompt("$task-anchor-readonly"), self.data_root)
+        )
+        policy_input = self.user_prompt("普通消息")
+        self.assertTrue(HOOK.read_mutation_policy(policy_input, self.data_root))
+
+        task_id = self.activate("$task-anchor 开始执行任务")
+
+        self.assertFalse(HOOK.read_mutation_policy(policy_input, self.data_root))
+        self.assertEqual(
+            self.task_metadata(task_id)["status"],
+            HOOK.TASK_STATUS_ACTIVE,
+        )
+        self.assertIsNone(
+            HOOK.handle_hook(
+                self.pre_tool_use("apply_patch", {"command": "*** Begin Patch"}),
+                self.data_root,
+            )
+        )
+
+    def test_activation_does_not_create_task_when_write_mode_cannot_be_saved(self) -> None:
+        policy_directory = self.session_dir() / "mutation-policies"
+        policy_directory.parent.mkdir(parents=True)
+        policy_directory.write_text("invalid directory", encoding="utf-8")
+
+        result = HOOK.handle_hook(
+            self.user_prompt("$task-anchor 不得创建任务"),
+            self.data_root,
+        )
+
+        self.assertIn("无法确认只读门控状态已切换", result["systemMessage"])
+        self.assertFalse(HOOK.current_task_path(self.data_root, self.session_id).exists())
+        self.assertEqual(self.task_ids(), set())
+
     def test_every_explicit_activation_creates_a_new_task_and_closes_old_one(self) -> None:
         first_prompt = "$task-anchor 第一个独立任务"
         second_prompt = "$task-anchor 第二个独立任务"

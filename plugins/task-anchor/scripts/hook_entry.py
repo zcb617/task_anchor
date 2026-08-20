@@ -679,6 +679,10 @@ def start_new_task(
         write_audit_event(data_root, data, "activation_missing_cwd")
         return warning("Task Anchor 无法创建任务：Hook 输入缺少 cwd，无法绑定项目边界。")
 
+    policy_result = set_mutation_policy(data, data_root, read_only=False)
+    if policy_result is not None:
+        return policy_result
+
     write_audit_event(data_root, data, "activation_received")
     session_dir = session_directory(data_root, current_session_id)
     new_task_id = str(uuid.uuid4())
