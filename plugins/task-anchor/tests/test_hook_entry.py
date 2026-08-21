@@ -882,16 +882,6 @@ class PluginContractTests(unittest.TestCase):
         end_metadata = (
             PLUGIN_ROOT / "skills" / "task-anchor-end" / "agents" / "openai.yaml"
         ).read_text(encoding="utf-8")
-        chinese_communication_skill = (
-            PLUGIN_ROOT / "skills" / "chinese-communication" / "SKILL.md"
-        ).read_text(encoding="utf-8")
-        chinese_communication_metadata = (
-            PLUGIN_ROOT
-            / "skills"
-            / "chinese-communication"
-            / "agents"
-            / "openai.yaml"
-        ).read_text(encoding="utf-8")
         read_only_skill = (
             PLUGIN_ROOT / "skills" / "task-anchor-readonly" / "SKILL.md"
         ).read_text(encoding="utf-8")
@@ -917,9 +907,6 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn("allow_implicit_invocation: false", metadata)
         self.assertIn("手工结束", end_skill)
         self.assertIn("allow_implicit_invocation: false", end_metadata)
-        self.assertIn("name: chinese-communication", chinese_communication_skill)
-        self.assertIn("体貌", chinese_communication_skill)
-        self.assertIn("display_name: \"中文沟通与句法校验\"", chinese_communication_metadata)
         self.assertIn("name: task-anchor-readonly", read_only_skill)
         self.assertIn("$task-anchor-write", read_only_skill)
         self.assertIn("allow_implicit_invocation: false", read_only_metadata)

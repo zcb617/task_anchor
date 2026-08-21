@@ -1,4 +1,0 @@
-interface:
-  display_name: "中文沟通与句法校验"
-  short_description: "用现代汉语句法规则逐句生成、审校和修正中文回复"
-  default_prompt: "请使用 $chinese-communication Skill，以自然规范的现代汉语与我交流。"
