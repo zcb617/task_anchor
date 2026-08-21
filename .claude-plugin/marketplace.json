@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "task-anchor-local",
+  "owner": {
+    "name": "David Zhang of jxrjkf.cn"
+  },
+  "plugins": [
+    {
+      "name": "task-anchor",
+      "source": "./plugins/task-anchor-claude",
+      "category": "productivity",
+      "description": "Persist explicitly started tasks across Claude Code context compaction."
+    }
+  ]
+}

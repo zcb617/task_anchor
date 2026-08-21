@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from typing import Any
 
@@ -246,9 +247,9 @@ def _tool_result(value: Any, *, is_error: bool = False) -> dict[str, Any]:
 def _require_cwd(arguments: dict[str, Any]) -> str:
     cwd = arguments.get("cwd")
     if cwd is None:
-        cwd = "."
+        cwd = os.environ.get("TASK_ANCHOR_DEFAULT_CWD")
     if not isinstance(cwd, str) or not cwd.strip():
-        raise resource_manager.ResourceError("cwd 必须是非空字符串。")
+        raise resource_manager.ResourceError("cwd 必须由 Task Anchor Hook 或插件项目目录提供。")
     return cwd
 
 

@@ -1,119 +1,117 @@
 # Task Anchor
 
-## 受管进程执行
+Task Anchor 将用户显式开始的任务持久化到当前会话和项目边界内，并在上下文压缩后恢复当前仍处于活动状态的原始任务指令。
 
-插件提供 `mcp__task_anchor__managed_exec` 工具。包含进程型关键词的本地命令应通过该工具执行，插件会登记 PID、工作目录、命令和停止策略；短命查询命令可以直接执行。
+本仓库同时发布两个独立插件包：
 
-- 默认 `stop_policy` 为 `cleanup`：Stop 时关闭该任务登记的进程树。
-- `stop_policy: "keep"`：Stop 时保留服务；建议同时设置 `name`，不再需要时使用 `operation: "stop"` 关闭。
-- `PreToolUse` Hook 会检查命令字符串；命中 `java`、`python`、`node`、`npm`、`mvn`、`gradle` 等进程型关键词时，必须通过 `managed_exec`，`rg`、`Get-Content` 等查询命令直接放行。
-- `Stop` Hook 只清理受管且策略为 `cleanup` 的资源，不会按进程名扫描或误杀用户手工启动的程序。
-- 对已存在的 `mcp__fastctx__*` 工具名，仅放行 `inspect_local_file`、`grep`、`glob` 三个只读工具；其余工具一律拒绝。该规则不注册、不启动也不依赖 FastCtx。
-- 受控管理器会自动识别 Windows、macOS 和 Linux：Windows 使用 `taskkill /T` 结束进程树；macOS/Linux 使用独立进程组和 `killpg` 结束进程组。
-- 资源归属按“项目工作区 + 会话”隔离；同一会话内登记的资源由该会话统一管理，其他会话以及其他项目的资源都不会被当前 Stop 清理。
-- `task_id` 只作为内部审计字段，不作为清理边界。没有明确会话上下文的资源不会进入自动清理范围；需要单独关闭某个资源时使用它的 `run_id` 或 `name`。
+- Codex：[`plugins/task-anchor`](plugins/task-anchor)
+- Claude Code：[`plugins/task-anchor-claude`](plugins/task-anchor-claude)
 
-Task Anchor 是一个 Codex 插件：用户显式调用 `$task-anchor` 时创建一项独立任务；发生上下文压缩后，只恢复该会话当前仍为活动状态的任务指令。
+两个包共享相同的任务语义，但各自使用宿主原生的 marketplace、Hook、技能和 MCP 协议。安装包是自包含的；不要跨插件目录引用脚本或状态。
 
-> [!IMPORTANT]
-> 安装并启用插件不等于 Hook 已启用。必须在 Codex 的 Hook 设置中允许并信任 Task Anchor Hook；否则最初任务不会保存，压缩后也不会恢复。
+## 核心语义
 
-## 已验证环境与运行方式
+- 显式开始任务会生成新的 `task_id`，并将同一会话内已有活动任务标记为 `superseded_by_new_task`。
+- 任务记录绑定会话哈希和工作区哈希；跨会话、跨项目、损坏或校验失败的记录不会被恢复。
+- `PostCompact` 仅恢复当前 `status = 1` 的任务。普通交付、工具调用完成、最终回复、`Stop` 和 `SessionEnd` 都不是可靠的语义完成信号。
+- 显式结束任务会记录 `manually_ended`，此后压缩不再恢复该任务。
+- 只读门控按“会话 + 工作区”保存，拒绝修改型工具和任意命令工具；它不替代宿主自身的权限、沙箱或审批机制。
+- 受管进程按“会话 + 工作区”登记。默认 `stop_policy: "cleanup"` 会在 `Stop`/`SessionEnd` 清理进程树；只有明确使用 `keep` 的服务会保留到显式停止。
 
-- 已验证基线：`codex-cli 0.144.4`。
-- 需要可执行的 `codex` 和 Python 3；Hook 在 Windows 使用 `python`，在 macOS/Linux 使用 `python3`，MCP 配置使用 `python` 作为启动入口。
-- Hook 触发时运行一次 Python 脚本；`managed_exec` MCP 服务由 Codex 按 MCP 生命周期管理，受管业务进程由工具登记并按策略清理。
+## 前置条件
 
-## 从源码安装
+- Node.js：启动 `managed_exec` MCP 服务和跨平台 Hook 启动器。
+- Python 3.10+：运行 Hook、状态机和受管进程服务。可使用 `TASK_ANCHOR_PYTHON` 指定解释器。
+- Claude Code 使用受管命令的人工确认标记需要 v2.1.199 或更新版本。
 
-在仓库根目录注册 Marketplace 并安装插件：
+## Claude Code
 
-    codex plugin marketplace add .
-    codex plugin add task-anchor@task-anchor-local
+Claude Code 插件包位于 [`plugins/task-anchor-claude`](plugins/task-anchor-claude)。市场清单位于 [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json)。
 
-然后在 Codex 的 Plugins 中确认 Task Anchor 已启用，并在 Hooks 设置（CLI 可用 `/hooks`）中允许、信任该插件的四个 Hook：
+### 安装
 
-- `UserPromptSubmit`
-- `PostCompact`
-- `PreToolUse`
-- `Stop`
+在 Claude Code 中依次执行：
 
-Hook 文件变化后，Codex 会要求重新审查和信任；在重新信任前，更新后的 Hook 会被跳过。
+```text
+/plugin marketplace add .
+```
 
-## 更新本地插件
+```text
+/plugin install task-anchor@task-anchor-local
+```
 
-更新源码并通过缓存版本号生成器更新版本后，重新安装当前 Marketplace 中的插件：
+安装或更新后运行 `/reload-plugins`，并审查/允许插件 Hook。开发时可严格验证插件布局：
 
-    python C:\Users\zhang\.codex\skills\.system\plugin-creator\scripts\update_plugin_cachebuster.py plugins\task-anchor
-    codex plugin add task-anchor@task-anchor-local
+```bash
+claude plugin validate plugins/task-anchor-claude --strict
+```
 
-重新信任 Hook，并在新的 Codex 对话中验证。已经创建的对话不会自动重新加载修改后的 Skill 内容。
+### 使用
 
-## 使用
+| 操作 | Claude Code 命令 |
+| --- | --- |
+| 开始任务 | `/task-anchor:task-anchor <完整任务指令>` |
+| 手工结束任务 | `/task-anchor:task-anchor-end` |
+| 开启只读门控 | `/task-anchor:task-anchor-readonly` |
+| 解除只读门控 | `/task-anchor:task-anchor-write` |
 
-开始任务 A：
+`/task-anchor:task-anchor` 只保存命令参数作为原始任务指令；普通对话里出现的 `$task-anchor` 文本不会触发任务创建。
 
-    $task-anchor <任务 A 的完整指令>
+Claude 版受管命令工具名为：
 
-显式调用 `$task-anchor` 表示开始执行任务，因此 Hook 会先把当前“会话 + 项目”的 `read_only` 设为 `false`，再创建新任务。若解除只读失败，则不会创建任务。
+```text
+mcp__plugin_task-anchor_task-anchor__managed_exec
+```
 
-同一对话中开始任务 B：
+Hook 会把该工具调用绑定到当前可信 `session_id` 和 `cwd`，不会接受调用内容提供的会话/工作区。每次受管命令都要求用户确认。优先提供 `program` 和 `args`；仅在需要管道、重定向或复合命令时使用 `shell: true` 与 `command`。保留服务必须设置 `stop_policy: "keep"` 和 `name`，并在不需要时调用该工具的 `operation: "stop"`。
 
-    $task-anchor <任务 B 的完整指令>
+插件状态保存在 `${CLAUDE_PLUGIN_DATA}`，受管进程运行时数据保存在其 `runtime/` 子目录；插件更新不会抹掉这些数据。
 
-每一次显式调用都会生成新的 `task_id`。调用任务 B 时，插件会把该会话中已有任务标记为 `status = 0`，并以 `closed_reason = superseded_by_new_task` 记录关闭原因，再创建任务 B 为 `status = 1`。
+## Codex
 
-手工结束当前任务：
+Codex 插件包位于 [`plugins/task-anchor`](plugins/task-anchor)，市场清单位于 [`.agents/plugins/marketplace.json`](.agents/plugins/marketplace.json)。
 
-    $task-anchor-end
+### 安装
 
-结束命令只关闭当前会话、当前项目绑定下的任务：它会将该任务标为 `status = 0`，记录 `closed_reason = manually_ended`，并保留历史记录。结束后压缩不会再恢复该任务。它不会中止已经开始的工具调用。
+```bash
+codex plugin marketplace add .
+```
 
-切换为只读模式：
+```bash
+codex plugin add task-anchor@task-anchor-local
+```
 
-    $task-anchor-readonly
+在 Codex 中启用 Task Anchor，并允许/信任其 `UserPromptSubmit`、`PostCompact`、`PreToolUse` 和 `Stop` Hook。Hook 文件更新后需要重新审查和信任。
 
-恢复修改权限：
+### 使用
 
-    $task-anchor-write
+```text
+$task-anchor <完整任务指令>
+$task-anchor-end
+$task-anchor-readonly
+$task-anchor-write
+```
 
-只读标记按“会话 + 项目”保存，首次使用默认为可写。只读状态下，`PreToolUse` 会拒绝 `apply_patch`、Shell、Unified exec、`managed_exec` 以及名称明确表示文件修改的工具；文件检查工具仍可使用。Shell 和 `managed_exec` 能运行任意命令，无法可靠证明命令不写入，因此只读状态下整体拒绝。`$task-anchor-write` 只解除这层只读门控，不绕过 Codex 自身权限、审批流程或插件原有规则。
+Codex 版的受管命令工具名是 `mcp__task_anchor__managed_exec`。其行为与 Claude Code 版的任务边界、只读门控和资源清理语义相同，但命令、Hook 数据包和工具名均为 Codex 专用。
 
-不要通过最终回复、原生 TOLIST 清空、普通工具调用或 `Stop` 事件结束任务。
+## 测试
 
-## 压缩后的状态
+运行 Codex Python 测试：
 
-`PostCompact` 只读取当前 `task_id`：
+```bash
+python -m unittest discover -s plugins/task-anchor/tests -p "test_*.py"
+```
 
-- `status = 1`：重新注入原始任务指令，并附加 `task_id`、`status = 1` 和“自动完成状态无法验证”的被动提醒。
-- `status = 0`：不注入任务指令。
+运行 Claude Code Python 测试：
 
-当前 Codex 插件接口没有插件可订阅的可靠“语义任务已完成”事件。因此普通最终交付后，任务仍保持 `status = 1`；压缩时会继续恢复它。提醒不提问、不提供选项、不等待用户回应、不打断任务，也不会改变状态。用户可显式调用 `$task-anchor-end` 手工结束；下一次显式 `$task-anchor` 则会关闭旧任务并创建新任务。
+```bash
+python -m unittest discover -s plugins/task-anchor-claude/tests -p "test_*.py"
+```
 
-## Hook 审计日志
+运行 Node 启动器测试：
 
-审计日志位于 `PLUGIN_DATA/audit/events.jsonl`。它仅保存 Hook 事件、UTC 时间、会话哈希、项目哈希、任务 ID、状态及指令字节数/SHA-256；不保存任务正文、普通用户消息或真实 `session_id`。
+```bash
+node --test plugins/task-anchor/tests/test_managed_exec_launcher.cjs
+```
 
-常见事件包括：
-
-    activation_received
-    task_closed
-    activation_completed
-    post_compact_received
-    restore_emitted
-    restore_closed
-
-## 仓库结构
-
-    .agents/plugins/marketplace.json
-    plugins/task-anchor/.codex-plugin/plugin.json
-    plugins/task-anchor/.mcp.json
-    plugins/task-anchor/hooks/hooks.json
-    plugins/task-anchor/scripts/hook_entry.py
-    plugins/task-anchor/scripts/resource_manager.py
-    plugins/task-anchor/scripts/managed_exec_mcp.py
-    plugins/task-anchor/skills/task-anchor/SKILL.md
-    plugins/task-anchor/skills/task-anchor-readonly/SKILL.md
-    plugins/task-anchor/skills/task-anchor-write/SKILL.md
-
-插件不包含小模型、自定义 TOLIST、`PostToolUse` 或 `PreCompact`；MCP 服务只提供受管命令执行工具。
+建议额外以 `--plugin-dir plugins/task-anchor-claude` 启动 Claude Code，验证四个技能、自动与手动压缩恢复、只读拒绝、每次 `managed_exec` 的人工确认，以及 cleanup/keep 资源在 `Stop` 与 `SessionEnd` 下的行为。
