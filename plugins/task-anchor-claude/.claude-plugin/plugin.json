@@ -4,7 +4,7 @@
   "displayName": "Task Anchor",
   "version": "0.5.0",
   "description": "Persist explicitly started tasks across Claude Code context compaction.",
-  "owner": {
+  "author": {
     "name": "jxrjkf.cn",
     "email": "contact@jxrjkf.cn"
   },
