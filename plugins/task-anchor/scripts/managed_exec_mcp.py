@@ -328,7 +328,6 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
                         ),
                         "inputSchema": TOOL_SCHEMA,
                         "outputSchema": TOOL_OUTPUT_SCHEMA,
-                        "_meta": {"anthropic/requiresUserInteraction": True},
                     }
                 ]
             },

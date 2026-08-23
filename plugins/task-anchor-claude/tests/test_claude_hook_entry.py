@@ -287,7 +287,7 @@ class ClaudePluginContractTests(unittest.TestCase):
             content = (PLUGIN_ROOT / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn("disable-model-invocation: true", content)
 
-    def test_managed_exec_requires_user_interaction(self) -> None:
+    def test_managed_exec_uses_standard_permission_flow(self) -> None:
         spec = importlib.util.spec_from_file_location(
             "task_anchor_claude_mcp", SCRIPTS_ROOT / "managed_exec_mcp.py"
         )
@@ -297,7 +297,7 @@ class ClaudePluginContractTests(unittest.TestCase):
         response = mcp.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         assert response is not None
         tool = response["result"]["tools"][0]
-        self.assertEqual(tool["_meta"]["anthropic/requiresUserInteraction"], True)
+        self.assertNotIn("_meta", tool)
 
 
 if __name__ == "__main__":
