@@ -284,6 +284,50 @@ class ClaudeHookEntryTests(unittest.TestCase):
             )
         )
 
+    def test_invalid_exclusion_config_keeps_bash_guard(self) -> None:
+        """验证排除配置缺失、非法或结构错误时 Bash 仍执行原有拒绝管控。"""
+        invalid_configs: list[tuple[str, str | None]] = [
+            ("missing", None),
+            ("invalid_json", "{"),
+            ("root_not_dict", "[]"),
+            ("missing_exclude_projects", "{}"),
+            ("exclude_projects_not_list", json.dumps({"excludeProjects": {}})),
+        ]
+
+        for case_name, content in invalid_configs:
+            with self.subTest(case_name=case_name):
+                if self.config_path.exists():
+                    self.config_path.unlink()
+                if content is not None:
+                    self.config_path.write_text(content, encoding="utf-8")
+                denied = HOOK.handle_hook(
+                    self.payload(
+                        "PreToolUse",
+                        tool_name="Bash",
+                        tool_input={"command": "sh -c 's" + "leep 600'"},
+                    ),
+                    self.data_root,
+                )
+                self.assertIsNotNone(denied)
+                self.assertEqual(
+                    denied["hookSpecificOutput"]["permissionDecision"],
+                    "deny",
+                )
+
+        self.config_path.write_text(
+            json.dumps({"excludeProjects": [str(self.workspace)]}), encoding="utf-8"
+        )
+        self.assertIsNone(
+            HOOK.handle_hook(
+                self.payload(
+                    "PreToolUse",
+                    tool_name="Bash",
+                    tool_input={"command": "sh -c 's" + "leep 600'"},
+                ),
+                self.data_root,
+            )
+        )
+
     def test_readonly_blocks_direct_command_tools_with_write_remediation(self) -> None:
         self.assertIsNone(self.expand("task-anchor", "read-only command policy"))
         self.assertIsNone(self.expand("task-anchor:task-anchor-readonly"))

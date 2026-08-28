@@ -1075,13 +1075,43 @@ def _bind_managed_exec_to_session(data: dict[str, Any]) -> dict[str, Any] | None
     }
 
 
+def _is_excluded_project(cwd: object) -> bool:
+    """安全读取用户排除配置，判断当前工作目录是否属于排除项目。"""
+
+    if not isinstance(cwd, str) or not cwd.strip():
+        return False
+    try:
+        config_path = Path.home() / ".task_anchor" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(config, dict):
+        return False
+    excluded_projects = config.get("excludeProjects")
+    if not isinstance(excluded_projects, list):
+        return False
+    try:
+        current_path = Path(cwd).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    for project in excluded_projects:
+        if not isinstance(project, str) or not project.strip():
+            continue
+        try:
+            if current_path == Path(project).resolve():
+                return True
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return False
+
+
 def guard_pre_tool_use(
     data: dict[str, Any],
     data_root: Path | None,
 ) -> dict[str, Any] | None:
     """限制 FastCtx 工具，并要求进程型命令通过 managed_exec 执行。"""
 
-    if data.get("cwd") and Path(data["cwd"]).resolve() in {Path(project).resolve() for project in json.loads((Path.home() / ".task_anchor" / "config.json").read_text(encoding="utf-8"))["excludeProjects"]}:
+    if _is_excluded_project(data.get("cwd")):
         return None
 
     tool_name = _tool_name(data)

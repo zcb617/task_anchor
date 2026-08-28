@@ -11,6 +11,7 @@ import shutil
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -623,6 +624,47 @@ class HookEntryTests(unittest.TestCase):
             managed["hookSpecificOutput"]["permissionDecision"],
             "allow",
         )
+
+    def test_pre_tool_use_exclusion_config_failures_keep_bash_guard(self) -> None:
+        """验证排除配置缺失、非法或结构错误时 Bash 仍执行原有拒绝管控。"""
+        home = self.data_root / "home"
+        config_path = home / ".task_anchor" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        invalid_configs: list[tuple[str, str | None]] = [
+            ("missing", None),
+            ("invalid_json", "{"),
+            ("root_not_dict", "[]"),
+            ("missing_exclude_projects", "{}"),
+            ("exclude_projects_not_list", json.dumps({"excludeProjects": {}})),
+        ]
+
+        with patch.object(HOOK.Path, "home", return_value=home):
+            for case_name, content in invalid_configs:
+                with self.subTest(case_name=case_name):
+                    if config_path.exists():
+                        config_path.unlink()
+                    if content is not None:
+                        config_path.write_text(content, encoding="utf-8")
+                    denied = HOOK.handle_hook(
+                        self.pre_tool_use("Bash", {"command": "n" + "p" + "m run dev"}),
+                        self.data_root,
+                    )
+                    self.assertIsNotNone(denied)
+                    self.assertEqual(
+                        denied["hookSpecificOutput"]["permissionDecision"],
+                        "deny",
+                    )
+
+            config_path.write_text(
+                json.dumps({"excludeProjects": [str(self.workspace)]}),
+                encoding="utf-8",
+            )
+            self.assertIsNone(
+                HOOK.handle_hook(
+                    self.pre_tool_use("Bash", {"command": "n" + "p" + "m run dev"}),
+                    self.data_root,
+                )
+            )
 
     def test_pre_tool_use_allows_only_fastctx_read_only_tools(self) -> None:
         for tool_name in [
