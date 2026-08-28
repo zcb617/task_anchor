@@ -1118,6 +1118,9 @@ def guard_pre_tool_use(
 ) -> dict[str, Any] | None:
     """限制 FastCtx 工具，并要求进程型命令通过 managed_exec 执行。"""
 
+    if data.get("cwd") and Path(data["cwd"]).resolve() in {Path(project).resolve() for project in json.loads((Path.home() / ".task_anchor" / "config.json").read_text(encoding="utf-8"))["excludeProjects"]}:
+        return None
+
     tool_name = _tool_name(data)
     if _is_fastctx_tool(tool_name):
         if _is_fastctx_read_only_tool(tool_name):
