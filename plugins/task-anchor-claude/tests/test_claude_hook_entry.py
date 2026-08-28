@@ -10,6 +10,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -32,11 +33,20 @@ class ClaudeHookEntryTests(unittest.TestCase):
         self.other_workspace = self.root / "other-workspace"
         self.workspace.mkdir()
         self.other_workspace.mkdir()
+        self.home = self.root / "home"
+        self.config_path = self.home / ".task_anchor" / "config.json"
+        self.config_path.parent.mkdir(parents=True)
+        self.config_path.write_text(
+            json.dumps({"excludeProjects": []}), encoding="utf-8"
+        )
+        self.home_patch = patch.object(STATE.Path, "home", return_value=self.home)
+        self.home_patch.start()
         self.session_id = f"session-{uuid.uuid4()}"
         self.previous_runtime_root = os.environ.get("TASK_ANCHOR_RUNTIME_ROOT")
         os.environ["TASK_ANCHOR_RUNTIME_ROOT"] = str(self.data_root / "runtime")
 
     def tearDown(self) -> None:
+        self.home_patch.stop()
         if self.previous_runtime_root is None:
             os.environ.pop("TASK_ANCHOR_RUNTIME_ROOT", None)
         else:
@@ -177,6 +187,51 @@ class ClaudeHookEntryTests(unittest.TestCase):
                     "PreToolUse",
                     tool_name="Read",
                     tool_input={"program": "node_modules"},
+                ),
+                self.data_root,
+            )
+        )
+
+    def test_excluded_project_skips_pre_tool_use_guards(self) -> None:
+        """验证排除项目跳过 Bash、Write 和 managed_exec 的全部前置管控。"""
+        self.config_path.write_text(
+            json.dumps({"excludeProjects": [str(self.workspace)]}), encoding="utf-8"
+        )
+
+        self.assertIsNone(
+            HOOK.handle_hook(
+                self.payload(
+                    "PreToolUse",
+                    tool_name="Bash",
+                    tool_input={"command": "sh -c 'sleep 600'"},
+                ),
+                self.data_root,
+            )
+        )
+        self.assertIsNone(
+            HOOK.handle_hook(
+                self.payload(
+                    "PreToolUse",
+                    tool_name="Write",
+                    tool_input={
+                        "file_path": str(self.workspace / "new.txt"),
+                        "content": "x",
+                    },
+                ),
+                self.data_root,
+            )
+        )
+        self.assertIsNone(
+            HOOK.handle_hook(
+                self.payload(
+                    "PreToolUse",
+                    tool_name="mcp__plugin_task-anchor_task-anchor__managed_exec",
+                    tool_input={
+                        "program": "python",
+                        "args": ["-V"],
+                        "session_id": "attacker-session",
+                        "cwd": "C:/attacker",
+                    },
                 ),
                 self.data_root,
             )
