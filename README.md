@@ -13,7 +13,7 @@ Task Anchor 将用户显式开始的任务持久化到当前会话和项目边�
 
 - 显式开始任务会生成新的 `task_id`，并将同一会话内已有活动任务标记为 `superseded_by_new_task`。
 - 任务记录绑定会话哈希和工作区哈希；跨会话、跨项目、损坏或校验失败的记录不会被恢复。
-- `PostCompact` 仅恢复当前 `status = 1` 的任务。普通交付、工具调用完成、最终回复、`Stop` 和 `SessionEnd` 都不是可靠的语义完成信号。
+- 每次命中 `PostCompact` Hook 都注入对应 CLI 的规则重读提醒（Codex 为 `AGENTS.md`，Claude Code 为 `CLAUDE.md`）；原始任务指令仍只在当前 `status = 1` 且原有校验通过时恢复。普通交付、工具调用完成、最终回复、`Stop` 和 `SessionEnd` 都不是可靠的语义完成信号。
 - 显式结束任务会记录 `manually_ended`，此后压缩不再恢复该任务。
 - 只读门控按“会话 + 工作区”保存，拒绝修改型工具和任意命令工具；它不替代宿主自身的权限、沙箱或审批机制。
 - 受管进程按“会话 + 工作区”登记。默认 `stop_policy: "cleanup"` 会在 `Stop`/`SessionEnd` 清理进程树；只有明确使用 `keep` 的服务会保留到显式停止。

@@ -253,6 +253,9 @@ class HookEntryTests(unittest.TestCase):
         self.assertIsNotNone(result)
         context = result["hookSpecificOutput"]["additionalContext"]
         self.assertEqual(result["hookSpecificOutput"]["hookEventName"], "PostCompact")
+        self.assertTrue(
+            context.startswith(HOOK.POST_COMPACT_CONTINUITY_REMINDER + "\n\n")
+        )
         self.assertIn(second_prompt, context)
         self.assertNotIn(self.task_instruction(first_task_id), context)
         self.assertIn(f"task_id: {second_task_id}", context)
@@ -260,6 +263,26 @@ class HookEntryTests(unittest.TestCase):
         self.assertIn("自动完成状态无法验证", context)
         self.assertIn("不要求作答，不改变任务状态，也不阻断当前任务", context)
         self.assertNotIn("$task-anchor-end", context)
+
+    def test_post_compact_without_anchor_emits_continuity_reminder(self) -> None:
+        """验证没有锚定任务时仍向 Codex 注入固定连续性提醒。"""
+        result = HOOK.handle_hook(self.post_compact(), self.data_root)
+
+        self.assertIsNotNone(result)
+        context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(context, HOOK.POST_COMPACT_CONTINUITY_REMINDER)
+        self.assertIn("AGENTS.md", context)
+        self.assertNotIn("CLAUDE.md", context)
+
+    def test_post_compact_without_data_root_emits_continuity_reminder(self) -> None:
+        """验证没有插件数据根目录时仍向 Codex 注入固定连续性提醒。"""
+        result = HOOK.handle_hook(self.post_compact(), None)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result["hookSpecificOutput"]["additionalContext"],
+            HOOK.POST_COMPACT_CONTINUITY_REMINDER,
+        )
 
     def test_many_compactions_restore_the_same_active_task(self) -> None:
         task_id = self.activate("$task-anchor 长任务")
@@ -292,7 +315,12 @@ class HookEntryTests(unittest.TestCase):
         self.assertEqual(metadata["status"], HOOK.TASK_STATUS_CLOSED)
         self.assertEqual(metadata["closed_reason"], HOOK.CLOSED_REASON_MANUAL)
         self.assertIn("closed_at", metadata)
-        self.assertIsNone(HOOK.handle_hook(self.post_compact(), self.data_root))
+        closed_restore = HOOK.handle_hook(self.post_compact(), self.data_root)
+        self.assertEqual(
+            closed_restore["hookSpecificOutput"]["additionalContext"],
+            HOOK.POST_COMPACT_CONTINUITY_REMINDER,
+        )
+        self.assertNotIn("需要手工结束", closed_restore["hookSpecificOutput"]["additionalContext"])
         closed_events = [
             event
             for event in self.audit_events()
@@ -362,6 +390,11 @@ class HookEntryTests(unittest.TestCase):
         result = HOOK.handle_hook(self.post_compact(), self.data_root)
 
         self.assertIn("未完成的任务切换", result["systemMessage"])
+        self.assertIn(
+            HOOK.POST_COMPACT_CONTINUITY_REMINDER,
+            result["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertNotIn(pending_prompt, result["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(self.current_task_id(), old_task_id)
         self.assertEqual(
             self.task_metadata(old_task_id)["status"], HOOK.TASK_STATUS_ACTIVE
@@ -382,7 +415,12 @@ class HookEntryTests(unittest.TestCase):
         metadata["closed_reason"] = HOOK.CLOSED_REASON_SUPERSEDED
         self.write_task_metadata(task_id, metadata)
 
-        self.assertIsNone(HOOK.handle_hook(self.post_compact(), self.data_root))
+        result = HOOK.handle_hook(self.post_compact(), self.data_root)
+        self.assertEqual(
+            result["hookSpecificOutput"]["additionalContext"],
+            HOOK.POST_COMPACT_CONTINUITY_REMINDER,
+        )
+        self.assertNotIn("$task-anchor 已关闭任务", result["hookSpecificOutput"]["additionalContext"])
         self.assertIn("restore_closed", [event["status"] for event in self.audit_events()])
 
     def test_manual_post_compact_restores_active_task(self) -> None:
@@ -391,10 +429,13 @@ class HookEntryTests(unittest.TestCase):
         self.assertIn(task_id, result["hookSpecificOutput"]["additionalContext"])
 
     def test_invalid_post_compact_trigger_is_ignored(self) -> None:
-        self.activate("$task-anchor 指令")
-        self.assertIsNone(
-            HOOK.handle_hook(self.post_compact("unexpected"), self.data_root)
-        )
+        prompt = "$task-anchor 指令"
+        self.activate(prompt)
+        result = HOOK.handle_hook(self.post_compact("unexpected"), self.data_root)
+        context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(context, HOOK.POST_COMPACT_CONTINUITY_REMINDER)
+        self.assertNotIn(prompt, context)
+        self.assertNotIn(self.current_task_id(), context)
 
     def test_read_only_and_write_skills_toggle_workspace_policy(self) -> None:
         self.assertIsNone(
@@ -734,7 +775,11 @@ class HookEntryTests(unittest.TestCase):
             self.post_compact(cwd=self.other_workspace), self.data_root
         )
         self.assertIn("当前项目与任务锚点不一致", result["systemMessage"])
-        self.assertNotIn("hookSpecificOutput", result)
+        self.assertIn(
+            HOOK.POST_COMPACT_CONTINUITY_REMINDER,
+            result["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertNotIn("不得跨项目继续", result["hookSpecificOutput"]["additionalContext"])
 
     def test_missing_cwd_is_rejected_on_activation_and_restore(self) -> None:
         activation = self.user_prompt("$task-anchor 必须绑定项目")
@@ -749,7 +794,11 @@ class HookEntryTests(unittest.TestCase):
         del compact["cwd"]
         compact_result = HOOK.handle_hook(compact, self.data_root)
         self.assertIn("缺少 cwd", compact_result["systemMessage"])
-        self.assertNotIn("hookSpecificOutput", compact_result)
+        self.assertIn(
+            HOOK.POST_COMPACT_CONTINUITY_REMINDER,
+            compact_result["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertNotIn("有效任务", compact_result["hookSpecificOutput"]["additionalContext"])
 
     def test_corrupted_instruction_is_not_injected(self) -> None:
         task_id = self.activate("$task-anchor 原始指令")
@@ -758,7 +807,11 @@ class HookEntryTests(unittest.TestCase):
         )
         result = HOOK.handle_hook(self.post_compact(), self.data_root)
         self.assertIn("SHA-256 校验失败", result["systemMessage"])
-        self.assertNotIn("hookSpecificOutput", result)
+        self.assertIn(
+            HOOK.POST_COMPACT_CONTINUITY_REMINDER,
+            result["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertNotIn("原始指令", result["hookSpecificOutput"]["additionalContext"])
 
     def test_legacy_session_layout_is_not_restored(self) -> None:
         directory = self.session_dir()
@@ -771,7 +824,11 @@ class HookEntryTests(unittest.TestCase):
         result = HOOK.handle_hook(self.post_compact(), self.data_root)
 
         self.assertIn("旧版任务记录", result["systemMessage"])
-        self.assertNotIn("hookSpecificOutput", result)
+        self.assertIn(
+            HOOK.POST_COMPACT_CONTINUITY_REMINDER,
+            result["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertNotIn("旧版任务", result["hookSpecificOutput"]["additionalContext"])
 
     def test_sessions_are_isolated(self) -> None:
         first_task_id = self.activate("$task-anchor 第一个会话")

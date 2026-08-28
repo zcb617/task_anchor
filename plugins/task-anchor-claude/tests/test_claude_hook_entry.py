@@ -141,6 +141,9 @@ class ClaudeHookEntryTests(unittest.TestCase):
         )
         assert restored is not None
         context = restored["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(
+            context.startswith(STATE.POST_COMPACT_CONTINUITY_REMINDER + "\n\n")
+        )
         self.assertIn(instruction, context)
         self.assertIn("/task-anchor:task-anchor", context)
 
@@ -150,6 +153,50 @@ class ClaudeHookEntryTests(unittest.TestCase):
         )
         assert rejected is not None
         self.assertIn("跨项目", rejected["systemMessage"])
+        self.assertIn(
+            STATE.POST_COMPACT_CONTINUITY_REMINDER,
+            rejected["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertNotIn(instruction, rejected["hookSpecificOutput"]["additionalContext"])
+
+    def test_post_compact_without_anchor_emits_continuity_reminder(self) -> None:
+        """验证没有锚定任务时仍向 Claude Code 注入固定连续性提醒。"""
+        result = HOOK.handle_hook(
+            self.payload("PostCompact", trigger="auto"), self.data_root
+        )
+
+        self.assertIsNotNone(result)
+        context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(context, STATE.POST_COMPACT_CONTINUITY_REMINDER)
+        self.assertIn("CLAUDE.md", context)
+        self.assertNotIn("AGENTS.md", context)
+
+    def test_post_compact_without_data_root_emits_continuity_reminder(self) -> None:
+        """验证没有插件数据根目录时仍向 Claude Code 注入固定连续性提醒。"""
+        result = HOOK.handle_hook(
+            self.payload("PostCompact", trigger="auto"), None
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result["hookSpecificOutput"]["additionalContext"],
+            STATE.POST_COMPACT_CONTINUITY_REMINDER,
+        )
+
+    def test_invalid_post_compact_trigger_emits_only_continuity_reminder(self) -> None:
+        """验证无效 PostCompact trigger 不恢复任务正文但仍注入固定提醒。"""
+        instruction = "invalid trigger task"
+        self.assertIsNone(self.expand("task-anchor", instruction))
+        task_id = self.current_task_id()
+        result = HOOK.handle_hook(
+            self.payload("PostCompact", trigger="unexpected"), self.data_root
+        )
+
+        self.assertIsNotNone(result)
+        context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(context, STATE.POST_COMPACT_CONTINUITY_REMINDER)
+        self.assertNotIn(instruction, context)
+        self.assertNotIn(task_id, context)
 
     def test_readonly_blocks_claude_mutation_tools(self) -> None:
         self.assertIsNone(self.expand("task-anchor", "read-only task"))

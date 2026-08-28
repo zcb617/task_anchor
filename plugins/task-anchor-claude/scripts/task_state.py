@@ -35,6 +35,11 @@ WRITE_SKILL_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_:-])/task-anchor:task-anchor-write(?![A-Za-z0-9_:-])"
 )
 POST_COMPACT = "PostCompact"
+# Claude Code 上下文压缩后提醒用户重新读取项目规则和最近对话。
+POST_COMPACT_CONTINUITY_REMINDER = (
+    "你刚刚经历了上下文压缩，请立刻重新读取CLAUDE.md规则文件，以及最近的20条和用户的对话内容。"
+    "以确保工作的延续性和连贯性。"
+)
 USER_PROMPT_SUBMIT = "UserPromptSubmit"
 PRE_TOOL_USE = "PreToolUse"
 STOP = "Stop"
@@ -168,6 +173,26 @@ def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
 
 def warning(message: str) -> dict[str, Any]:
     return {"continue": True, "systemMessage": message}
+
+
+def post_compact_output(task_context: str | None = None) -> dict[str, Any]:
+    """构造 Claude Code PostCompact 的连续性提醒及可选任务恢复上下文。"""
+
+    additional_context = POST_COMPACT_CONTINUITY_REMINDER
+    if task_context:
+        additional_context = f"{additional_context}\n\n{task_context}"
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": POST_COMPACT,
+            "additionalContext": additional_context,
+        }
+    }
+
+
+def post_compact_warning(message: str) -> dict[str, Any]:
+    """保留 PostCompact 警告审计提示，同时注入 Claude Code 连续性提醒。"""
+
+    return {**warning(message), **post_compact_output()}
 
 
 def read_session_id(data: dict[str, Any]) -> str | None:
@@ -872,21 +897,22 @@ def end_current_task(
     return None
 
 
+# 在上下文压缩后注入连续性提醒，并仅恢复校验通过的当前活动任务。
 def restore_after_post_compact(
     data: dict[str, Any],
     data_root: Path | None,
 ) -> dict[str, Any] | None:
     if data.get("trigger") not in {"auto", "manual"}:
         write_audit_event(data_root, data, "post_compact_ignored_trigger")
-        return None
+        return post_compact_output()
     if data_root is None:
-        return None
+        return post_compact_output()
 
     write_audit_event(data_root, data, "post_compact_received")
     current_session_id = read_session_id(data)
     if current_session_id is None:
         write_audit_event(data_root, data, "restore_missing_session_id")
-        return warning("Task Anchor 无法恢复任务：Hook 输入缺少 session_id。")
+        return post_compact_warning("Task Anchor 无法恢复任务：Hook 输入缺少 session_id。")
 
     try:
         with session_lock(session_directory(data_root, current_session_id)):
@@ -900,7 +926,7 @@ def restore_after_post_compact(
                     "restore_pending_transition",
                     task_id=task_id,
                 )
-                return warning(
+                return post_compact_warning(
                     "Task Anchor 检测到未完成的任务切换，未恢复任务指令；"
                     "请重新显式调用 /task-anchor:task-anchor。"
                 )
@@ -909,12 +935,12 @@ def restore_after_post_compact(
             if task_id is None:
                 if has_legacy_session_layout(data_root, current_session_id):
                     write_audit_event(data_root, data, "legacy_layout_skipped")
-                    return warning(
+                    return post_compact_warning(
                         "Task Anchor 检测到旧版任务记录，未恢复旧指令；"
                         "请重新显式调用 /task-anchor:task-anchor 创建当前任务。"
                     )
                 write_audit_event(data_root, data, "restore_no_current_task")
-                return None
+                return post_compact_output()
 
             instruction, metadata = load_task(
                 data,
@@ -930,15 +956,15 @@ def restore_after_post_compact(
                     task_id=task_id,
                     closed_reason=metadata.get("closed_reason"),
                 )
-                return None
+                return post_compact_output()
     except LockUnavailable:
         write_audit_event(data_root, data, "restore_lock_unavailable")
-        return warning("Task Anchor 当前任务状态正由另一项操作切换，未恢复任务指令。")
+        return post_compact_warning("Task Anchor 当前任务状态正由另一项操作切换，未恢复任务指令。")
     except StorageError as exc:
         write_audit_event(data_root, data, "restore_rejected")
-        return warning(str(exc))
+        return post_compact_warning(str(exc))
 
-    additional_context = (
+    task_context = (
         f"必须使用 {SKILL_MARKER} Skill 继续当前任务。\n\n"
         "[Task Anchor 状态提醒]\n"
         f"- task_id: {task_id}\n"
@@ -955,12 +981,7 @@ def restore_after_post_compact(
         instruction_bytes=len(instruction.encode("utf-8")),
         task_status=metadata["status"],
     )
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": POST_COMPACT,
-            "additionalContext": additional_context,
-        }
-    }
+    return post_compact_output(task_context)
 
 
 def _tool_name(data: dict[str, Any]) -> str:
