@@ -1279,7 +1279,7 @@ def handle_hook(
     if event_name == POST_COMPACT:
         return restore_after_post_compact(data, data_root)
     if event_name == PRE_TOOL_USE:
-        return guard_pre_tool_use(data, data_root)
+        # return guard_pre_tool_use(data, data_root)
     if event_name == STOP:
         cleanup_after_stop(data, data_root)
         return None
