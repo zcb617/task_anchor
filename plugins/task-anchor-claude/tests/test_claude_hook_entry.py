@@ -198,21 +198,94 @@ class ClaudeHookEntryTests(unittest.TestCase):
         self.assertNotIn(instruction, context)
         self.assertNotIn(task_id, context)
 
-    def test_pre_tool_use_entry_requires_managed_exec_for_process_commands(self) -> None:
-        """验证恢复的 PreToolUse 入口会拒绝绕过 managed_exec 的进程命令。"""
+    def test_pre_tool_use_allows_non_process_commands(self) -> None:
+        """验证 Bash 查询命令未命中进程关键词时允许直接执行。"""
         result = HOOK.handle_hook(
             self.payload(
                 "PreToolUse",
                 tool_name="Bash",
-                tool_input={"command": "npm run dev"},
+                tool_input={"command": "pwd && ls"},
             ),
             self.data_root,
         )
-        self.assertIsNotNone(result)
-        self.assertEqual(
-            result["hookSpecificOutput"]["permissionDecision"], "deny"
+        self.assertIsNone(result)
+
+        for command in ("git status", "rg --files"):
+            with self.subTest(command=command):
+                result = HOOK.handle_hook(
+                    self.payload(
+                        "PreToolUse",
+                        tool_name="Bash",
+                        tool_input={"command": command},
+                    ),
+                    self.data_root,
+                )
+                self.assertIsNone(result)
+
+    def test_pre_tool_use_entry_requires_managed_exec_for_process_commands(self) -> None:
+        """验证恢复的 PreToolUse 入口会拒绝绕过 managed_exec 的进程命令。"""
+        for command in ("node -e \"console.log(1)\"", "npm run dev"):
+            with self.subTest(command=command):
+                result = HOOK.handle_hook(
+                    self.payload(
+                        "PreToolUse",
+                        tool_name="Bash",
+                        tool_input={"command": command},
+                    ),
+                    self.data_root,
+                )
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(
+                    result["hookSpecificOutput"]["permissionDecision"], "deny"
+                )
+                self.assertIn(
+                    "mcp__plugin_task-anchor_task-anchor__managed_exec",
+                    result["hookSpecificOutput"]["permissionDecisionReason"],
+                )
+
+    def test_pre_tool_use_matches_nested_command_fields(self) -> None:
+        """验证 toolInput 和 arguments 中的命令仍按进程关键词拦截。"""
+        nested_inputs = (
+            ("toolInput", {"command": "bun run dev"}),
+            ("arguments", {"command": "node -e \"console.log(1)\""}),
         )
-        self.assertIn("managed_exec", result["hookSpecificOutput"]["permissionDecisionReason"])
+        for field_name, field_value in nested_inputs:
+            with self.subTest(field_name=field_name):
+                result = HOOK.handle_hook(
+                    self.payload(
+                        "PreToolUse",
+                        tool_name="Bash",
+                        **{field_name: field_value},
+                    ),
+                    self.data_root,
+                )
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(
+                    result["hookSpecificOutput"]["permissionDecision"], "deny"
+                )
+                self.assertIn(
+                    "mcp__plugin_task-anchor_task-anchor__managed_exec",
+                    result["hookSpecificOutput"]["permissionDecisionReason"],
+                )
+
+    def test_pre_tool_use_allows_non_command_tools_without_command_text(self) -> None:
+        """验证 Read 和 Write 不因缺少命令文本进入进程命令拦截。"""
+        for tool_name, tool_input in (
+            ("Read", {"file_path": "README.md"}),
+            ("Write", {"file_path": "output.txt", "content": "content"}),
+        ):
+            with self.subTest(tool_name=tool_name):
+                result = HOOK.handle_hook(
+                    self.payload(
+                        "PreToolUse",
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                    ),
+                    self.data_root,
+                )
+                self.assertIsNone(result)
 
     def test_session_end_cleanup_is_idempotent(self) -> None:
         self.assertIsNone(self.expand("task-anchor", "background task"))

@@ -89,6 +89,41 @@ MUTATION_TOOL_TOKENS = {
     "write",
 }
 FILE_RESOURCE_TOKENS = {"directory", "file", "folder", "path"}
+PROCESS_COMMAND_KEYWORDS = (
+    "java",
+    "python",
+    "node",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "mvn",
+    "maven",
+    "gradle",
+    "go",
+    "cargo",
+    "dotnet",
+    "docker",
+    "podman",
+    "adb",
+    "ffmpeg",
+    "deno",
+    "bun",
+    "php",
+    "ruby",
+    "perl",
+)
+COMMAND_TEXT_KEYS = (
+    "command",
+    "cmd",
+    "shell_command",
+    "command_line",
+    "script",
+    "program",
+)
+NESTED_COMMAND_KEYS = ("tool_input", "toolInput", "arguments", "input")
+
+
 class StorageError(RuntimeError):
     """任务存储不完整或不可信。"""
 
@@ -1075,6 +1110,35 @@ def _bind_managed_exec_to_session(data: dict[str, Any]) -> dict[str, Any] | None
     }
 
 
+def _command_text(data: dict[str, Any]) -> str:
+    """提取 Hook 输入中的命令字符串，不解析命令结构。"""
+
+    parts: list[str] = []
+
+    def visit(value: Any, depth: int = 0) -> None:
+        if not isinstance(value, dict) or depth > 2:
+            return
+        for key in COMMAND_TEXT_KEYS:
+            item = value.get(key)
+            if isinstance(item, str):
+                parts.append(item)
+        for key in NESTED_COMMAND_KEYS:
+            visit(value.get(key), depth + 1)
+
+    visit(data)
+    return " ".join(parts)
+
+
+def _matched_process_keyword(command_text: str) -> str | None:
+    """识别命令文本中的进程关键词，供进程命令执行管控使用。"""
+
+    normalized = command_text.lower()
+    return next(
+        (keyword for keyword in PROCESS_COMMAND_KEYWORDS if keyword in normalized),
+        None,
+    )
+
+
 def _is_excluded_project(cwd: object) -> bool:
     """安全读取用户排除配置，判断当前工作目录是否属于排除项目。"""
 
@@ -1162,12 +1226,22 @@ def guard_pre_tool_use(
         return _deny_read_only(
             "Only mcp__plugin_task-anchor_task-anchor__managed_exec is permitted."
         )
-    if tool_name.strip().lower() in COMMAND_TOOL_NAMES:
-        return _deny_read_only(
-            "Direct command tools are disabled; use "
-            "mcp__plugin_task-anchor_task-anchor__managed_exec."
-        )
-    return None
+
+    command_text = _command_text(data)
+    matched_keyword = _matched_process_keyword(command_text)
+    if matched_keyword is None:
+        return None
+
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": PRE_TOOL_USE,
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                f"Process keyword {matched_keyword!r} requires "
+                "mcp__plugin_task-anchor_task-anchor__managed_exec."
+            ),
+        },
+    }
 
 
 def cleanup_after_stop(data: dict[str, Any], data_root: Path | None) -> None:
