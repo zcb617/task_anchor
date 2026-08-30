@@ -16,9 +16,12 @@ disable-model-invocation: true
 2. 用户明确改变目标、约束或方向时，以较新的明确指令为准。
 3. 不要把普通交付、工具调用完成、计划清空、最终回复、`Stop` 或 `SessionEnd` 当作任务完成；任务只会被 `/task-anchor:task-anchor-end` 明确结束，或被下一个锚定任务取代。
 
-## 原生命令执行边界
+## 受管命令执行
 
-本插件不接管本地命令执行，所有命令按 Claude Code 原生工具方式执行；当前版本不通过 Task Anchor 提供命令超时或自动停止。
+- 所有会启动本地进程的命令必须调用 `mcp__plugin_task-anchor_task-anchor__managed_exec`，不得直接调用 Shell、exec、PowerShell、Bash 或 local_shell。
+- Node managed_exec 负责启动、登记、超时和停止本地进程；普通资源到达 `timeout_ms` 会结束整个进程树。
+- 默认 `stop_policy` 为 `cleanup`，Stop/SessionEnd 会清理普通资源；`keep` 资源不受 timeout_ms 和 Stop/SessionEnd 影响，必须设置 `name`，并在不需要时显式调用 `operation: "stop"`。
+- 优先使用 `program` 与 `args`；只有确实需要管道、重定向或复合命令时才使用 `shell: true` 与 `command`。
 
 ## 压缩后继续
 

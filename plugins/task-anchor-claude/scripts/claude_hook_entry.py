@@ -70,8 +70,8 @@ def handle_hook(data: dict[str, Any], data_root: Path | None) -> dict[str, Any] 
         return _handle_prompt_expansion(data, data_root)
     if event_name == POST_COMPACT:
         return task_state.restore_after_post_compact(data, data_root)
-#    if event_name == PRE_TOOL_USE:
-#        return task_state.guard_pre_tool_use(data, data_root)
+    if event_name == PRE_TOOL_USE:
+        return task_state.guard_pre_tool_use(data, data_root)
     if event_name in {STOP, SESSION_END}:
         task_state.cleanup_after_stop(data, data_root)
     return None

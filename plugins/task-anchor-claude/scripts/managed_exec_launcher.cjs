@@ -120,62 +120,23 @@ function selectRuntime(options = {}) {
   throw error;
 }
 
+/** 直接加载同目录 Node MCP 服务，避免 Node 再启动 Python MCP。 */
 function runServer() {
-  let selected;
+  const serverPath = path.join(__dirname, "managed_exec_mcp.cjs");
   try {
-    selected = selectRuntime();
+    const server = require(serverPath);
+    const result = server.main();
+    if (result && typeof result.then === "function") {
+      result.catch((error) => {
+        process.stderr.write(`Task Anchor managed_exec MCP failed: ${error.message}\n`);
+        process.exitCode = 1;
+      });
+    }
+    return result;
   } catch (error) {
-    process.stderr.write(error.message + "\n");
+    process.stderr.write(`Task Anchor failed to load managed_exec MCP: ${error.message}\n`);
     return 1;
   }
-
-  const serverPath = path.join(__dirname, "managed_exec_mcp.py");
-  const child = childProcess.spawn(
-    selected.candidate.command,
-    [...selected.candidate.prefixArgs, serverPath],
-    {
-      cwd: path.dirname(__dirname),
-      env: process.env,
-      stdio: "inherit",
-      windowsHide: true,
-    },
-  );
-
-  let childExited = false;
-  const forwardSignal = (signal) => {
-    if (!childExited) {
-      child.kill(signal);
-    }
-  };
-  for (const signal of ["SIGINT", "SIGTERM"]) {
-    process.on(signal, () => forwardSignal(signal));
-  }
-
-  child.once("error", (error) => {
-    process.stderr.write(
-      "Task Anchor failed to start managed_exec MCP with " +
-        selected.candidate.command +
-        ": " +
-        error.message +
-        "\n",
-    );
-    process.exitCode = 1;
-  });
-  child.once("exit", (code, signal) => {
-    childExited = true;
-    if (signal) {
-      process.stderr.write("Task Anchor managed_exec MCP exited from signal " + signal + ".\n");
-      process.exitCode = 1;
-      return;
-    }
-    process.exitCode = typeof code === "number" ? code : 1;
-  });
-  process.once("exit", () => {
-    if (!childExited) {
-      child.kill();
-    }
-  });
-  return null;
 }
 
 module.exports = {

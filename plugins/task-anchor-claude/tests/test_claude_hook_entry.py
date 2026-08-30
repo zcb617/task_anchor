@@ -198,18 +198,21 @@ class ClaudeHookEntryTests(unittest.TestCase):
         self.assertNotIn(instruction, context)
         self.assertNotIn(task_id, context)
 
-    def test_pre_tool_use_entry_is_disabled(self) -> None:
-        """验证已停用的 PreToolUse 入口不会产生 Hook 响应或启动命令。"""
-        self.assertIsNone(
-            HOOK.handle_hook(
-                self.payload(
-                    "PreToolUse",
-                    tool_name="Bash",
-                    tool_input={"command": "npm run dev"},
-                ),
-                self.data_root,
-            )
+    def test_pre_tool_use_entry_requires_managed_exec_for_process_commands(self) -> None:
+        """验证恢复的 PreToolUse 入口会拒绝绕过 managed_exec 的进程命令。"""
+        result = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="Bash",
+                tool_input={"command": "npm run dev"},
+            ),
+            self.data_root,
         )
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result["hookSpecificOutput"]["permissionDecision"], "deny"
+        )
+        self.assertIn("managed_exec", result["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_session_end_cleanup_is_idempotent(self) -> None:
         self.assertIsNone(self.expand("task-anchor", "background task"))
@@ -251,9 +254,10 @@ class ClaudePluginContractTests(unittest.TestCase):
         config = json.loads((PLUGIN_ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
         self.assertEqual(
             set(config["hooks"]),
-            {"UserPromptExpansion", "PostCompact", "Stop", "SessionEnd"},
+            {"UserPromptExpansion", "PostCompact", "PreToolUse", "Stop", "SessionEnd"},
         )
         self.assertEqual(config["hooks"]["PostCompact"][0]["matcher"], "auto|manual")
+        self.assertEqual(config["hooks"]["PreToolUse"][0]["matcher"], ".*")
         for name in (
             "task-anchor",
             "task-anchor-end",
@@ -263,10 +267,13 @@ class ClaudePluginContractTests(unittest.TestCase):
             content = (PLUGIN_ROOT / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn("disable-model-invocation: true", content)
 
-    def test_mcp_registration_is_disabled(self) -> None:
-        """验证 Claude Code 插件不再注册 Task Anchor MCP 服务。"""
+    def test_mcp_registration_uses_node_launcher(self) -> None:
+        """验证 Claude Code 插件注册 Node managed_exec 启动器。"""
         mcp_config = json.loads((PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8"))
-        self.assertEqual(mcp_config["mcpServers"], {})
+        server = mcp_config["mcpServers"]["task-anchor"]
+        self.assertEqual(server["command"], "node")
+        self.assertEqual(server["args"], ["${CLAUDE_PLUGIN_ROOT}/scripts/managed_exec_launcher.cjs"])
+        self.assertEqual(server["env"]["TASK_ANCHOR_DEFAULT_CWD"], "${CLAUDE_PROJECT_DIR}")
 
 
 if __name__ == "__main__":

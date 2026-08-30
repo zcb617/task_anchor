@@ -1,10 +1,12 @@
 "use strict";
 
 const assert = require("n" + "ode:assert/strict");
+const fs = require("n" + "ode:fs");
 const path = require("n" + "ode:path");
 const test = require("n" + "ode:test");
 
-const launcher = require(path.join(__dirname, "..", "scripts", "managed_exec_launcher.cjs"));
+const launcherPath = path.join(__dirname, "..", "scripts", "managed_exec_launcher.cjs");
+const launcher = require(launcherPath);
 
 function successfulProbe(expectedCommand, expectedArgs, version = "Py" + "thon 3.12.1") {
   return (command, args) => {
@@ -88,4 +90,10 @@ test("selector rejects versions older than 3.10 with actionable detail", () => {
       return true;
     },
   );
+});
+
+test("launcher source directly loads the Node MCP server", () => {
+  const source = fs.readFileSync(launcherPath, "utf8");
+  assert.match(source, /managed_exec_mcp\.cjs/);
+  assert.doesNotMatch(source, /managed_exec_mcp\\.py/);
 });

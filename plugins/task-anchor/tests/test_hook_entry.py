@@ -187,14 +187,17 @@ class HookEntryTests(unittest.TestCase):
             HOOK.TASK_STATUS_ACTIVE,
         )
 
-    def test_pre_tool_use_entry_is_disabled(self) -> None:
-        """验证已停用的 PreToolUse 入口不会产生 Hook 响应或启动命令。"""
-        self.assertIsNone(
-            HOOK.handle_hook(
-                self.pre_tool_use("exec", {"cmd": "npm run dev"}),
-                self.data_root,
-            )
+    def test_pre_tool_use_entry_requires_managed_exec_for_process_commands(self) -> None:
+        """验证恢复的 PreToolUse 入口会拒绝绕过 managed_exec 的进程命令。"""
+        result = HOOK.handle_hook(
+            self.pre_tool_use("exec", {"cmd": "npm run dev"}),
+            self.data_root,
         )
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result["hookSpecificOutput"]["permissionDecision"], "deny"
+        )
+        self.assertIn("managed_exec", result["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_activation_does_not_create_task_when_write_mode_cannot_be_saved(self) -> None:
         policy_directory = self.session_dir() / "mutation-policies"
@@ -674,7 +677,13 @@ class PluginContractTests(unittest.TestCase):
         mcp_config = json.loads(
             (PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(mcp_config["mcpServers"], {})
+        self.assertEqual(
+            mcp_config["mcpServers"]["task_anchor"]["command"], "node"
+        )
+        self.assertEqual(
+            mcp_config["mcpServers"]["task_anchor"]["args"],
+            ["scripts/managed_exec_launcher.cjs"],
+        )
 
     def test_task_and_resource_hook_events_are_registered(self) -> None:
         config = json.loads(
@@ -682,8 +691,9 @@ class PluginContractTests(unittest.TestCase):
         )
         self.assertEqual(
             set(config["hooks"]),
-            {"UserPromptSubmit", "PostCompact", "Stop"},
+            {"UserPromptSubmit", "PostCompact", "PreToolUse", "Stop"},
         )
+        self.assertEqual(config["hooks"]["PreToolUse"][0]["matcher"], ".*")
         self.assertNotIn("matcher", config["hooks"]["PostCompact"][0])
 
     def test_all_plugin_skills_are_registered(self) -> None:

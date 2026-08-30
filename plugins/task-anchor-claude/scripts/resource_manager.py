@@ -32,6 +32,10 @@ _LIVE_PROCESSES: dict[int, subprocess.Popen[Any]] = {}
 PLATFORM_WINDOWS = "windows"
 PLATFORM_MACOS = "macos"
 PLATFORM_LINUX = "linux"
+# 跨 Node/Python 账本目录锁的最大等待时间。
+LOCK_TIMEOUT_SECONDS = 10.0
+# 跨 Node/Python 账本目录锁的竞争重试间隔。
+LOCK_RETRY_SECONDS = 0.025
 
 
 def current_platform() -> str:
@@ -109,45 +113,35 @@ def context_path(cwd: str) -> Path:
     return workspace_runtime_directory(cwd) / "active-context.json"
 
 
-def _ensure_lock_byte(handle: Any) -> None:
-    handle.seek(0)
-    if handle.read(1) == b"":
-        handle.seek(0)
-        handle.write(b"\0")
-        handle.flush()
-    handle.seek(0)
-
-
 @contextmanager
 def file_lock(lock_path: Path) -> Iterator[None]:
-    """跨进程保护资源清单，避免 Hook 与 MCP 同时覆盖写入。"""
+    """使用 .lock.d 原子目录创建 Node/Python 共享的账本互斥锁。"""
 
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = lock_path.open("a+b")
+    lock_directory = lock_path
+    lock_directory.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+    acquired = False
+    while not acquired:
+        try:
+            lock_directory.mkdir()
+            acquired = True
+        except FileExistsError as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ResourceError(f"资源锁等待超时：{lock_directory}") from exc
+            time.sleep(min(LOCK_RETRY_SECONDS, remaining))
+        except OSError as exc:
+            raise ResourceError(f"无法创建资源锁：{lock_directory}") from exc
+
     try:
-        _ensure_lock_byte(handle)
-        if current_platform() == PLATFORM_WINDOWS:
-            import msvcrt
-
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         yield
     finally:
         try:
-            if current_platform() == PLATFORM_WINDOWS:
-                import msvcrt
-
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            handle.close()
+            lock_directory.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise ResourceError(f"无法释放资源锁：{lock_directory}") from exc
 
 
 def atomic_write(path: Path, content: bytes) -> None:
@@ -233,7 +227,7 @@ def set_active_context(cwd: str, session_id: str, task_id: str) -> None:
     if session_key is None:
         raise ResourceError("无法记录没有 session_id 的任务上下文。")
     path = context_path(normalized_cwd)
-    with file_lock(path.with_suffix(".lock")):
+    with file_lock(path.with_suffix(".lock.d")):
         stored = _read_json(path, {})
         contexts: dict[str, Any] = {}
         if isinstance(stored, dict) and isinstance(stored.get("contexts"), dict):
@@ -499,7 +493,7 @@ def start_process(
         "status": "running",
     }
     path = ledger_path(normalized_cwd)
-    with file_lock(path.with_suffix(".lock")):
+    with file_lock(path.with_suffix(".lock.d")):
         records = _load_records(normalized_cwd)
         records.append(record)
         _save_records(normalized_cwd, records)
@@ -533,7 +527,7 @@ def start_process(
             "output": _read_log(log_path),
         }
 
-    with file_lock(path.with_suffix(".lock")):
+    with file_lock(path.with_suffix(".lock.d")):
         records = [item for item in _load_records(normalized_cwd) if item.get("run_id") != run_id]
         _save_records(normalized_cwd, records)
     _LIVE_PROCESSES.pop(process.pid, None)
@@ -569,7 +563,7 @@ def stop_process(
     owner_key, _, _ = resolve_owner(normalized_cwd, session_id, task_id)
     workspace = workspace_key(normalized_cwd)
     path = ledger_path(normalized_cwd)
-    with file_lock(path.with_suffix(".lock")):
+    with file_lock(path.with_suffix(".lock.d")):
         records = _load_records(normalized_cwd)
         selected: list[dict[str, Any]] = []
         remaining: list[dict[str, Any]] = []
@@ -643,7 +637,7 @@ def list_processes(
     normalized_cwd = normalize_path(cwd)
     owner_key, _, _ = resolve_owner(normalized_cwd, session_id, task_id)
     workspace = workspace_key(normalized_cwd)
-    with file_lock(ledger_path(normalized_cwd).with_suffix(".lock")):
+    with file_lock(ledger_path(normalized_cwd).with_suffix(".lock.d")):
         records = _load_records(normalized_cwd)
     return [
         item

@@ -1,3 +1,13 @@
 {
-  "mcpServers": {}
+  "mcpServers": {
+    "task-anchor": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/scripts/managed_exec_launcher.cjs"
+      ],
+      "env": {
+        "TASK_ANCHOR_DEFAULT_CWD": "${CLAUDE_PROJECT_DIR}"
+      }
+    }
+  }
 }

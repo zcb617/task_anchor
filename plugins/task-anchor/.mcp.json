@@ -1,3 +1,9 @@
 {
-  "mcpServers": {}
+  "mcpServers": {
+    "task_anchor": {
+      "command": "node",
+      "args": ["scripts/managed_exec_launcher.cjs"],
+      "cwd": "."
+    }
+  }
 }
