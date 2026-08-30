@@ -18,8 +18,7 @@ disable-model-invocation: true
 
 ## 受管命令执行
 
-- 所有会启动本地进程的命令必须调用 `mcp__plugin_task-anchor_task-anchor__managed_exec`，不得直接调用 Shell、exec、PowerShell、Bash 或 local_shell。
-- Node managed_exec 负责启动、登记、超时和停止本地进程；普通资源到达 `timeout_ms` 会结束整个进程树。
+- 查询命令使用宿主原生工具。查询/只读命令（明确包括 `pwd`、`ls`、`git status`、`rg` 和读取文件）使用 Codex/Claude Code 宿主原生工具，不调用 `mcp__plugin_task-anchor_task-anchor__managed_exec`；Windows 下不要把 Unix 命令名作为 managed_exec 的 program，除非明确使用宿主支持的 shell 命令。\n- node/bun/npm/python/java 等进程命令使用 managed_exec。只有会启动本地进程、启动开发服务、测试服务或持续运行程序的命令（包括 Codex 现有关键词范围）才调用 `mcp__plugin_task-anchor_task-anchor__managed_exec`。\n- Node managed_exec 负责启动、登记、超时和停止本地进程；普通资源到达 `timeout_ms` 会结束整个进程树。
 - 默认 `stop_policy` 为 `cleanup`，Stop/SessionEnd 会清理普通资源；`keep` 资源不受 timeout_ms 和 Stop/SessionEnd 影响，必须设置 `name`，并在不需要时显式调用 `operation: "stop"`。
 - 优先使用 `program` 与 `args`；只有确实需要管道、重定向或复合命令时才使用 `shell: true` 与 `command`。
 
