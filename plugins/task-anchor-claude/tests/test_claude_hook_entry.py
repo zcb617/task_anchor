@@ -198,188 +198,18 @@ class ClaudeHookEntryTests(unittest.TestCase):
         self.assertNotIn(instruction, context)
         self.assertNotIn(task_id, context)
 
-    def test_readonly_blocks_claude_mutation_tools(self) -> None:
-        self.assertIsNone(self.expand("task-anchor", "read-only task"))
-        self.assertIsNone(self.expand("task-anchor:task-anchor-readonly"))
-        result = HOOK.handle_hook(
-            self.payload(
-                "PreToolUse",
-                tool_name="Write",
-                tool_input={"file_path": str(self.workspace / "new.txt"), "content": "x"},
-            ),
-            self.data_root,
-        )
-        assert result is not None
-        output = result["hookSpecificOutput"]
-        self.assertEqual(output["permissionDecision"], "deny")
-        self.assertIn("task-anchor-write", output["permissionDecisionReason"])
-
-    def test_direct_command_tools_require_managed_exec_without_text_heuristics(self) -> None:
-        command_result = HOOK.handle_hook(
-            self.payload(
-                "PreToolUse",
-                tool_name="Bash",
-                tool_input={"command": "sh -c 'sleep 600'"},
-            ),
-            self.data_root,
-        )
-        assert command_result is not None
-        command_output = command_result["hookSpecificOutput"]
-        self.assertEqual(command_output["permissionDecision"], "deny")
-        self.assertIn("managed_exec", command_output["permissionDecisionReason"])
-
-        self.assertIsNone(
-            HOOK.handle_hook(
-                self.payload(
-                    "PreToolUse",
-                    tool_name="Read",
-                    tool_input={"program": "node_modules"},
-                ),
-                self.data_root,
-            )
-        )
-
-    def test_excluded_project_skips_pre_tool_use_guards(self) -> None:
-        """验证排除项目跳过 Bash、Write 和 managed_exec 的全部前置管控。"""
-        self.config_path.write_text(
-            json.dumps({"excludeProjects": [str(self.workspace)]}), encoding="utf-8"
-        )
-
+    def test_pre_tool_use_entry_is_disabled(self) -> None:
+        """验证已停用的 PreToolUse 入口不会产生 Hook 响应或启动命令。"""
         self.assertIsNone(
             HOOK.handle_hook(
                 self.payload(
                     "PreToolUse",
                     tool_name="Bash",
-                    tool_input={"command": "sh -c 'sleep 600'"},
+                    tool_input={"command": "npm run dev"},
                 ),
                 self.data_root,
             )
         )
-        self.assertIsNone(
-            HOOK.handle_hook(
-                self.payload(
-                    "PreToolUse",
-                    tool_name="Write",
-                    tool_input={
-                        "file_path": str(self.workspace / "new.txt"),
-                        "content": "x",
-                    },
-                ),
-                self.data_root,
-            )
-        )
-        self.assertIsNone(
-            HOOK.handle_hook(
-                self.payload(
-                    "PreToolUse",
-                    tool_name="mcp__plugin_task-anchor_task-anchor__managed_exec",
-                    tool_input={
-                        "program": "python",
-                        "args": ["-V"],
-                        "session_id": "attacker-session",
-                        "cwd": "C:/attacker",
-                    },
-                ),
-                self.data_root,
-            )
-        )
-
-    def test_invalid_exclusion_config_keeps_bash_guard(self) -> None:
-        """验证排除配置缺失、非法或结构错误时 Bash 仍执行原有拒绝管控。"""
-        invalid_configs: list[tuple[str, str | None]] = [
-            ("missing", None),
-            ("invalid_json", "{"),
-            ("root_not_dict", "[]"),
-            ("missing_exclude_projects", "{}"),
-            ("exclude_projects_not_list", json.dumps({"excludeProjects": {}})),
-        ]
-
-        for case_name, content in invalid_configs:
-            with self.subTest(case_name=case_name):
-                if self.config_path.exists():
-                    self.config_path.unlink()
-                if content is not None:
-                    self.config_path.write_text(content, encoding="utf-8")
-                denied = HOOK.handle_hook(
-                    self.payload(
-                        "PreToolUse",
-                        tool_name="Bash",
-                        tool_input={"command": "sh -c 's" + "leep 600'"},
-                    ),
-                    self.data_root,
-                )
-                self.assertIsNotNone(denied)
-                self.assertEqual(
-                    denied["hookSpecificOutput"]["permissionDecision"],
-                    "deny",
-                )
-
-        self.config_path.write_text(
-            json.dumps({"excludeProjects": [str(self.workspace)]}), encoding="utf-8"
-        )
-        self.assertIsNone(
-            HOOK.handle_hook(
-                self.payload(
-                    "PreToolUse",
-                    tool_name="Bash",
-                    tool_input={"command": "sh -c 's" + "leep 600'"},
-                ),
-                self.data_root,
-            )
-        )
-
-    def test_readonly_blocks_direct_command_tools_with_write_remediation(self) -> None:
-        self.assertIsNone(self.expand("task-anchor", "read-only command policy"))
-        self.assertIsNone(self.expand("task-anchor:task-anchor-readonly"))
-        result = HOOK.handle_hook(
-            self.payload(
-                "PreToolUse",
-                tool_name="Bash",
-                tool_input={"command": "sh -c 'printf safe'"},
-            ),
-            self.data_root,
-        )
-        assert result is not None
-        output = result["hookSpecificOutput"]
-        self.assertEqual(output["permissionDecision"], "deny")
-        self.assertIn("task-anchor-write", output["permissionDecisionReason"])
-
-    def test_managed_exec_binding_overwrites_untrusted_context(self) -> None:
-        result = HOOK.handle_hook(
-            self.payload(
-                "PreToolUse",
-                tool_name="mcp__plugin_task-anchor_task-anchor__managed_exec",
-                tool_input={
-                    "program": "python",
-                    "args": ["-V"],
-                    "session_id": "attacker-session",
-                    "cwd": "C:/attacker",
-                    "env": {"SECRET": "do-not-copy"},
-                },
-            ),
-            self.data_root,
-        )
-        assert result is not None
-        output = result["hookSpecificOutput"]
-        self.assertEqual(output["permissionDecision"], "allow")
-        updated = output["updatedInput"]
-        self.assertEqual(updated["session_id"], self.session_id)
-        self.assertEqual(updated["cwd"], str(self.workspace))
-        self.assertEqual(updated["env"], {"SECRET": "do-not-copy"})
-
-    def test_other_mcp_managed_exec_suffix_is_not_trusted(self) -> None:
-        result = HOOK.handle_hook(
-            self.payload(
-                "PreToolUse",
-                tool_name="mcp__other__managed_exec",
-                tool_input={"program": "python", "args": ["-V"]},
-            ),
-            self.data_root,
-        )
-        assert result is not None
-        output = result["hookSpecificOutput"]
-        self.assertEqual(output["permissionDecision"], "deny")
-        self.assertNotIn("updatedInput", output)
 
     def test_session_end_cleanup_is_idempotent(self) -> None:
         self.assertIsNone(self.expand("task-anchor", "background task"))
@@ -421,7 +251,7 @@ class ClaudePluginContractTests(unittest.TestCase):
         config = json.loads((PLUGIN_ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
         self.assertEqual(
             set(config["hooks"]),
-            {"UserPromptExpansion", "PostCompact", "PreToolUse", "Stop", "SessionEnd"},
+            {"UserPromptExpansion", "PostCompact", "Stop", "SessionEnd"},
         )
         self.assertEqual(config["hooks"]["PostCompact"][0]["matcher"], "auto|manual")
         for name in (
@@ -433,17 +263,10 @@ class ClaudePluginContractTests(unittest.TestCase):
             content = (PLUGIN_ROOT / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn("disable-model-invocation: true", content)
 
-    def test_managed_exec_uses_standard_permission_flow(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "task_anchor_claude_mcp", SCRIPTS_ROOT / "managed_exec_mcp.py"
-        )
-        assert spec is not None and spec.loader is not None
-        mcp = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mcp)
-        response = mcp.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
-        assert response is not None
-        tool = response["result"]["tools"][0]
-        self.assertNotIn("_meta", tool)
+    def test_mcp_registration_is_disabled(self) -> None:
+        """验证 Claude Code 插件不再注册 Task Anchor MCP 服务。"""
+        mcp_config = json.loads((PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8"))
+        self.assertEqual(mcp_config["mcpServers"], {})
 
 
 if __name__ == "__main__":

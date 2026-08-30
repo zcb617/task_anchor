@@ -22,15 +22,9 @@ description: "仅在用户显式调用 $task-anchor 时使用。用于解除当�
 - 不要把最终回复、普通交付、原生 TOLIST 清空、工具调用完成或 `Stop` 事件当作持久化的任务完成信号。
 - 当前 Codex 插件接口没有可订阅的可靠语义完成事件。因此正常交付后，当前任务仍是 `status = 1`；只有下一次用户显式调用 `$task-anchor` 才会以“被新任务取代”的原因关闭旧记录。
 
-## 受管命令执行
+## 原生命令执行边界
 
-- 所有会启动本地进程的命令必须调用 `mcp__task_anchor__managed_exec`，不得直接调用 Shell、`exec`、PowerShell、Bash 或 `local_shell`。
-- 普通一次性命令也经过 `managed_exec`；它会登记进程并在正常退出后移除记录。
-- `managed_exec` 的 `stop_policy` 默认是 `cleanup`，表示 Stop 时关闭本次任务登记的进程及其子进程。
-- 资源按当前项目工作区和会话隔离；同一会话内登记的资源属于同一清理范围，`task_id` 只作记录，不是更小的清理边界。不要用进程名推断资源归属。
-- 只有用户明确要求继续保留的服务才传 `stop_policy: "keep"`，例如需要持续访问的测试端口。
-- `keep` 资源必须设置 `name`，并在不再需要时使用 `managed_exec` 的 `operation: "stop"` 显式关闭。
-- 优先使用 `program` + `args`；只有确实需要管道、重定向或复合命令时才使用 `shell: true` 和 `command`。
+本插件不接管本地命令执行，所有命令按 Codex 原生工具方式执行；当前版本不通过 Task Anchor 提供命令超时或自动停止。
 
 ## 压缩后继续
 

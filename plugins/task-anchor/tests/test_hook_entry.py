@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import importlib.util
 import json
 import os
@@ -11,7 +10,6 @@ import shutil
 import unittest
 import uuid
 from pathlib import Path
-from unittest.mock import patch
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -188,9 +186,12 @@ class HookEntryTests(unittest.TestCase):
             self.task_metadata(task_id)["status"],
             HOOK.TASK_STATUS_ACTIVE,
         )
+
+    def test_pre_tool_use_entry_is_disabled(self) -> None:
+        """验证已停用的 PreToolUse 入口不会产生 Hook 响应或启动命令。"""
         self.assertIsNone(
             HOOK.handle_hook(
-                self.pre_tool_use("apply_patch", {"command": "*** Begin Patch"}),
+                self.pre_tool_use("exec", {"cmd": "npm run dev"}),
                 self.data_root,
             )
         )
@@ -483,80 +484,6 @@ class HookEntryTests(unittest.TestCase):
             )
         )
 
-    def test_read_only_policy_blocks_mutation_capable_tools(self) -> None:
-        HOOK.handle_hook(self.user_prompt("$task-anchor-readonly"), self.data_root)
-
-        for tool_name, tool_input in [
-            ("apply_patch", {"command": "*** Begin Patch"}),
-            ("Bash", {"command": "git status"}),
-            ("exec_command", {"cmd": "rg pattern ."}),
-            ("mcp__task_anchor__managed_exec", {"program": "git", "args": ["status"]}),
-            ("mcp__filesystem__write_file", {"path": "a.txt", "content": "x"}),
-            ("mcp__filesystem__rename_file", {"source": "a", "destination": "b"}),
-        ]:
-            denied = HOOK.handle_hook(
-                self.pre_tool_use(tool_name, tool_input),
-                self.data_root,
-            )
-            self.assertEqual(
-                denied["hookSpecificOutput"]["permissionDecision"],
-                "deny",
-                tool_name,
-            )
-            self.assertIn(
-                "$task-anchor-write",
-                denied["hookSpecificOutput"]["permissionDecisionReason"],
-            )
-
-        self.assertIsNone(
-            HOOK.handle_hook(
-                self.pre_tool_use("mcp__fastctx__grep", {"path": "README.md"}),
-                self.data_root,
-            )
-        )
-
-    def test_write_skill_removes_only_the_read_only_gate(self) -> None:
-        HOOK.handle_hook(self.user_prompt("$task-anchor-readonly"), self.data_root)
-        HOOK.handle_hook(self.user_prompt("$task-anchor-write"), self.data_root)
-
-        self.assertIsNone(
-            HOOK.handle_hook(
-                self.pre_tool_use("apply_patch", {"command": "*** Begin Patch"}),
-                self.data_root,
-            )
-        )
-        managed = HOOK.handle_hook(
-            self.pre_tool_use(
-                "mcp__task_anchor__managed_exec",
-                {"program": "git", "args": ["status"]},
-            ),
-            self.data_root,
-        )
-        self.assertEqual(
-            managed["hookSpecificOutput"]["updatedInput"]["session_id"],
-            self.session_id,
-        )
-
-    def test_invalid_or_missing_policy_context_fails_closed_for_mutation(self) -> None:
-        missing_cwd = self.pre_tool_use("apply_patch", {"command": "patch"})
-        del missing_cwd["cwd"]
-        denied = HOOK.handle_hook(missing_cwd, self.data_root)
-        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
-
-        workspace_sha256 = HOOK.read_workspace_sha256(self.user_prompt("普通消息"))
-        policy_path = HOOK.mutation_policy_path(
-            self.data_root,
-            self.session_id,
-            workspace_sha256,
-        )
-        policy_path.parent.mkdir(parents=True)
-        policy_path.write_text("{}", encoding="utf-8")
-        corrupted = HOOK.handle_hook(
-            self.pre_tool_use("apply_patch", {"command": "patch"}),
-            self.data_root,
-        )
-        self.assertEqual(corrupted["hookSpecificOutput"]["permissionDecision"], "deny")
-
     def test_conflicting_policy_skills_do_not_change_state(self) -> None:
         result = HOOK.handle_hook(
             self.user_prompt("$task-anchor-readonly $task-anchor-write"),
@@ -566,214 +493,6 @@ class HookEntryTests(unittest.TestCase):
         self.assertFalse(
             HOOK.read_mutation_policy(self.user_prompt("普通消息"), self.data_root)
         )
-
-    def test_pre_tool_use_requires_managed_exec_for_process_commands(self) -> None:
-        for command in ["npm run dev", r"C:\Java\bin\java.exe -jar app.jar"]:
-            denied = HOOK.handle_hook(
-                {
-                    "hook_event_name": "PreToolUse",
-                    "session_id": self.session_id,
-                    "cwd": str(self.workspace),
-                    "tool_name": "exec",
-                    "tool_input": {"cmd": command},
-                },
-                self.data_root,
-            )
-            self.assertEqual(
-                denied["hookSpecificOutput"]["permissionDecision"], "deny"
-            )
-            self.assertTrue(
-                denied["hookSpecificOutput"]["permissionDecisionReason"].isascii()
-            )
-            self.assertNotIn("continue", denied)
-
-        for command in ["rg -n pattern .", "Get-Content -Path README.md"]:
-            self.assertIsNone(
-                HOOK.handle_hook(
-                    {
-                        "hook_event_name": "PreToolUse",
-                        "session_id": self.session_id,
-                        "cwd": str(self.workspace),
-                        "tool_name": "exec",
-                        "tool_input": {"cmd": command},
-                    },
-                    self.data_root,
-                )
-            )
-
-        self.assertIsNotNone(
-            HOOK.handle_hook(
-                {
-                    "hook_event_name": "PreToolUse",
-                    "session_id": self.session_id,
-                    "cwd": str(self.workspace),
-                    "tool_name": "mcp__task_anchor__managed_exec",
-                    "tool_input": {"program": "npm", "args": ["run", "dev"]},
-                },
-                self.data_root,
-            )
-        )
-        managed = HOOK.handle_hook(
-            self.pre_tool_use(
-                "mcp__task_anchor__managed_exec",
-                {"program": "n" + "p" + "m", "args": ["run", "dev"]},
-            ),
-            self.data_root,
-        )
-        self.assertEqual(
-            managed["hookSpecificOutput"]["permissionDecision"],
-            "allow",
-        )
-
-    def test_pre_tool_use_exclusion_config_failures_keep_bash_guard(self) -> None:
-        """验证排除配置缺失、非法或结构错误时 Bash 仍执行原有拒绝管控。"""
-        home = self.data_root / "home"
-        config_path = home / ".task_anchor" / "config.json"
-        config_path.parent.mkdir(parents=True)
-        invalid_configs: list[tuple[str, str | None]] = [
-            ("missing", None),
-            ("invalid_json", "{"),
-            ("root_not_dict", "[]"),
-            ("missing_exclude_projects", "{}"),
-            ("exclude_projects_not_list", json.dumps({"excludeProjects": {}})),
-        ]
-
-        with patch.object(HOOK.Path, "home", return_value=home):
-            for case_name, content in invalid_configs:
-                with self.subTest(case_name=case_name):
-                    if config_path.exists():
-                        config_path.unlink()
-                    if content is not None:
-                        config_path.write_text(content, encoding="utf-8")
-                    denied = HOOK.handle_hook(
-                        self.pre_tool_use("Bash", {"command": "n" + "p" + "m run dev"}),
-                        self.data_root,
-                    )
-                    self.assertIsNotNone(denied)
-                    self.assertEqual(
-                        denied["hookSpecificOutput"]["permissionDecision"],
-                        "deny",
-                    )
-
-            config_path.write_text(
-                json.dumps({"excludeProjects": [str(self.workspace)]}),
-                encoding="utf-8",
-            )
-            self.assertIsNone(
-                HOOK.handle_hook(
-                    self.pre_tool_use("Bash", {"command": "n" + "p" + "m run dev"}),
-                    self.data_root,
-                )
-            )
-
-    def test_pre_tool_use_allows_only_fastctx_read_only_tools(self) -> None:
-        for tool_name in [
-            "mcp__fastctx__inspect_local_file",
-            "MCP__FASTCTX__GREP",
-            "mcp__fastctx__glob",
-        ]:
-            self.assertIsNone(
-                HOOK.handle_hook(
-                    {
-                        "hook_event_name": "PreToolUse",
-                        "session_id": self.session_id,
-                        "cwd": str(self.workspace),
-                        "tool_name": tool_name,
-                        "tool_input": {"path": "README.md"},
-                    },
-                    self.data_root,
-                )
-            )
-
-        for tool_name in [
-            "mcp__fastctx__replace",
-            "mcp__fastctx__run",
-            "mcp__fastctx__run_background",
-            "mcp__fastctx__job_kill",
-            "mcp__fastctx__future_tool",
-        ]:
-            denied = HOOK.handle_hook(
-                {
-                    "hook_event_name": "PreToolUse",
-                    "session_id": self.session_id,
-                    "cwd": str(self.workspace),
-                    "tool_name": tool_name,
-                    "tool_input": {"command": "echo hello"},
-                },
-                self.data_root,
-            )
-            self.assertEqual(
-                denied["hookSpecificOutput"]["permissionDecision"], "deny"
-            )
-            self.assertTrue(
-                denied["hookSpecificOutput"]["permissionDecisionReason"].isascii()
-            )
-
-    def test_managed_exec_receives_current_session_from_pre_tool_use(self) -> None:
-        program = "n" + "p" + "m"
-        bound = HOOK.handle_hook(
-            {
-                "hook_event_name": "PreToolUse",
-                "session_id": self.session_id,
-                "cwd": str(self.workspace),
-                "tool_name": "mcp__task_anchor__managed_exec",
-                "tool_input": {"program": program, "args": ["run", "dev"]},
-            },
-            self.data_root,
-        )
-        self.assertEqual(
-            bound["hookSpecificOutput"]["updatedInput"]["session_id"],
-            self.session_id,
-        )
-        self.assertEqual(bound["hookSpecificOutput"]["updatedInput"]["program"], program)
-        self.assertEqual(bound["hookSpecificOutput"]["updatedInput"]["env"], dict(os.environ))
-
-    def test_managed_exec_preserves_explicit_session(self) -> None:
-        program = "n" + "p" + "m"
-        self.assertIsNone(
-            HOOK.handle_hook(
-                {
-                    "hook_event_name": "PreToolUse",
-                    "session_id": self.session_id,
-                    "cwd": str(self.workspace),
-                    "tool_name": "mcp__task_anchor__managed_exec",
-                    "tool_input": {"program": program, "session_id": "explicit-session"},
-                },
-                self.data_root,
-            )
-        )
-
-    def test_pre_tool_use_response_is_safe_for_windows_legacy_encoding(self) -> None:
-        command = "".join(["n", "p", "m"]) + " run dev"
-        payload = {
-            "hook_event_name": "PreToolUse",
-            "session_id": self.session_id,
-            "cwd": str(self.workspace),
-            "tool_name": "exec",
-            "tool_input": {"cmd": command},
-        }
-        previous_stdin = sys.stdin
-        previous_stdout = sys.stdout
-        previous_plugin_data = os.environ.get("PLUGIN_DATA")
-        output = io.BytesIO()
-        try:
-            os.environ["PLUGIN_DATA"] = str(self.data_root)
-            sys.stdin = io.TextIOWrapper(
-                io.BytesIO(json.dumps(payload, ensure_ascii=False).encode("utf-8")),
-                encoding="utf-8",
-            )
-            sys.stdout = io.TextIOWrapper(output, encoding="cp1252")
-            self.assertEqual(HOOK.main(), 0)
-            sys.stdout.flush()
-            serialized = output.getvalue().decode("cp1252")
-            self.assertIn('"permissionDecision": "deny"', serialized)
-        finally:
-            sys.stdin = previous_stdin
-            sys.stdout = previous_stdout
-            if previous_plugin_data is None:
-                os.environ.pop("PLUGIN_DATA", None)
-            else:
-                os.environ["PLUGIN_DATA"] = previous_plugin_data
 
     def test_stop_cleans_default_resources_but_keeps_explicit_keep_resource(self) -> None:
         HOOK.resource_manager.set_active_context(
@@ -955,7 +674,7 @@ class PluginContractTests(unittest.TestCase):
         mcp_config = json.loads(
             (PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8")
         )
-        self.assertIn("task_anchor", mcp_config["mcpServers"])
+        self.assertEqual(mcp_config["mcpServers"], {})
 
     def test_task_and_resource_hook_events_are_registered(self) -> None:
         config = json.loads(
@@ -963,10 +682,9 @@ class PluginContractTests(unittest.TestCase):
         )
         self.assertEqual(
             set(config["hooks"]),
-            {"UserPromptSubmit", "PostCompact", "PreToolUse", "Stop"},
+            {"UserPromptSubmit", "PostCompact", "Stop"},
         )
         self.assertNotIn("matcher", config["hooks"]["PostCompact"][0])
-        self.assertEqual(config["hooks"]["PreToolUse"][0]["matcher"], ".*")
 
     def test_all_plugin_skills_are_registered(self) -> None:
         skill = (PLUGIN_ROOT / "skills" / "task-anchor" / "SKILL.md").read_text(
