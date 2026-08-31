@@ -28,6 +28,8 @@ const LOCK_RETRY_MS = 25;
 const EXPLICIT_RUN_ID_REQUIRES_OWNER = true;
 // 当前 Node 进程内登记的子进程，用于等待关闭和复用进程句柄。
 const LIVE_PROCESSES = new Map();
+// Windows 需要经由命令解释器启动的批处理包装程序扩展名。
+const WINDOWS_BATCH_EXTENSIONS = new Set([".bat", ".cmd"]);
 
 /** 受管资源操作失败。 */
 class ResourceError extends Error {
@@ -379,10 +381,11 @@ function processAlive(pid) {
   }
 }
 
-/** 为子进程创建独立进程组，保证停止操作能够结束整棵进程树。 */
+/** 返回受管子进程启动选项：Windows 隐藏控制台，POSIX 创建独立进程组。 */
 function processLaunchOptions(platformName) {
   if (platformName === PLATFORM_WINDOWS) {
-    return { detached: true, windowsHide: true };
+    // Windows 的 detached 会创建独立控制台；停止仍由 taskkill /T /F 负责整棵进程树。
+    return { detached: false, windowsHide: true };
   }
   if (platformName === PLATFORM_MACOS || platformName === PLATFORM_LINUX) {
     return { detached: true };
@@ -477,6 +480,68 @@ function commandText(program, args, command) {
     throw new ResourceError("run 操作必须提供 program 或 command。");
   }
   return [program, ...args].join(" ");
+}
+
+/** 按 Windows 不区分大小写的环境变量规则读取值。 */
+function windowsEnvironmentValue(environment, name) {
+  const expected = String(name).toUpperCase();
+  const matchedName = Object.keys(environment || {}).find((key) => key.toUpperCase() === expected);
+  return matchedName ? environment[matchedName] : undefined;
+}
+
+/** 判断指定路径是否为存在的 Windows 批处理包装程序。 */
+function existingWindowsBatchPath(candidate) {
+  if (!WINDOWS_BATCH_EXTENSIONS.has(path.extname(candidate).toLowerCase())) {
+    return null;
+  }
+  try {
+    return fs.statSync(candidate).isFile() ? candidate : null;
+  } catch (error) {
+    if (error && ["ENOENT", "ENOTDIR"].includes(error.code)) {
+      return null;
+    }
+    throw new ResourceError(`无法读取 Windows 命令包装程序：${candidate}`);
+  }
+}
+
+/** 在 Windows 的当前目录和 PATH 中解析 .bat/.cmd 命令包装程序。 */
+function resolveWindowsBatchProgram(program, cwd, environment = process.env, platform = process.platform) {
+  if (platform !== "win32" || typeof program !== "string" || !program.trim()) {
+    return null;
+  }
+  const normalizedProgram = program.trim();
+  const hasPath = path.isAbsolute(normalizedProgram) || /[\\/]/.test(normalizedProgram);
+  const programExtension = path.extname(normalizedProgram).toLowerCase();
+  const pathExtensions = String(windowsEnvironmentValue(environment, "PATHEXT") || ".BAT;.CMD")
+    .split(";")
+    .map((extension) => extension.trim().toLowerCase())
+    .filter((extension) => WINDOWS_BATCH_EXTENSIONS.has(extension));
+  const extensions = programExtension ? [""] : [...new Set(pathExtensions)];
+  if (programExtension && !WINDOWS_BATCH_EXTENSIONS.has(programExtension)) {
+    return null;
+  }
+  if (!extensions.length) {
+    return null;
+  }
+  const searchDirectories = hasPath
+    ? [path.dirname(path.resolve(cwd, normalizedProgram))]
+    : [
+        cwd,
+        ...String(windowsEnvironmentValue(environment, "PATH") || "")
+          .split(path.delimiter)
+          .map((entry) => entry.trim().replace(/^"(.*)"$/, "$1"))
+          .filter(Boolean),
+      ];
+  const basename = hasPath ? path.basename(normalizedProgram) : normalizedProgram;
+  for (const directory of searchDirectories) {
+    for (const extension of extensions) {
+      const batchPath = existingWindowsBatchPath(path.join(directory, `${basename}${extension}`));
+      if (batchPath) {
+        return batchPath;
+      }
+    }
+  }
+  return null;
 }
 
 /** 校验并复制 program 参数数组，避免异步执行期间被调用方修改。 */
@@ -630,8 +695,21 @@ async function startProcess({
     if (typeof program !== "string" || !program.trim()) {
       throw new ResourceError("shell=false 时必须提供 program。");
     }
-    spawnTarget = program;
-    spawnArgs = normalizedArgs;
+    const batchProgram = resolveWindowsBatchProgram(
+      program,
+      normalizedCwd,
+      env === undefined || env === null ? process.env : env,
+    );
+    if (batchProgram) {
+      const commandInterpreter =
+        windowsEnvironmentValue(env === undefined || env === null ? process.env : env, "ComSpec") || "cmd.exe";
+      spawnTarget = commandInterpreter;
+      // cmd.exe 将批处理程序和参数分别接收，避免路径引号被作为命令字符解释。
+      spawnArgs = ["/d", "/c", batchProgram, ...normalizedArgs];
+    } else {
+      spawnTarget = program;
+      spawnArgs = normalizedArgs;
+    }
   }
 
   const runId = crypto.randomUUID();
@@ -644,8 +722,7 @@ async function startProcess({
     const options = {
       cwd: normalizedCwd,
       shell: Boolean(shell),
-      windowsHide: true,
-      detached: true,
+      ...processLaunchOptions(platformName),
       // 通过 Node 管道分别接收 stdout/stderr，再合并写入受管日志。
       stdio: ["ignore", "pipe", "pipe"],
     };
@@ -952,6 +1029,7 @@ module.exports = {
   STOP_POLICY_CLEANUP,
   STOP_POLICY_KEEP,
   VALID_STOP_POLICIES,
+  WINDOWS_BATCH_EXTENSIONS,
   PLATFORM_WINDOWS,
   PLATFORM_MACOS,
   PLATFORM_LINUX,
@@ -985,6 +1063,9 @@ module.exports = {
   processGroupId,
   terminatePid,
   commandText,
+  windowsEnvironmentValue,
+  existingWindowsBatchPath,
+  resolveWindowsBatchProgram,
   validateArgs,
   readLog,
   startProcess,

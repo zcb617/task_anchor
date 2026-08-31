@@ -37,6 +37,17 @@ function fixture() {
   };
 }
 
+/** 为 Windows 批处理命令测试提供包含临时目录的 PATH。 */
+function windowsBatchEnvironment(directory) {
+  const environment = { ...process.env };
+  const pathName = Object.keys(environment).find((name) => name.toUpperCase() === "PATH") || "PATH";
+  const pathExtensionsName =
+    Object.keys(environment).find((name) => name.toUpperCase() === "PATHEXT") || "PATHEXT";
+  environment[pathName] = [directory, environment[pathName]].filter(Boolean).join(path.delimiter);
+  environment[pathExtensionsName] = ".EXE;.BAT;.CMD";
+  return environment;
+}
+
 /** 启动一个不会自行退出的 Node 子进程，供停止和超时场景复用。 */
 function longRunningProcess(cwd, sessionId, options = {}) {
   return manager.startProcess({
@@ -66,6 +77,48 @@ test("program and args preserve environment, cwd, and non-zero exit", async () =
   } finally {
     testFixture.restore();
   }
+});
+
+test("windows .cmd programs work by absolute path and PATH command name", { skip: process.platform !== "win32" }, async () => {
+  const testFixture = fixture();
+  try {
+    const batchDirectory = path.join(testFixture.root, "batch tools");
+    const batchPath = path.join(batchDirectory, "managed-batch.cmd");
+    fs.mkdirSync(batchDirectory);
+    fs.writeFileSync(batchPath, "@echo off\r\necho batch:%~1\r\n", "utf8");
+    const environment = windowsBatchEnvironment(batchDirectory);
+
+    const direct = await manager.startProcess({
+      cwd: testFixture.workspace,
+      program: batchPath,
+      args: ["direct"],
+      env: environment,
+      sessionId: testFixture.sessionId,
+    });
+    assert.equal(direct.exit_code, 0);
+    assert.equal(direct.output.trim(), "batch:direct");
+
+    const fromPath = await manager.startProcess({
+      cwd: testFixture.workspace,
+      program: "managed-batch",
+      args: ["path"],
+      env: environment,
+      sessionId: testFixture.sessionId,
+    });
+    assert.equal(fromPath.exit_code, 0);
+    assert.equal(fromPath.output.trim(), "batch:path");
+  } finally {
+    testFixture.restore();
+  }
+});
+
+test("Windows 启动隐藏子进程且不创建独立控制台，POSIX 保留独立进程组", () => {
+  assert.deepEqual(manager.processLaunchOptions(manager.PLATFORM_WINDOWS), {
+    detached: false,
+    windowsHide: true,
+  });
+  assert.deepEqual(manager.processLaunchOptions(manager.PLATFORM_MACOS), { detached: true });
+  assert.deepEqual(manager.processLaunchOptions(manager.PLATFORM_LINUX), { detached: true });
 });
 
 test("legacy lock file does not block the new lock directory", async () => {
