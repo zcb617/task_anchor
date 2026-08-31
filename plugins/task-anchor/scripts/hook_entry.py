@@ -1176,15 +1176,16 @@ def guard_pre_tool_use(
     if _is_fastctx_tool(tool_name):
         if _is_fastctx_read_only_tool(tool_name):
             return None
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": PRE_TOOL_USE,
-                "permissionDecision": "deny",
-                "permissionDecisionReason": (
-                    "FastCtx only permits inspect_local_file, grep, and glob."
-                ),
+        if tool_name.strip().lower() != "mcp__fastctx__replace":
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": PRE_TOOL_USE,
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        "FastCtx only permits inspect_local_file, grep, glob, and replace."
+                    ),
+                }
             }
-        }
     if _is_mutation_capable_tool(tool_name):
         if data_root is None:
             return _deny_read_only("Read-only policy context is unavailable.")

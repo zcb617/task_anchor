@@ -287,6 +287,132 @@ class ClaudeHookEntryTests(unittest.TestCase):
                 )
                 self.assertIsNone(result)
 
+    def test_fastctx_replace_is_allowed_without_read_only_policy(self) -> None:
+        """验证未启用只读策略时 FastCtx replace 工具允许执行。"""
+        result = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="mcp__fastctx__replace",
+                tool_input={},
+            ),
+            self.data_root,
+        )
+
+        self.assertIsNone(result)
+
+    def test_fastctx_replace_is_denied_by_read_only_policy(self) -> None:
+        """验证只读策略开启后 FastCtx replace 工具被 mutation policy 拦截。"""
+        self.assertIsNone(
+            HOOK.handle_hook(
+                self.payload(
+                    "UserPromptExpansion",
+                    command_name="task-anchor:task-anchor-readonly",
+                    command_args="$task-anchor-readonly",
+                ),
+                self.data_root,
+            )
+        )
+
+        result = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="mcp__fastctx__replace",
+                tool_input={},
+            ),
+            self.data_root,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn(
+            "blocks mutation-capable tools",
+            result["hookSpecificOutput"]["permissionDecisionReason"],
+        )
+
+    def test_fastctx_replace_is_allowed_after_write_policy(self) -> None:
+        """验证写入策略覆盖只读策略后 FastCtx replace 工具恢复执行。"""
+        self.assertIsNone(
+            HOOK.handle_hook(
+                self.payload(
+                    "UserPromptExpansion",
+                    command_name="task-anchor:task-anchor-readonly",
+                    command_args="$task-anchor-readonly",
+                ),
+                self.data_root,
+            )
+        )
+        self.assertIsNone(
+            HOOK.handle_hook(
+                self.payload(
+                    "UserPromptExpansion",
+                    command_name="task-anchor:task-anchor-write",
+                    command_args="$task-anchor-write",
+                ),
+                self.data_root,
+            )
+        )
+
+        result = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="mcp__fastctx__replace",
+                tool_input={},
+            ),
+            self.data_root,
+        )
+
+        self.assertIsNone(result)
+
+    def test_unknown_fastctx_tool_is_denied(self) -> None:
+        """验证未知 FastCtx 工具继续被 FastCtx 专属白名单拒绝。"""
+        result = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="mcp__fastctx__unknown",
+                tool_input={},
+            ),
+            self.data_root,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn(
+            "FastCtx only permits inspect_local_file, grep, glob, and replace.",
+            result["hookSpecificOutput"]["permissionDecisionReason"],
+        )
+
+    def test_fastctx_read_only_tools_remain_allowed_under_read_only_policy(self) -> None:
+        """验证只读策略开启后 FastCtx 三个只读工具仍然允许执行。"""
+        self.assertIsNone(
+            HOOK.handle_hook(
+                self.payload(
+                    "UserPromptExpansion",
+                    command_name="task-anchor:task-anchor-readonly",
+                    command_args="$task-anchor-readonly",
+                ),
+                self.data_root,
+            )
+        )
+
+        for tool_name in (
+            "mcp__fastctx__inspect_local_file",
+            "mcp__fastctx__grep",
+            "mcp__fastctx__glob",
+        ):
+            with self.subTest(tool_name=tool_name):
+                self.assertIsNone(
+                    HOOK.handle_hook(
+                        self.payload(
+                            "PreToolUse",
+                            tool_name=tool_name,
+                            tool_input={},
+                        ),
+                        self.data_root,
+                    )
+                )
+
     def test_session_end_cleanup_is_idempotent(self) -> None:
         self.assertIsNone(self.expand("task-anchor", "background task"))
         result = STATE.resource_manager.start_process(

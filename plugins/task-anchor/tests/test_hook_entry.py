@@ -199,6 +199,84 @@ class HookEntryTests(unittest.TestCase):
         )
         self.assertIn("managed_exec", result["hookSpecificOutput"]["permissionDecisionReason"])
 
+    def test_fastctx_replace_is_allowed_without_read_only_policy(self) -> None:
+        """验证未启用只读策略时 FastCtx replace 工具允许执行。"""
+        result = HOOK.handle_hook(
+            self.pre_tool_use("mcp__fastctx__replace", {}),
+            self.data_root,
+        )
+
+        self.assertIsNone(result)
+
+    def test_fastctx_replace_is_denied_by_read_only_policy(self) -> None:
+        """验证只读策略开启后 FastCtx replace 工具被 mutation policy 拦截。"""
+        self.assertIsNone(
+            HOOK.handle_hook(self.user_prompt("$task-anchor-readonly"), self.data_root)
+        )
+
+        result = HOOK.handle_hook(
+            self.pre_tool_use("mcp__fastctx__replace", {}),
+            self.data_root,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn(
+            "blocks mutation-capable tools",
+            result["hookSpecificOutput"]["permissionDecisionReason"],
+        )
+
+    def test_fastctx_replace_is_allowed_after_write_policy(self) -> None:
+        """验证写入策略覆盖只读策略后 FastCtx replace 工具恢复执行。"""
+        self.assertIsNone(
+            HOOK.handle_hook(self.user_prompt("$task-anchor-readonly"), self.data_root)
+        )
+        self.assertIsNone(
+            HOOK.handle_hook(self.user_prompt("$task-anchor-write"), self.data_root)
+        )
+
+        result = HOOK.handle_hook(
+            self.pre_tool_use("mcp__fastctx__replace", {}),
+            self.data_root,
+        )
+
+        self.assertIsNone(result)
+
+    def test_unknown_fastctx_tool_is_denied(self) -> None:
+        """验证未知 FastCtx 工具继续被 FastCtx 专属白名单拒绝。"""
+        result = HOOK.handle_hook(
+            self.pre_tool_use("mcp__fastctx__unknown", {}),
+            self.data_root,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn(
+            "FastCtx only permits inspect_local_file, grep, glob, and replace.",
+            result["hookSpecificOutput"]["permissionDecisionReason"],
+        )
+
+    def test_fastctx_read_only_tools_remain_allowed_under_read_only_policy(self) -> None:
+        """验证只读策略开启后 FastCtx 三个只读工具仍然允许执行。"""
+        self.assertIsNone(
+            HOOK.handle_hook(self.user_prompt("$task-anchor-readonly"), self.data_root)
+        )
+
+        for tool_name in (
+            "mcp__fastctx__inspect_local_file",
+            "mcp__fastctx__grep",
+            "mcp__fastctx__glob",
+        ):
+            with self.subTest(tool_name=tool_name):
+                self.assertIsNone(
+                    HOOK.handle_hook(
+                        self.pre_tool_use(tool_name, {}),
+                        self.data_root,
+                    )
+                )
+
     def test_activation_does_not_create_task_when_write_mode_cannot_be_saved(self) -> None:
         policy_directory = self.session_dir() / "mutation-policies"
         policy_directory.parent.mkdir(parents=True)
