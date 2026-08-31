@@ -381,10 +381,11 @@ function processAlive(pid) {
   }
 }
 
-/** 为子进程创建独立进程组，保证停止操作能够结束整棵进程树。 */
+/** 返回受管子进程启动选项：Windows 隐藏控制台，POSIX 创建独立进程组。 */
 function processLaunchOptions(platformName) {
   if (platformName === PLATFORM_WINDOWS) {
-    return { detached: true, windowsHide: true };
+    // Windows 的 detached 会创建独立控制台；停止仍由 taskkill /T /F 负责整棵进程树。
+    return { detached: false, windowsHide: true };
   }
   if (platformName === PLATFORM_MACOS || platformName === PLATFORM_LINUX) {
     return { detached: true };
@@ -721,8 +722,7 @@ async function startProcess({
     const options = {
       cwd: normalizedCwd,
       shell: Boolean(shell),
-      windowsHide: true,
-      detached: true,
+      ...processLaunchOptions(platformName),
       // 通过 Node 管道分别接收 stdout/stderr，再合并写入受管日志。
       stdio: ["ignore", "pipe", "pipe"],
     };

@@ -112,6 +112,15 @@ test("windows .cmd programs work by absolute path and PATH command name", { skip
   }
 });
 
+test("Windows 启动隐藏子进程且不创建独立控制台，POSIX 保留独立进程组", () => {
+  assert.deepEqual(manager.processLaunchOptions(manager.PLATFORM_WINDOWS), {
+    detached: false,
+    windowsHide: true,
+  });
+  assert.deepEqual(manager.processLaunchOptions(manager.PLATFORM_MACOS), { detached: true });
+  assert.deepEqual(manager.processLaunchOptions(manager.PLATFORM_LINUX), { detached: true });
+});
+
 test("legacy lock file does not block the new lock directory", async () => {
   const testFixture = fixture();
   let resource;
