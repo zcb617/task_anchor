@@ -51,7 +51,9 @@ test("tool errors stay in structured content and do not terminate the service", 
     method: "tools/call",
     params: { name: "managed_exec", arguments: { operation: "invalid" } },
   });
-  assert.deepEqual(response.result.content, []);
+  assert.deepEqual(response.result.content, [
+    { type: "text", text: "operation 只能是 run、stop、list 或 cleanup。" },
+  ]);
   assert.deepEqual(response.result.structuredContent, { error: "operation 只能是 run、stop、list 或 cleanup。" });
   assert.equal(response.result.isError, true);
   assert.deepEqual(mcp.handleRequest({ jsonrpc: "2.0", id: 5, method: "ping" }).result, {});

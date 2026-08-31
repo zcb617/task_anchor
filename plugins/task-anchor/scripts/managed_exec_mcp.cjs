@@ -225,9 +225,10 @@ const TOOL_OUTPUT_SCHEMA = {
 
 /** 构造旧协议兼容的 MCP 工具结果外壳。 */
 function toolResult(value, isError = false) {
+  const errorMessage = value && typeof value.error === "string" ? value.error : "managed_exec 执行失败。";
   return {
-    // 兼容旧客户端的文本内容数组，当前保持为空。
-    content: [],
+    // 成功结果仅使用结构化内容；错误结果同时提供文本，供 Claude Code 可靠展示。
+    content: isError ? [{ type: "text", text: errorMessage }] : [],
     // 稳定的结构化业务结果。
     structuredContent: value,
     // 工具业务错误标记。
