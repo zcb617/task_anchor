@@ -5,6 +5,7 @@ const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { TaskAnchorLogger } = require("./task_anchor_logger.cjs");
 
 // 资源账本格式版本，用于兼容现有 Python Hook 读取的数据。
 const SCHEMA_VERSION = 1;
@@ -582,7 +583,7 @@ function removeRecord(cwd, runId) {
 }
 
 /** 将 Node child close/error 事件及合并日志刷新转换为可等待的受管完成状态。 */
-function trackProcess(child, logStream = null) {
+function trackProcess(child, logStream = null, logger = null) {
   const completion = new Promise((resolve) => {
     let settled = false;
     let processFinished = false;
@@ -620,6 +621,12 @@ function trackProcess(child, logStream = null) {
         return;
       }
       processFinished = true;
+      if (logger) {
+        logger.warning("spawn_failed", {
+          error: error && error.message ? error.message : String(error),
+          ...(error && error.code ? { code: error.code } : {}),
+        });
+      }
       result = { code: null, signal: null, error: error || outputError };
       finishOutput();
     });
@@ -628,6 +635,13 @@ function trackProcess(child, logStream = null) {
         return;
       }
       processFinished = true;
+      if (logger) {
+        logger.info("process_exited", {
+          pid: Number.isInteger(child.pid) ? child.pid : null,
+          exit_code: code,
+          signal: signal || null,
+        });
+      }
       result = { code, signal, error: outputError };
       finishOutput();
     });
@@ -685,6 +699,8 @@ async function startProcess({
   const displayCommand = commandText(program, normalizedArgs, command);
   let spawnTarget;
   let spawnArgs;
+  let batchProgram = null;
+  const executionEnvironment = env === undefined || env === null ? process.env : env;
   if (shell) {
     if (typeof command !== "string" || !command.trim()) {
       throw new ResourceError("shell=true 时必须提供 command 字符串。");
@@ -695,14 +711,14 @@ async function startProcess({
     if (typeof program !== "string" || !program.trim()) {
       throw new ResourceError("shell=false 时必须提供 program。");
     }
-    const batchProgram = resolveWindowsBatchProgram(
+    batchProgram = resolveWindowsBatchProgram(
       program,
       normalizedCwd,
-      env === undefined || env === null ? process.env : env,
+      executionEnvironment,
     );
     if (batchProgram) {
       const commandInterpreter =
-        windowsEnvironmentValue(env === undefined || env === null ? process.env : env, "ComSpec") || "cmd.exe";
+        windowsEnvironmentValue(executionEnvironment, "ComSpec") || "cmd.exe";
       spawnTarget = commandInterpreter;
       // cmd.exe 将批处理程序和参数分别接收，避免路径引号被作为命令字符解释。
       spawnArgs = ["/d", "/c", batchProgram, ...normalizedArgs];
@@ -714,6 +730,44 @@ async function startProcess({
 
   const runId = crypto.randomUUID();
   const logPath = path.join(workspaceRuntimeDirectory(normalizedCwd), "logs", `${runId}.log`);
+  const diagnosticLogPath = path.join(
+    workspaceRuntimeDirectory(normalizedCwd),
+    "logs",
+    `${runId}.events.jsonl`,
+  );
+  const logger = new TaskAnchorLogger(diagnosticLogPath);
+  logger.info("launch_requested", {
+    run_id: runId,
+    cwd: normalizedCwd,
+    platform: platformName,
+    program,
+    args: normalizedArgs,
+    command,
+    shell: Boolean(shell),
+    wait: Boolean(wait),
+    timeout_ms: timeoutMs,
+    stop_policy: normalizedPolicy,
+    environment_source: env === undefined || env === null ? "process" : "provided",
+  });
+  logger.debug("execution_environment", {
+    path: windowsEnvironmentValue(executionEnvironment, "PATH") ?? null,
+    pathext: windowsEnvironmentValue(executionEnvironment, "PATHEXT") ?? null,
+    comspec: windowsEnvironmentValue(executionEnvironment, "ComSpec") ?? null,
+  });
+  if (platformName === PLATFORM_WINDOWS && !shell) {
+    logger.debug("windows_batch_resolved", {
+      program,
+      batch_program: batchProgram,
+    });
+  }
+  const launchOptions = processLaunchOptions(platformName);
+  logger.debug("spawn_attempted", {
+    spawn_target: spawnTarget,
+    spawn_args: spawnArgs,
+    cwd: normalizedCwd,
+    shell: Boolean(shell),
+    ...launchOptions,
+  });
   fs.mkdirSync(path.dirname(logPath), { recursive: true });
   let logStream = null;
   let child = null;
@@ -722,7 +776,7 @@ async function startProcess({
     const options = {
       cwd: normalizedCwd,
       shell: Boolean(shell),
-      ...processLaunchOptions(platformName),
+      ...launchOptions,
       // 通过 Node 管道分别接收 stdout/stderr，再合并写入受管日志。
       stdio: ["ignore", "pipe", "pipe"],
     };
@@ -730,13 +784,18 @@ async function startProcess({
       options.env = env;
     }
     child = childProcess.spawn(spawnTarget, spawnArgs, options);
+    child.once("spawn", () => {
+      logger.info("spawn_succeeded", {
+        pid: Number.isInteger(child.pid) ? child.pid : null,
+      });
+    });
     if (child.stdout) {
       child.stdout.pipe(logStream, { end: false });
     }
     if (child.stderr) {
       child.stderr.pipe(logStream, { end: false });
     }
-    const tracked = trackProcess(child, logStream);
+    const tracked = trackProcess(child, logStream, logger);
 
     const record = {
       // 资源记录格式版本。
@@ -773,6 +832,8 @@ async function startProcess({
       name: normalizedName,
       // 合并输出日志路径。
       log_path: logPath,
+      // 结构化生命周期诊断日志路径。
+      diagnostic_log_path: diagnosticLogPath,
       // 当前登记状态。
       status: "running",
     };
@@ -784,14 +845,23 @@ async function startProcess({
         saveRecords(normalizedCwd, records);
       });
     } catch (error) {
+      logger.warning("ledger_write_failed", {
+        run_id: runId,
+        error: error && error.message ? error.message : String(error),
+      });
       try {
         await terminatePid(child.pid);
       } catch (terminationError) {
-        process.stderr.write(`Task Anchor 无法清理未登记进程 ${child.pid}: ${terminationError.message}\n`);
+        logger.warning("ledger_write_failed", {
+          run_id: runId,
+          error: terminationError && terminationError.message
+            ? terminationError.message
+            : String(terminationError),
+        });
       }
       throw error instanceof ResourceError
         ? error
-        : new ResourceError(`资源登记失败：${error.message}`);
+        : new ResourceError(`资源登记失败：${error.message}；诊断日志：${diagnosticLogPath}`);
     }
 
     let timer = null;
@@ -807,7 +877,10 @@ async function startProcess({
       try {
         removeRecord(normalizedCwd, runId);
       } catch (error) {
-        process.stderr.write(`Task Anchor 无法移除资源记录 ${runId}: ${error.message}\n`);
+        logger.warning("ledger_remove_failed", {
+          run_id: runId,
+          error: error && error.message ? error.message : String(error),
+        });
       }
       return completion;
     });
@@ -816,6 +889,11 @@ async function startProcess({
       timeoutPromise = new Promise((resolve) => {
         timer = setTimeout(() => {
           timeoutTriggered = true;
+          logger.warning("timeout_triggered", {
+            run_id: runId,
+            pid: child.pid,
+            timeout_ms: timeoutMs,
+          });
           (async () => {
             try {
               const termination = await terminatePid(child.pid);
@@ -825,20 +903,34 @@ async function startProcess({
               ) {
                 timeoutFailureMessage =
                   `Task Anchor 超时停止 PID ${child.pid} 未确认终止，资源账本已保留，可通过 operation=stop 重试。`;
-                process.stderr.write(`${timeoutFailureMessage}\n`);
+                logger.warning("timeout_stop_failed", {
+                  run_id: runId,
+                  pid: child.pid,
+                  error: timeoutFailureMessage,
+                });
               } else {
+                logger.info("timeout_stop_succeeded", {
+                  run_id: runId,
+                  pid: child.pid,
+                  status: termination.status,
+                });
                 try {
                   removeRecord(normalizedCwd, runId);
                 } catch (error) {
-                  process.stderr.write(
-                    `Task Anchor 已终止 PID ${child.pid}，但无法移除资源记录 ${runId}：${error.message}\n`,
-                  );
+                  logger.warning("ledger_remove_failed", {
+                    run_id: runId,
+                    error: error && error.message ? error.message : String(error),
+                  });
                 }
               }
             } catch (error) {
               timeoutFailureMessage =
                 `Task Anchor 超时停止 PID ${child.pid} 失败：${error.message}；资源账本已保留，可通过 operation=stop 重试。`;
-              process.stderr.write(`${timeoutFailureMessage}\n`);
+              logger.warning("timeout_stop_failed", {
+                run_id: runId,
+                pid: child.pid,
+                error: error && error.message ? error.message : String(error),
+              });
             } finally {
               timer = null;
               resolve();
@@ -866,6 +958,8 @@ async function startProcess({
         platform: platformName,
         // 合并输出日志路径。
         log_path: logPath,
+        // 结构化生命周期诊断日志路径。
+        diagnostic_log_path: diagnosticLogPath,
       };
     }
 
@@ -884,7 +978,9 @@ async function startProcess({
       completion = await removeOnCompletion;
     }
     if (completion && completion.error) {
-      throw new ResourceError(`启动命令失败：${completion.error.message}`);
+      throw new ResourceError(
+        `启动命令失败：${completion.error.message}；诊断日志：${diagnosticLogPath}`,
+      );
     }
     const result = {
       // 受管运行唯一 ID。
@@ -901,6 +997,8 @@ async function startProcess({
       cwd: normalizedCwd,
       // 合并输出日志路径。
       log_path: logPath,
+      // 结构化生命周期诊断日志路径。
+      diagnostic_log_path: diagnosticLogPath,
       // 被执行进程的合并输出。
       output: readLog(logPath),
     };
@@ -928,6 +1026,13 @@ async function startProcess({
 /** 判断账本记录是否同时属于指定会话和工作区。 */
 function matchesOwner(record, ownerKey, workspace) {
   return record.workspace_key === workspace && record.owner_key === ownerKey;
+}
+
+/** 为已有账本记录创建诊断日志器，兼容缺少诊断路径的历史记录。 */
+function loggerForRecord(record) {
+  return typeof record.diagnostic_log_path === "string" && record.diagnostic_log_path.trim()
+    ? new TaskAnchorLogger(record.diagnostic_log_path)
+    : null;
 }
 
 /** 停止指定会话和工作区内的资源，显式 run_id 遵循 Codex 既有权限边界。 */
@@ -965,9 +1070,25 @@ async function stopProcess({
   const stopped = [];
   const failed = [];
   const succeededIds = new Set();
+  const loggerByRunId = new Map();
   for (const record of selected) {
+    const logger = loggerForRecord(record);
+    if (logger) {
+      loggerByRunId.set(record.run_id, logger);
+      logger.info("stop_requested", {
+        run_id: record.run_id,
+        pid: Number(record.pid),
+      });
+    }
     try {
       const termination = await terminatePid(Number(record.pid));
+      if (logger) {
+        logger.info("stop_succeeded", {
+          run_id: record.run_id,
+          pid: Number(record.pid),
+          status: termination.status,
+        });
+      }
       stopped.push({
         // 停止状态和 PID。
         ...termination,
@@ -978,6 +1099,13 @@ async function stopProcess({
       });
       succeededIds.add(record.run_id);
     } catch (error) {
+      if (logger) {
+        logger.warning("stop_failed", {
+          run_id: record.run_id,
+          pid: Number(record.pid),
+          error: error && error.message ? error.message : String(error),
+        });
+      }
       failed.push({
         // 停止失败的资源运行 ID。
         run_id: record.run_id,
@@ -986,10 +1114,20 @@ async function stopProcess({
       });
     }
   }
-  withFileLock(lockPathFor(filePath), () => {
-    const current = loadRecords(normalizedCwd);
-    saveRecords(normalizedCwd, current.filter((record) => !succeededIds.has(record.run_id)));
-  });
+  try {
+    withFileLock(lockPathFor(filePath), () => {
+      const current = loadRecords(normalizedCwd);
+      saveRecords(normalizedCwd, current.filter((record) => !succeededIds.has(record.run_id)));
+    });
+  } catch (error) {
+    for (const [runId, logger] of loggerByRunId) {
+      logger.warning("ledger_write_failed", {
+        run_id: runId,
+        error: error && error.message ? error.message : String(error),
+      });
+    }
+    throw error;
+  }
   return {
     // 成功停止或已经停止的资源。
     stopped,

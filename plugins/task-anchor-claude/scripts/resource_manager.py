@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from task_anchor_logger import TaskAnchorLogger
+
 
 SCHEMA_VERSION = 1
 STOP_POLICY_CLEANUP = "cleanup"
@@ -32,6 +34,8 @@ _LIVE_PROCESSES: dict[int, subprocess.Popen[Any]] = {}
 PLATFORM_WINDOWS = "windows"
 PLATFORM_MACOS = "macos"
 PLATFORM_LINUX = "linux"
+# Windows 需要由命令解释器解析的批处理程序扩展名。
+WINDOWS_BATCH_EXTENSIONS = {".bat", ".cmd"}
 # 跨 Node/Python 账本目录锁的最大等待时间。
 LOCK_TIMEOUT_SECONDS = 10.0
 # 跨 Node/Python 账本目录锁的竞争重试间隔。
@@ -402,6 +406,57 @@ def _validate_args(args: Any) -> list[str]:
     return list(args)
 
 
+def _environment_value(environment: dict[str, str], name: str) -> str | None:
+    """按不区分大小写的环境变量名读取允许写入诊断日志的值。"""
+    expected = name.casefold()
+    for key, value in environment.items():
+        if isinstance(key, str) and key.casefold() == expected:
+            return value
+    return None
+
+
+def _resolve_windows_batch_program(
+    program: str | None,
+    cwd: str,
+    environment: dict[str, str],
+) -> str | None:
+    """解析 Windows 当前目录或 PATH 中已存在的批处理程序，仅用于诊断记录。"""
+    if current_platform() != PLATFORM_WINDOWS or not isinstance(program, str) or not program.strip():
+        return None
+    normalized_program = program.strip()
+    program_extension = Path(normalized_program).suffix.lower()
+    if program_extension and program_extension not in WINDOWS_BATCH_EXTENSIONS:
+        return None
+    has_path = os.path.isabs(normalized_program) or "/" in normalized_program or "\\" in normalized_program
+    if program_extension:
+        extensions = [""]
+    else:
+        path_extensions = str(_environment_value(environment, "PATHEXT") or ".BAT;.CMD")
+        extensions = [
+            extension.strip().lower()
+            for extension in path_extensions.split(";")
+            if extension.strip().lower() in WINDOWS_BATCH_EXTENSIONS
+        ]
+    if not extensions:
+        return None
+    if has_path:
+        search_directories = [os.path.dirname(os.path.abspath(os.path.join(cwd, normalized_program)))]
+    else:
+        search_directories = [cwd]
+        search_directories.extend(
+            entry.strip().strip('"')
+            for entry in str(_environment_value(environment, "PATH") or "").split(os.pathsep)
+            if entry.strip()
+        )
+    basename = os.path.basename(normalized_program)
+    for directory in search_directories:
+        for extension in extensions:
+            candidate = Path(directory) / f"{basename}{extension}"
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
 def _read_log(log_path: Path, limit: int = 20_000) -> str:
     try:
         content = log_path.read_text(encoding="utf-8", errors="replace")
@@ -451,52 +506,146 @@ def start_process(
     )
     run_id = str(uuid.uuid4())
     log_path = workspace_runtime_directory(normalized_cwd) / "logs" / f"{run_id}.log"
+    diagnostic_log_path = (
+        workspace_runtime_directory(normalized_cwd) / "logs" / f"{run_id}.events.jsonl"
+    )
+    logger = TaskAnchorLogger(str(diagnostic_log_path))
+    execution_environment = dict(os.environ) if env is None else env
+    logger.info(
+        "launch_requested",
+        {
+            "run_id": run_id,
+            "cwd": normalized_cwd,
+            "platform": platform_name,
+            "program": program,
+            "args": normalized_args,
+            "command": command,
+            "shell": bool(shell),
+            "wait": bool(wait),
+            "timeout_ms": timeout_ms,
+            "stop_policy": normalized_policy,
+            "environment_source": "process" if env is None else "provided",
+        },
+    )
+    logger.debug(
+        "execution_environment",
+        {
+            "path": _environment_value(execution_environment, "PATH"),
+            "pathext": _environment_value(execution_environment, "PATHEXT"),
+            "comspec": _environment_value(execution_environment, "ComSpec"),
+        },
+    )
+    batch_program = _resolve_windows_batch_program(program, normalized_cwd, execution_environment)
+    if platform_name == PLATFORM_WINDOWS and not shell:
+        logger.debug(
+            "windows_batch_resolved",
+            {"program": program, "batch_program": batch_program},
+        )
+    launch_options = _process_launch_options(platform_name)
+    logger.debug(
+        "spawn_attempted",
+        {
+            "spawn_target": popen_args,
+            "spawn_args": normalized_args if not shell else [],
+            "cwd": normalized_cwd,
+            "shell": bool(shell),
+            **launch_options,
+        },
+    )
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_handle = log_path.open("ab")
+    log_handle = None
     popen_kwargs: dict[str, Any] = {
         "cwd": normalized_cwd,
         "shell": shell,
         "stdin": subprocess.DEVNULL,
-        "stdout": log_handle,
-        "stderr": subprocess.STDOUT,
         "env": env,
     }
-    popen_kwargs.update(_process_launch_options(platform_name))
+    popen_kwargs.update(launch_options)
 
     try:
+        log_handle = log_path.open("ab")
+        popen_kwargs["stdout"] = log_handle
+        popen_kwargs["stderr"] = subprocess.STDOUT
         process = subprocess.Popen(popen_args, **popen_kwargs)
+        logger.info("spawn_succeeded", {"pid": process.pid})
     except (OSError, ValueError) as exc:
-        log_handle.close()
-        raise ResourceError(f"启动命令失败：{exc}") from exc
+        error_code = getattr(exc, "errno", None)
+        logger.warning(
+            "spawn_failed",
+            {
+                "error": str(exc),
+                **({"code": error_code} if error_code is not None else {}),
+            },
+        )
+        raise ResourceError(f"启动命令失败：{exc}；诊断日志：{diagnostic_log_path}") from exc
     finally:
-        log_handle.close()
+        if log_handle is not None:
+            log_handle.close()
     _LIVE_PROCESSES[process.pid] = process
 
     record = {
+        # 资源记录格式版本。
         "schema_version": SCHEMA_VERSION,
+        # 本次受管运行唯一 ID。
         "run_id": run_id,
+        # 资源所有者键。
         "owner_key": owner_key,
+        # 资源所属会话哈希。
         "session_key": resolved_session_key,
+        # 资源所属任务 ID。
         "task_id": resolved_task_id,
+        # 工作区哈希。
         "workspace_key": workspace_key(normalized_cwd),
+        # 规范化工作目录。
         "cwd": normalized_cwd,
+        # 启动平台。
         "platform": platform_name,
+        # 直接启动的程序。
         "program": program,
+        # 传给程序的参数。
         "args": normalized_args,
+        # 展示命令。
         "command": display_command,
+        # 操作系统 PID。
         "pid": process.pid,
+        # UTC 启动时间。
         "started_at": utc_now(),
+        # Unix 启动时间戳。
         "started_at_epoch": time.time(),
+        # 停止策略。
         "stop_policy": normalized_policy,
+        # keep 资源名称。
         "name": normalized_name,
+        # 合并 stdout/stderr 日志路径。
         "log_path": str(log_path),
+        # 结构化生命周期诊断日志路径。
+        "diagnostic_log_path": str(diagnostic_log_path),
+        # 当前登记状态。
         "status": "running",
     }
     path = ledger_path(normalized_cwd)
-    with file_lock(path.with_suffix(".lock.d")):
-        records = _load_records(normalized_cwd)
-        records.append(record)
-        _save_records(normalized_cwd, records)
+    try:
+        with file_lock(path.with_suffix(".lock.d")):
+            records = _load_records(normalized_cwd)
+            records.append(record)
+            _save_records(normalized_cwd, records)
+    except (OSError, ResourceError) as exc:
+        logger.warning("ledger_write_failed", {"run_id": run_id, "error": str(exc)})
+        raise
+
+    def remove_completed_record() -> None:
+        """在进程完成后移除账本记录并记录移除异常。"""
+        try:
+            with file_lock(path.with_suffix(".lock.d")):
+                records = [
+                    item
+                    for item in _load_records(normalized_cwd)
+                    if item.get("run_id") != run_id
+                ]
+                _save_records(normalized_cwd, records)
+        except (OSError, ResourceError) as exc:
+            logger.warning("ledger_remove_failed", {"run_id": run_id, "error": str(exc)})
+            raise
 
     if not wait:
         return {
@@ -508,12 +657,17 @@ def start_process(
             "cwd": normalized_cwd,
             "platform": platform_name,
             "log_path": str(log_path),
+            "diagnostic_log_path": str(diagnostic_log_path),
         }
 
     timeout_seconds = None if timeout_ms is None else max(0, timeout_ms) / 1000
     try:
         exit_code = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
+        logger.warning(
+            "timeout_triggered",
+            {"run_id": run_id, "pid": process.pid, "timeout_ms": timeout_ms},
+        )
         return {
             "run_id": run_id,
             "pid": process.pid,
@@ -524,12 +678,15 @@ def start_process(
             "cwd": normalized_cwd,
             "platform": platform_name,
             "log_path": str(log_path),
+            "diagnostic_log_path": str(diagnostic_log_path),
             "output": _read_log(log_path),
         }
 
-    with file_lock(path.with_suffix(".lock.d")):
-        records = [item for item in _load_records(normalized_cwd) if item.get("run_id") != run_id]
-        _save_records(normalized_cwd, records)
+    logger.info(
+        "process_exited",
+        {"run_id": run_id, "pid": process.pid, "exit_code": exit_code, "signal": None},
+    )
+    remove_completed_record()
     _LIVE_PROCESSES.pop(process.pid, None)
     return {
         "run_id": run_id,
@@ -540,6 +697,7 @@ def start_process(
         "command": display_command,
         "cwd": normalized_cwd,
         "log_path": str(log_path),
+        "diagnostic_log_path": str(diagnostic_log_path),
         "output": _read_log(log_path),
     }
 
@@ -585,21 +743,67 @@ def stop_process(
             else:
                 remaining.append(record)
 
-        results = []
-        failed = []
+        results: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        succeeded_run_ids: set[str] = set()
         for record in selected:
+            diagnostic_path = record.get("diagnostic_log_path")
+            logger = (
+                TaskAnchorLogger(diagnostic_path)
+                if isinstance(diagnostic_path, str) and diagnostic_path.strip()
+                else None
+            )
+            if logger is not None:
+                logger.info(
+                    "stop_requested",
+                    {"run_id": record.get("run_id"), "pid": record.get("pid")},
+                )
             try:
+                termination = _terminate_pid(int(record.get("pid", 0)))
+                if logger is not None:
+                    logger.info(
+                        "stop_succeeded",
+                        {
+                            "run_id": record.get("run_id"),
+                            "pid": record.get("pid"),
+                            "status": termination.get("status"),
+                        },
+                    )
                 results.append(
                     {
-                        **_terminate_pid(int(record.get("pid", 0))),
+                        # 停止状态和操作系统 PID。
+                        **termination,
+                        # Task Anchor 分配的运行 ID。
                         "run_id": record.get("run_id"),
+                        # 调用方设置的资源名称。
                         "name": record.get("name"),
                     }
                 )
+                succeeded_run_ids.add(str(record.get("run_id")))
             except (ResourceError, ValueError, TypeError) as exc:
-                failed.append({"run_id": record.get("run_id"), "error": str(exc)})
+                error_message = str(exc)
+                if logger is not None:
+                    logger.warning(
+                        "stop_failed",
+                        {
+                            "run_id": record.get("run_id"),
+                            "pid": record.get("pid"),
+                            "error": error_message,
+                        },
+                    )
+                failed.append({"run_id": record.get("run_id"), "error": error_message})
                 remaining.append(record)
-        _save_records(normalized_cwd, remaining)
+        try:
+            _save_records(normalized_cwd, remaining)
+        except (OSError, ResourceError) as exc:
+            for record in selected:
+                diagnostic_path = record.get("diagnostic_log_path")
+                if isinstance(diagnostic_path, str) and diagnostic_path.strip():
+                    TaskAnchorLogger(diagnostic_path).warning(
+                        "ledger_write_failed",
+                        {"run_id": record.get("run_id"), "error": str(exc)},
+                    )
+            raise
     return {
         "stopped": results,
         "failed": failed,
@@ -608,8 +812,8 @@ def stop_process(
             for item in records
             if item.get("stop_policy") == STOP_POLICY_KEEP
             and owner_key is not None
-            and _matches_owner(item, owner_key, workspace_key(normalized_cwd))
-            and item.get("run_id") not in {result.get("run_id") for result in results}
+            and _matches_owner(item, owner_key, workspace)
+            and str(item.get("run_id")) not in succeeded_run_ids
         ],
     }
 

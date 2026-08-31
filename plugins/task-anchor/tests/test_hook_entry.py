@@ -199,6 +199,58 @@ class HookEntryTests(unittest.TestCase):
         )
         self.assertIn("managed_exec", result["hookSpecificOutput"]["permissionDecisionReason"])
 
+    def test_managed_exec_binding_audits_environment_injection(self) -> None:
+        """验证 Codex managed_exec 绑定注入环境并只审计环境摘要标记。"""
+        result = HOOK.handle_hook(
+            self.pre_tool_use(
+                "mcp__task_anchor__managed_exec",
+                {"program": "node", "args": []},
+            ),
+            self.data_root,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        updated_input = result["hookSpecificOutput"]["updatedInput"]
+        self.assertEqual(updated_input["session_id"], self.session_id)
+        self.assertIsInstance(updated_input["env"], dict)
+        event = self.audit_events()[-1]
+        self.assertEqual(event["status"], "managed_exec_bound")
+        self.assertEqual(event["message"], "managed_exec_bound")
+        self.assertTrue(event["environment_injected"])
+        self.assertNotIn("env", event)
+
+    def test_managed_exec_binding_skip_reasons_are_fixed(self) -> None:
+        """验证 Codex managed_exec 绑定跳过只使用规定的原因值。"""
+        missing_session = self.pre_tool_use(
+            "mcp__task_anchor__managed_exec", {"program": "node"}
+        )
+        missing_session["session_id"] = None
+        missing_input = self.pre_tool_use(
+            "mcp__task_anchor__managed_exec", {"program": "node"}
+        )
+        missing_input.pop("tool_input")
+        explicit_session = self.pre_tool_use(
+            "mcp__task_anchor__managed_exec",
+            {"program": "node", "session_id": "other-session"},
+        )
+
+        for payload, expected_reason in (
+            (missing_session, "missing_session_id"),
+            (missing_input, "missing_tool_input"),
+            (explicit_session, "explicit_session_id"),
+        ):
+            with self.subTest(reason=expected_reason):
+                # 直接验证绑定函数，避免 managed_exec 被只读变更门控提前拦截。
+                HOOK._bind_managed_exec_to_session(payload, self.data_root)
+                event = self.audit_events()[-1]
+                self.assertEqual(event["status"], "managed_exec_bind_skipped")
+                self.assertEqual(event["reason"], expected_reason)
+                self.assertIn(
+                    event["reason"],
+                    {"missing_session_id", "missing_tool_input", "explicit_session_id"},
+                )
+
     def test_fastctx_replace_is_allowed_without_read_only_policy(self) -> None:
         """验证未启用只读策略时 FastCtx replace 工具允许执行。"""
         result = HOOK.handle_hook(

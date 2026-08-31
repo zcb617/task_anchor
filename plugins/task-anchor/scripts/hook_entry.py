@@ -19,6 +19,7 @@ SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 import resource_manager
+from task_anchor_logger import TaskAnchorLogger
 
 SKILL_MARKER = "$task-anchor"
 SKILL_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])\$task-anchor(?![A-Za-z0-9_-])")
@@ -295,7 +296,7 @@ def write_audit_event(
     status: str,
     **details: Any,
 ) -> None:
-    """写入不包含任务正文和真实 session_id 的最小审计记录。"""
+    """通过统一 Logger 写入不包含任务正文和真实 session_id 的最小审计记录。"""
     if data_root is None:
         return
 
@@ -304,31 +305,25 @@ def write_audit_event(
     source = data.get("source")
     trigger = data.get("trigger")
     record: dict[str, Any] = {
-        "timestamp": utc_now(),
+        # Hook 事件名称，保持既有审计字段。
         "hook_event_name": event_name if isinstance(event_name, str) else None,
+        # Hook 来源，保持既有审计字段。
         "source": source if isinstance(source, str) else None,
+        # Hook 触发方式，保持既有审计字段。
         "trigger": trigger if isinstance(trigger, str) else None,
+        # 脱敏后的会话标识，保持既有审计字段。
         SESSION_KEY_FIELD: (
             session_key(current_session_id) if current_session_id is not None else None
         ),
+        # 工作区摘要，保持既有审计字段。
         WORKSPACE_SHA256_FIELD: read_workspace_sha256(data),
+        # 原有审计状态字段。
         "status": status,
+        # 事件补充字段。
+        **details,
     }
-    record.update(details)
-    line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
-        "utf-8"
-    )
     audit_path = data_root / AUDIT_LOG_RELATIVE_PATH
-    try:
-        audit_path.parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_BINARY", 0)
-        descriptor = os.open(audit_path, flags, 0o600)
-        try:
-            os.write(descriptor, line)
-        finally:
-            os.close(descriptor)
-    except OSError:
-        return
+    TaskAnchorLogger(str(audit_path)).info(status, record)
 
 
 def is_explicit_activation(prompt: Any) -> bool:
@@ -1080,22 +1075,51 @@ def _managed_exec_input(data: dict[str, Any]) -> tuple[str, dict[str, Any]] | No
     return None
 
 
-def _bind_managed_exec_to_session(data: dict[str, Any]) -> dict[str, Any] | None:
-    """在工具实际执行前，将当前 Hook 会话绑定到 managed_exec。"""
+def _bind_managed_exec_to_session(
+    data: dict[str, Any],
+    data_root: Path | None,
+) -> dict[str, Any] | None:
+    """在工具实际执行前绑定当前 Hook 会话，并审计绑定结果。"""
 
     current_session_id = read_session_id(data)
     tool_input = _managed_exec_input(data)
-    if current_session_id is None or tool_input is None:
+    if current_session_id is None:
+        write_audit_event(
+            data_root,
+            data,
+            "managed_exec_bind_skipped",
+            reason="missing_session_id",
+        )
+        return None
+    if tool_input is None:
+        write_audit_event(
+            data_root,
+            data,
+            "managed_exec_bind_skipped",
+            reason="missing_tool_input",
+        )
         return None
 
     _, original_input = tool_input
     explicit_session_id = original_input.get("session_id")
     if isinstance(explicit_session_id, str) and explicit_session_id.strip():
+        write_audit_event(
+            data_root,
+            data,
+            "managed_exec_bind_skipped",
+            reason="explicit_session_id",
+        )
         return None
 
     updated_input = dict(original_input)
     updated_input["session_id"] = current_session_id
     updated_input["env"] = dict(os.environ)
+    write_audit_event(
+        data_root,
+        data,
+        "managed_exec_bound",
+        environment_injected=True,
+    )
     return {
         "hookSpecificOutput": {
             "hookEventName": PRE_TOOL_USE,
@@ -1212,7 +1236,7 @@ def guard_pre_tool_use(
                 f"invoke {WRITE_SKILL_MARKER} to allow modifications."
             )
     if _is_managed_exec_tool(tool_name):
-        return _bind_managed_exec_to_session(data)
+        return _bind_managed_exec_to_session(data, data_root)
 
     command_text = _command_text(data)
     matched_keyword = _matched_process_keyword(command_text)

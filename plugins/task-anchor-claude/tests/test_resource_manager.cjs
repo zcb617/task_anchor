@@ -73,6 +73,27 @@ test("program and args preserve environment, cwd, and non-zero exit", async () =
     assert.equal(result.status, "exited");
     assert.equal(result.exit_code, 7);
     assert.equal(result.output, `${manager.normalizePath(testFixture.workspace)}|managed`);
+    assert.equal(typeof result.diagnostic_log_path, "string");
+    const events = fs.readFileSync(result.diagnostic_log_path, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const expectedMessages = [
+      "launch_requested",
+      "execution_environment",
+      "spawn_attempted",
+      "spawn_succeeded",
+      "process_exited",
+    ];
+    if (process.platform === "win32") {
+      expectedMessages.splice(2, 0, "windows_batch_resolved");
+    }
+    assert.deepEqual(events.map((event) => event.message), expectedMessages);
+    if (process.platform === "win32") {
+      assert.equal(events[2].program, process.execPath);
+      assert.equal(events[2].batch_program, null);
+    }
+    assert.equal(events.some((event) => Object.hasOwn(event, "TASK_ANCHOR_NODE_TEST")), false);
     assert.deepEqual(manager.listProcesses({ cwd: testFixture.workspace, sessionId: testFixture.sessionId }), []);
   } finally {
     testFixture.restore();
@@ -165,6 +186,12 @@ test("timeout ends the process tree and removes the ordinary resource", async ()
     });
     assert.equal(result.status, "exited");
     assert.equal(result.timed_out, true);
+    const events = fs.readFileSync(result.diagnostic_log_path, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(events.some((event) => event.message === "timeout_triggered"), true);
+    assert.equal(events.some((event) => event.message === "timeout_stop_succeeded"), true);
     assert.equal(manager.processAlive(result.pid), false);
     assert.deepEqual(manager.listProcesses({ cwd: testFixture.workspace, sessionId: testFixture.sessionId }), []);
   } finally {

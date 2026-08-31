@@ -198,6 +198,71 @@ class ClaudeHookEntryTests(unittest.TestCase):
         self.assertNotIn(instruction, context)
         self.assertNotIn(task_id, context)
 
+    def audit_events(self) -> list[dict[str, object]]:
+        """读取当前 Claude Hook 生成的结构化审计事件。"""
+        path = self.data_root / STATE.AUDIT_LOG_RELATIVE_PATH
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def test_managed_exec_binding_audits_without_environment_injection(self) -> None:
+        """验证 Claude managed_exec 绑定保留工作区并标记未注入环境。"""
+        result = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="mcp__plugin_task-anchor_task-anchor__managed_exec",
+                tool_input={"program": "node", "args": []},
+            ),
+            self.data_root,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        updated_input = result["hookSpecificOutput"]["updatedInput"]
+        self.assertEqual(updated_input["session_id"], self.session_id)
+        self.assertEqual(updated_input["cwd"], str(self.workspace))
+        self.assertNotIn("env", updated_input)
+        event = self.audit_events()[-1]
+        self.assertEqual(event["status"], "managed_exec_bound")
+        self.assertEqual(event["message"], "managed_exec_bound")
+        self.assertFalse(event["environment_injected"])
+
+    def test_managed_exec_binding_skip_reasons_are_fixed(self) -> None:
+        """验证 Claude managed_exec 绑定跳过只使用规定的原因值。"""
+        missing_session = self.payload(
+            "PreToolUse",
+            tool_name="mcp__plugin_task-anchor_task-anchor__managed_exec",
+            tool_input={"program": "node"},
+        )
+        missing_session["session_id"] = None
+        missing_input = self.payload(
+            "PreToolUse",
+            tool_name="mcp__plugin_task-anchor_task-anchor__managed_exec",
+            tool_input={"program": "node"},
+        )
+        missing_input.pop("tool_input")
+        explicit_session = self.payload(
+            "PreToolUse",
+            tool_name="mcp__plugin_task-anchor_task-anchor__managed_exec",
+            tool_input={"program": "node", "session_id": "other-session"},
+        )
+
+        for payload, expected_reason in (
+            (missing_session, "missing_session_id"),
+            (missing_input, "missing_tool_input"),
+            (explicit_session, "explicit_session_id"),
+        ):
+            with self.subTest(reason=expected_reason):
+                # 直接验证绑定函数，避免 managed_exec 被只读变更门控提前拦截。
+                STATE._bind_managed_exec_to_session(payload, self.data_root)
+                event = self.audit_events()[-1]
+                self.assertEqual(event["status"], "managed_exec_bind_skipped")
+                self.assertEqual(event["reason"], expected_reason)
+                self.assertIn(
+                    event["reason"],
+                    {"missing_session_id", "missing_tool_input", "explicit_session_id"},
+                )
+
     def test_pre_tool_use_allows_non_process_commands(self) -> None:
         """验证 Bash 查询命令未命中进程关键词时允许直接执行。"""
         result = HOOK.handle_hook(

@@ -75,6 +75,33 @@ class ResourceManagerTests(unittest.TestCase):
         )
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(result["output"], "managed-environment\n")
+        self.assertIsInstance(result["diagnostic_log_path"], str)
+        events = [
+            json.loads(line)
+            for line in Path(result["diagnostic_log_path"]).read_text(encoding="utf-8").splitlines()
+        ]
+        expected_messages = [
+            "launch_requested",
+            "execution_environment",
+            "spawn_attempted",
+            "spawn_succeeded",
+            "process_exited",
+        ]
+        if os.name == "nt":
+            expected_messages.insert(2, "windows_batch_resolved")
+        self.assertEqual([event["message"] for event in events], expected_messages)
+        if os.name == "nt":
+            self.assertEqual(events[2]["program"], sys.executable)
+            self.assertIsNone(events[2]["batch_program"])
+        self.assertFalse(any("TASK_ANCHOR_ENV_TEST" in event for event in events))
+
+    @unittest.skipUnless(os.name != "nt", "Windows 文件 mode 位不稳定。")
+    def test_logger_creates_restricted_jsonl_file(self) -> None:
+        """验证 Python Logger 新建诊断文件采用 0600 权限。"""
+        log_path = self.root / "nested" / "diagnostic.events.jsonl"
+        logger = RESOURCE_MANAGER.TaskAnchorLogger(log_path)
+        logger.info("logger_test", {"field": "value"})
+        self.assertEqual(log_path.stat().st_mode & 0o777, 0o600)
 
     def test_platform_detection_and_launch_options(self) -> None:
         cases = {
@@ -466,6 +493,7 @@ class ManagedExecMcpTests(unittest.TestCase):
         )
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(result["output"], "mcp-environment\n")
+        self.assertIsInstance(result["diagnostic_log_path"], str)
 
     def test_tool_call_starts_and_stops_a_managed_process(self) -> None:
         resource = MCP.execute_tool(

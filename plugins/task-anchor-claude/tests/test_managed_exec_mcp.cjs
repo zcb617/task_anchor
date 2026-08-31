@@ -41,6 +41,11 @@ test("initialize, ping, tools/list, and notifications follow JSON-RPC contract",
   const tools = mcp.handleRequest({ jsonrpc: "2.0", id: 3, method: "tools/list" });
   assert.equal(tools.result.tools[0].name, "managed_exec");
   assert.equal(tools.result.tools[0].inputSchema.properties.stop_policy.default, "cleanup");
+  const outputSchema = tools.result.tools[0].outputSchema;
+  const runSchema = outputSchema.oneOf.find((item) => item.title === "run 操作结果");
+  assert.equal(runSchema.properties.diagnostic_log_path.type, "string");
+  assert.equal(runSchema.required.includes("diagnostic_log_path"), true);
+  assert.equal(outputSchema.$defs.registeredResource.required.includes("diagnostic_log_path"), true);
   assert.equal(mcp.handleRequest({ jsonrpc: "2.0", method: "ping" }), null);
 });
 
@@ -71,6 +76,7 @@ test("tools/call preserves program args, shell command, and environment", async 
     });
     assert.equal(direct.exit_code, 0);
     assert.equal(direct.output, "direct");
+    assert.equal(typeof direct.diagnostic_log_path, "string");
 
     const shell = await mcp.executeTool({
       command: process.platform === "win32" ? "echo shell" : "printf shell",

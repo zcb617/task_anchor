@@ -140,13 +140,15 @@ const TOOL_OUTPUT_SCHEMA = {
         name: { type: ["string", "null"], description: "调用方设置的可选资源名称。" },
         // 合并输出日志路径。
         log_path: { type: "string", description: "合并输出日志文件路径。" },
+        // 结构化生命周期诊断日志路径。
+        diagnostic_log_path: { type: "string", description: "结构化生命周期诊断日志文件路径。" },
         // 账本中的运行状态。
         status: { type: "string", enum: ["running"], description: "已登记资源的当前状态。" },
       },
       required: [
         "schema_version", "run_id", "owner_key", "session_key", "task_id", "workspace_key",
         "cwd", "platform", "program", "args", "command", "pid", "started_at", "started_at_epoch",
-        "stop_policy", "name", "log_path", "status",
+        "stop_policy", "name", "log_path", "diagnostic_log_path", "status",
       ],
       additionalProperties: false,
     },
@@ -177,10 +179,12 @@ const TOOL_OUTPUT_SCHEMA = {
         platform: { type: "string", description: "进程运行平台；运行中可能返回。" },
         // 输出日志路径。
         log_path: { type: "string", description: "合并输出日志文件路径。" },
+        // 结构化生命周期诊断日志路径。
+        diagnostic_log_path: { type: "string", description: "结构化生命周期诊断日志文件路径。" },
         // 被执行程序产生的原始输出。
         output: { type: "string", description: "被执行程序写入 stdout 和 stderr 的原始合并文本。" },
       },
-      required: ["run_id", "pid", "status", "stop_policy", "command", "cwd", "log_path"],
+      required: ["run_id", "pid", "status", "stop_policy", "command", "cwd", "log_path", "diagnostic_log_path"],
       additionalProperties: false,
     },
     {
