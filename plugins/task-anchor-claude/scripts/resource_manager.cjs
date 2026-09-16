@@ -25,7 +25,7 @@ const PLATFORM_LINUX = "linux";
 const LOCK_TIMEOUT_MS = 10000;
 // 跨 Node/Python 账本目录锁的竞争重试间隔。
 const LOCK_RETRY_MS = 25;
-// Claude 版本沿用 Python manager 的显式 run_id 所有者校验。
+// Codex 版本沿用 Python manager 的显式 run_id 所有者校验。
 const EXPLICIT_RUN_ID_REQUIRES_OWNER = true;
 // 当前 Node 进程内登记的子进程，用于等待关闭和复用进程句柄。
 const LIVE_PROCESSES = new Map();
@@ -663,6 +663,42 @@ function trackProcess(child, logStream = null, logger = null) {
   return entry;
 }
 
+/** 判断 POSIX shell 命令是否试图用末尾的 & 脱离 Task Anchor 生命周期管控。 */
+function isPosixShellBackgroundCommand(command, platformName, shell) {
+  if (shell !== true) {
+    return false;
+  }
+  if (platformName !== PLATFORM_LINUX && platformName !== PLATFORM_MACOS) {
+    return false;
+  }
+  if (typeof command !== "string") {
+    return false;
+  }
+  const trimmed = command.replace(/\s+$/, "");
+  if (!trimmed.endsWith("&") || trimmed.endsWith("&&")) {
+    return false;
+  }
+  let quote = null;
+  for (const character of trimmed) {
+    if (quote === "'") {
+      if (character === "'") {
+        quote = null;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+    }
+  }
+  return quote === null;
+}
+
 /** 启动、登记并等待或返回受管本地进程。 */
 async function startProcess({
   cwd,
@@ -670,7 +706,6 @@ async function startProcess({
   args = null,
   command = null,
   shell = false,
-  wait = true,
   timeoutMs = 1800000,
   stopPolicy = null,
   name = null,
@@ -707,6 +742,9 @@ async function startProcess({
     }
     spawnTarget = command;
     spawnArgs = [];
+    if (isPosixShellBackgroundCommand(command, platformName, true)) {
+      throw new ResourceError("Task Anchor 不允许使用 & 后台运行；持续进程请直接启动，由 Task Anchor 管理生命周期。");
+    }
   } else {
     if (typeof program !== "string" || !program.trim()) {
       throw new ResourceError("shell=false 时必须提供 program。");
@@ -744,7 +782,6 @@ async function startProcess({
     args: normalizedArgs,
     command,
     shell: Boolean(shell),
-    wait: Boolean(wait),
     timeout_ms: timeoutMs,
     stop_policy: normalizedPolicy,
     environment_source: env === undefined || env === null ? "process" : "provided",
@@ -938,29 +975,6 @@ async function startProcess({
           })();
         }, timeoutMs);
       });
-    }
-
-    if (!wait) {
-      return {
-        // 受管运行唯一 ID。
-        run_id: runId,
-        // 操作系统进程 ID。
-        pid: child.pid,
-        // 当前进程仍在运行。
-        status: "running",
-        // 停止策略。
-        stop_policy: normalizedPolicy,
-        // 展示命令。
-        command: displayCommand,
-        // 规范化工作目录。
-        cwd: normalizedCwd,
-        // 启动平台。
-        platform: platformName,
-        // 合并输出日志路径。
-        log_path: logPath,
-        // 结构化生命周期诊断日志路径。
-        diagnostic_log_path: diagnosticLogPath,
-      };
     }
 
     let completion;
@@ -1206,6 +1220,7 @@ module.exports = {
   resolveWindowsBatchProgram,
   validateArgs,
   readLog,
+  isPosixShellBackgroundCommand,
   startProcess,
   matchesOwner,
   stopProcess,

@@ -40,8 +40,7 @@ TOOL_SCHEMA = {
         "command": {"type": "string", "description": "仅在 shell=true 时使用的完整命令。"},
         "shell": {"type": "boolean", "default": False},
         "cwd": {"type": "string", "description": "工作目录，默认当前工作目录。"},
-        "wait": {"type": "boolean", "default": True, "description": "是否等待命令退出。"},
-            "timeout_ms": {"type": ["integer", "null"], "default": 1800000},
+        "timeout_ms": {"type": ["integer", "null"], "default": 1800000},
         "stop_policy": {
             "type": "string",
             "enum": ["cleanup", "keep"],
@@ -163,7 +162,7 @@ TOOL_OUTPUT_SCHEMA = {
                 },
                 "timed_out": {
                     "type": "boolean",
-                    "description": "等待已超时，但进程仍在受管运行。",
+                    "description": "命令已达到 timeout_ms 并结束整个进程树。",
                 },
                 "exit_code": {"type": "integer", "description": "进程退出码；仅退出后返回。"},
                 "stop_policy": {
@@ -272,7 +271,6 @@ def execute_tool(arguments: dict[str, Any]) -> dict[str, Any]:
             args=arguments.get("args"),
             command=arguments.get("command"),
             shell=bool(arguments.get("shell", False)),
-            wait=bool(arguments.get("wait", True)),
             timeout_ms=arguments.get("timeout_ms", 1800000),
             stop_policy=arguments.get("stop_policy"),
             name=arguments.get("name"),

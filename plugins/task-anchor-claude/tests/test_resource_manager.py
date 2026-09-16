@@ -4,6 +4,8 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -38,26 +40,90 @@ class ResourceManagerTests(unittest.TestCase):
         os.environ["TASK_ANCHOR_RUNTIME_ROOT"] = str(self.root / "runtime")
         self.session_id = f"session-{uuid.uuid4()}"
         self.task_id = f"task-{uuid.uuid4()}"
+        # 后台测试线程，承载 timeout_ms=null 的永久等待命令。
+        self._background_threads = []
+        # 后台测试资源，tearDown 统一兜底停止，避免遗留进程。
+        self._background_resources = []
         RESOURCE_MANAGER.set_active_context(
             str(self.workspace), self.session_id, self.task_id
         )
 
     def tearDown(self) -> None:
+        for resource, cwd, session_id in self._background_resources:
+            try:
+                RESOURCE_MANAGER.stop_process(
+                    cwd=cwd,
+                    run_id=resource["run_id"],
+                    session_id=session_id,
+                    include_keep=True,
+                )
+            except RESOURCE_MANAGER.ResourceError:
+                pass
+        for thread in self._background_threads:
+            thread.join(timeout=10)
         if self.previous_runtime_root is None:
             os.environ.pop("TASK_ANCHOR_RUNTIME_ROOT", None)
         else:
             os.environ["TASK_ANCHOR_RUNTIME_ROOT"] = self.previous_runtime_root
         shutil.rmtree(self.root, ignore_errors=True)
 
+    def start_background_sleep(
+        self,
+        *,
+        cwd=None,
+        session_id=None,
+        task_id=None,
+        stop_policy=None,
+        name=None,
+    ):
+        """在后台启动永久等待命令，供生命周期停止场景取得账本资源。"""
+        resolved_cwd = str(cwd or self.workspace)
+        resolved_session_id = session_id or self.session_id
+        result_holder = {}
+        error_holder = []
+
+        def run_process():
+            try:
+                result_holder["result"] = RESOURCE_MANAGER.start_process(
+                    cwd=resolved_cwd,
+                    program=sys.executable,
+                    args=["-c", "import time; time.sleep(30)"],
+                    timeout_ms=None,
+                    stop_policy=stop_policy,
+                    name=name,
+                    session_id=resolved_session_id,
+                    task_id=task_id,
+                )
+            except BaseException as exc:
+                error_holder.append(exc)
+
+        thread = threading.Thread(target=run_process, daemon=True)
+        self._background_threads.append(thread)
+        thread.start()
+        deadline = time.monotonic() + 5
+        resource = None
+        while time.monotonic() < deadline:
+            if error_holder:
+                raise error_holder[0]
+            records = RESOURCE_MANAGER.list_processes(
+                cwd=resolved_cwd, session_id=resolved_session_id
+            )
+            if records:
+                resource = records[-1]
+                break
+            if not thread.is_alive():
+                break
+            time.sleep(0.01)
+        if resource is None:
+            raise AssertionError("后台长跑命令未登记到资源账本。")
+        self._background_resources.append((resource, resolved_cwd, resolved_session_id))
+        return resource
+
     def start_sleep(self, stop_policy=None):
-        return RESOURCE_MANAGER.start_process(
-            cwd=str(self.workspace),
-            program=sys.executable,
-            args=["-c", "import time; time.sleep(30)"],
-            wait=False,
+        """启动测试用长跑资源并返回已登记的账本记录。"""
+        return self.start_background_sleep(
             stop_policy=stop_policy,
             name="resource-test-keep" if stop_policy == "keep" else None,
-            session_id=self.session_id,
         )
 
     def test_start_process_uses_provided_environment(self) -> None:
@@ -183,20 +249,12 @@ class ResourceManagerTests(unittest.TestCase):
     def test_cleanup_groups_all_resources_within_same_session(self) -> None:
         task_a = f"task-a-{uuid.uuid4()}"
         task_b = f"task-b-{uuid.uuid4()}"
-        resource_a = RESOURCE_MANAGER.start_process(
-            cwd=str(self.workspace),
-            program=sys.executable,
-            args=["-c", "import time; time.sleep(30)"],
-            wait=False,
+        resource_a = self.start_background_sleep(
             session_id=self.session_id,
             task_id=task_a,
             name="drawing-a",
         )
-        resource_b = RESOURCE_MANAGER.start_process(
-            cwd=str(self.workspace),
-            program=sys.executable,
-            args=["-c", "import time; time.sleep(30)"],
-            wait=False,
+        resource_b = self.start_background_sleep(
             session_id=self.session_id,
             task_id=task_b,
             name="drawing-b",
@@ -227,21 +285,9 @@ class ResourceManagerTests(unittest.TestCase):
         task_a = f"task-a-{uuid.uuid4()}"
         task_b = f"task-b-{uuid.uuid4()}"
         RESOURCE_MANAGER.set_active_context(str(self.workspace), session_a, task_a)
-        resource_a = RESOURCE_MANAGER.start_process(
-            cwd=str(self.workspace),
-            program=sys.executable,
-            args=["-c", "import time; time.sleep(30)"],
-            wait=False,
-            session_id=session_a,
-        )
+        resource_a = self.start_background_sleep(session_id=session_a, task_id=task_a)
         RESOURCE_MANAGER.set_active_context(str(self.workspace), session_b, task_b)
-        resource_b = RESOURCE_MANAGER.start_process(
-            cwd=str(self.workspace),
-            program=sys.executable,
-            args=["-c", "import time; time.sleep(30)"],
-            wait=False,
-            session_id=session_b,
-        )
+        resource_b = self.start_background_sleep(session_id=session_b, task_id=task_b)
         try:
             result = RESOURCE_MANAGER.cleanup_for_stop(
                 cwd=str(self.workspace), session_id=session_a
@@ -270,13 +316,7 @@ class ResourceManagerTests(unittest.TestCase):
         session_a = f"session-a-{uuid.uuid4()}"
         session_b = f"session-b-{uuid.uuid4()}"
         RESOURCE_MANAGER.set_active_context(str(self.workspace), session_a, f"task-a-{uuid.uuid4()}")
-        resource_a = RESOURCE_MANAGER.start_process(
-            cwd=str(self.workspace),
-            program=sys.executable,
-            args=["-c", "import time; time.sleep(30)"],
-            wait=False,
-            session_id=session_a,
-        )
+        resource_a = self.start_background_sleep(session_id=session_a)
         try:
             result = RESOURCE_MANAGER.stop_process(
                 cwd=str(self.workspace),
@@ -304,13 +344,7 @@ class ResourceManagerTests(unittest.TestCase):
         workspace = self.root / "uncontextualized-workspace"
         workspace.mkdir()
         owner_session = f"session-owner-{uuid.uuid4()}"
-        resource = RESOURCE_MANAGER.start_process(
-            cwd=str(workspace),
-            program=sys.executable,
-            args=["-c", "import time; time.sleep(30)"],
-            wait=False,
-            session_id=owner_session,
-        )
+        resource = self.start_background_sleep(cwd=workspace, session_id=owner_session)
         try:
             with self.assertRaises(RESOURCE_MANAGER.ResourceError):
                 RESOURCE_MANAGER.stop_process(cwd=str(workspace), run_id=resource["run_id"])
@@ -350,7 +384,6 @@ class ResourceManagerTests(unittest.TestCase):
                 cwd=str(self.workspace),
                 program=sys.executable,
                 args=["-c", "import time; time.sleep(30)"],
-                wait=False,
                 stop_policy="keep",
                 session_id=self.session_id,
             )
@@ -377,7 +410,6 @@ class ResourceManagerTests(unittest.TestCase):
             cwd=str(self.workspace),
             program=sys.executable,
             args=["-c", "print('managed-ok')"],
-            wait=True,
             session_id=self.session_id,
         )
         self.assertEqual(result["status"], "exited")
@@ -389,6 +421,47 @@ class ResourceManagerTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_posix_rejects_trailing_ampersand(self) -> None:
+        """POSIX shell 末尾 & 直接抛业务错误，命令无法启动。"""
+        if os.name == "nt":
+            self.skipTest("Windows 不校验末尾 &")
+        with self.assertRaises(RESOURCE_MANAGER.ResourceError):
+            RESOURCE_MANAGER.start_process(
+                cwd=str(self.workspace),
+                command="sleep 60 &",
+                shell=True,
+                stop_policy="keep",
+                name="posix-background",
+                session_id=self.session_id,
+            )
+
+    def test_long_running_cleanup_command_times_out(self) -> None:
+        """长跑命令 cleanup + 短 timeout_ms 被超时，进程终止且账本清空。"""
+        result = RESOURCE_MANAGER.start_process(
+            cwd=str(self.workspace),
+            program=sys.executable,
+            args=["-c", "import time; time.sleep(30)"],
+            timeout_ms=150,
+            session_id=self.session_id,
+        )
+        try:
+            self.assertEqual(result["status"], "exited")
+            self.assertTrue(result["timed_out"])
+            self.assertFalse(RESOURCE_MANAGER._process_alive(result["pid"]))
+            self.assertEqual(
+                RESOURCE_MANAGER.list_processes(
+                    cwd=str(self.workspace), session_id=self.session_id
+                ),
+                [],
+            )
+        finally:
+            RESOURCE_MANAGER.stop_process(
+                cwd=str(self.workspace),
+                run_id=result["run_id"],
+                session_id=self.session_id,
+                include_keep=True,
+            )
 
 
 class ManagedExecMcpTests(unittest.TestCase):
@@ -495,19 +568,21 @@ class ManagedExecMcpTests(unittest.TestCase):
         self.assertEqual(result["output"], "mcp-environment\n")
         self.assertIsInstance(result["diagnostic_log_path"], str)
 
-    def test_tool_call_starts_and_stops_a_managed_process(self) -> None:
+    def test_tool_call_waits_for_timeout_and_cleans_a_managed_process(self) -> None:
         resource = MCP.execute_tool(
             {
                 "program": sys.executable,
                 "args": ["-c", "import time; time.sleep(30)"],
                 "cwd": str(self.workspace),
-                "wait": False,
+                "timeout_ms": 150,
                 "session_id": "mcp-session",
                 "task_id": "mcp-task",
             }
         )
         try:
-            self.assertEqual(resource["status"], "running")
+            self.assertEqual(resource["status"], "exited")
+            self.assertTrue(resource["timed_out"])
+            self.assertFalse(RESOURCE_MANAGER._process_alive(resource["pid"]))
             result = MCP.execute_tool(
                 {
                     "operation": "stop",
@@ -517,7 +592,7 @@ class ManagedExecMcpTests(unittest.TestCase):
                     "include_keep": True,
                 }
             )
-            self.assertEqual(len(result["stopped"]), 1)
+            self.assertEqual(result["stopped"], [])
         finally:
             MCP.execute_tool(
                 {

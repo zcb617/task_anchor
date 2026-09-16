@@ -37,8 +37,6 @@ const TOOL_SCHEMA = {
     shell: { type: "boolean", default: false },
     // 子进程工作目录。
     cwd: { type: "string", description: "工作目录，默认当前工作目录。" },
-    // 是否等待命令退出。
-    wait: { type: "boolean", default: true, description: "是否等待命令退出。" },
     // 单次命令的毫秒级时间上限。
     timeout_ms: { type: ["integer", "null"], default: 1800000 },
     // Stop 时清理还是保留资源。
@@ -240,11 +238,11 @@ function toolResult(value, isError = false) {
   };
 }
 
-/** 从请求参数读取并校验 Claude 工作目录，缺省时使用插件注入的项目目录。 */
+/** 从请求参数读取并校验 Codex 工作目录，缺省时沿用当前目录。 */
 function requireCwd(argumentsObject) {
-  const cwd = argumentsObject.cwd === undefined ? process.env.TASK_ANCHOR_DEFAULT_CWD : argumentsObject.cwd;
+  const cwd = argumentsObject.cwd === undefined ? "." : argumentsObject.cwd;
   if (typeof cwd !== "string" || !cwd.trim()) {
-    throw new resourceManager.ResourceError("cwd 必须由 Task Anchor Hook 或插件项目目录提供。");
+    throw new resourceManager.ResourceError("cwd 必须是非空字符串。");
   }
   return cwd;
 }
@@ -278,8 +276,6 @@ async function executeTool(argumentsObject) {
       command: argumentsObject.command,
       // 是否使用 shell。
       shell: Boolean(argumentsObject.shell ?? false),
-      // 是否等待关闭。
-      wait: Boolean(argumentsObject.wait ?? true),
       // 单次命令时间上限。
       timeoutMs: Object.prototype.hasOwnProperty.call(argumentsObject, "timeout_ms")
         ? argumentsObject.timeout_ms

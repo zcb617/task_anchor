@@ -467,6 +467,34 @@ def _read_log(log_path: Path, limit: int = 20_000) -> str:
     return f"[输出已截断，保留末尾 {limit} 个字符]\n{content[-limit:]}"
 
 
+def _is_posix_shell_background_command(
+    command: Any, platform_name: str, shell: bool
+) -> bool:
+    """判断 POSIX shell 命令是否试图用末尾的 & 脱离 Task Anchor 生命周期管控。"""
+    if shell is not True:
+        return False
+    if platform_name not in (PLATFORM_LINUX, PLATFORM_MACOS):
+        return False
+    if not isinstance(command, str):
+        return False
+    trimmed = command.rstrip()
+    if not trimmed.endswith("&") or trimmed.endswith("&&"):
+        return False
+    quote: str | None = None
+    for character in trimmed:
+        if quote == "'":
+            if character == "'":
+                quote = None
+            continue
+        if quote == '"':
+            if character == '"':
+                quote = None
+            continue
+        if character in ("'", '"'):
+            quote = character
+    return quote is None
+
+
 def start_process(
     *,
     cwd: str,
@@ -474,7 +502,6 @@ def start_process(
     args: Any = None,
     command: str | None = None,
     shell: bool = False,
-    wait: bool = True,
     timeout_ms: int | None = 1_800_000,
     stop_policy: Any = None,
     name: str | None = None,
@@ -495,6 +522,10 @@ def start_process(
     if shell:
         if not isinstance(command, str) or not command.strip():
             raise ResourceError("shell=true 时必须提供 command 字符串。")
+        if _is_posix_shell_background_command(command, platform_name, True):
+            raise ResourceError(
+                "Task Anchor 不允许使用 & 后台运行；持续进程请直接启动，由 Task Anchor 管理生命周期。"
+            )
         popen_args: Any = command
     else:
         if not isinstance(program, str) or not program.strip():
@@ -521,7 +552,6 @@ def start_process(
             "args": normalized_args,
             "command": command,
             "shell": bool(shell),
-            "wait": bool(wait),
             "timeout_ms": timeout_ms,
             "stop_policy": normalized_policy,
             "environment_source": "process" if env is None else "provided",
@@ -647,19 +677,6 @@ def start_process(
             logger.warning("ledger_remove_failed", {"run_id": run_id, "error": str(exc)})
             raise
 
-    if not wait:
-        return {
-            "run_id": run_id,
-            "pid": process.pid,
-            "status": "running",
-            "stop_policy": normalized_policy,
-            "command": display_command,
-            "cwd": normalized_cwd,
-            "platform": platform_name,
-            "log_path": str(log_path),
-            "diagnostic_log_path": str(diagnostic_log_path),
-        }
-
     timeout_seconds = None if timeout_ms is None else max(0, timeout_ms) / 1000
     try:
         exit_code = process.wait(timeout=timeout_seconds)
@@ -668,10 +685,35 @@ def start_process(
             "timeout_triggered",
             {"run_id": run_id, "pid": process.pid, "timeout_ms": timeout_ms},
         )
+        try:
+            termination = _terminate_pid(process.pid)
+            if termination.get("status") not in {"stopped", "already_stopped"}:
+                raise ResourceError(
+                    f"Task Anchor 超时停止 PID {process.pid} 未确认终止。"
+                )
+            logger.info(
+                "timeout_stop_succeeded",
+                {
+                    "run_id": run_id,
+                    "pid": process.pid,
+                    "status": termination.get("status"),
+                },
+            )
+            remove_completed_record()
+        except (OSError, ResourceError, subprocess.SubprocessError) as exc:
+            error_message = (
+                f"Task Anchor 超时停止 PID {process.pid} 失败：{exc}；"
+                f"资源账本已保留，可通过 operation=stop 重试。"
+            )
+            logger.warning(
+                "timeout_stop_failed",
+                {"run_id": run_id, "pid": process.pid, "error": error_message},
+            )
+            raise ResourceError(error_message) from exc
         return {
             "run_id": run_id,
             "pid": process.pid,
-            "status": "running",
+            "status": "exited",
             "timed_out": True,
             "stop_policy": normalized_policy,
             "command": display_command,

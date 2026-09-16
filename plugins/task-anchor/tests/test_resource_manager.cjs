@@ -54,10 +54,30 @@ function longRunningProcess(cwd, sessionId, options = {}) {
     cwd,
     program: process.execPath,
     args: ["-e", "setInterval(() => {}, 1000)"],
-    wait: false,
     sessionId,
     ...options,
   });
+}
+
+/** 发起永久命令后轮询资源账本，供生命周期停止测试取得运行资源。 */
+async function startBackgroundLongRunningResource(cwd, sessionId, options = {}) {
+  const completion = longRunningProcess(cwd, sessionId, options);
+  let startupError;
+  completion.catch((error) => {
+    startupError = error;
+  });
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    if (startupError) {
+      throw startupError;
+    }
+    const resources = manager.listProcesses({ cwd, sessionId });
+    if (resources.length > 0) {
+      return resources[resources.length - 1];
+    }
+    await delay(10);
+  }
+  throw new Error("永久命令未登记到资源账本。");
 }
 
 test("program and args preserve environment, cwd, and non-zero exit", async () => {
@@ -186,10 +206,21 @@ test("timeout ends the process tree and removes the ordinary resource", async ()
     });
     assert.equal(result.status, "exited");
     assert.equal(result.timed_out, true);
-    const events = fs.readFileSync(result.diagnostic_log_path, "utf8")
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
+    let events = [];
+    const eventDeadline = Date.now() + 3000;
+    while (Date.now() < eventDeadline) {
+      events = fs.readFileSync(result.diagnostic_log_path, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      if (
+        events.some((event) => event.message === "timeout_triggered")
+        && events.some((event) => event.message === "timeout_stop_succeeded")
+      ) {
+        break;
+      }
+      await delay(25);
+    }
     assert.equal(events.some((event) => event.message === "timeout_triggered"), true);
     assert.equal(events.some((event) => event.message === "timeout_stop_succeeded"), true);
     assert.equal(manager.processAlive(result.pid), false);
@@ -199,20 +230,12 @@ test("timeout ends the process tree and removes the ordinary resource", async ()
   }
 });
 
-test("wait=false still creates a timeout timer", async () => {
+test("long-running cleanup command is terminated by timeout and ledger is cleared", async () => {
   const testFixture = fixture();
   try {
     const resource = await longRunningProcess(testFixture.workspace, testFixture.sessionId, { timeoutMs: 60 });
-    assert.equal(resource.status, "running");
-    const deadline = Date.now() + 3000;
-    while (Date.now() < deadline) {
-      const processStopped = !manager.processAlive(resource.pid);
-      const records = manager.listProcesses({ cwd: testFixture.workspace, sessionId: testFixture.sessionId });
-      if (processStopped && records.length === 0) {
-        break;
-      }
-      await delay(25);
-    }
+    assert.equal(resource.status, "exited");
+    assert.equal(resource.timed_out, true);
     assert.equal(manager.processAlive(resource.pid), false);
     assert.deepEqual(manager.listProcesses({ cwd: testFixture.workspace, sessionId: testFixture.sessionId }), []);
   } finally {
@@ -225,12 +248,12 @@ test("keep and null timeout resources obey cleanup and explicit stop rules", asy
   let keep;
   let noTimeout;
   try {
-    keep = await longRunningProcess(testFixture.workspace, testFixture.sessionId, {
+    keep = await startBackgroundLongRunningResource(testFixture.workspace, testFixture.sessionId, {
       timeoutMs: 40,
       stopPolicy: "keep",
       name: "node-keep",
     });
-    noTimeout = await longRunningProcess(testFixture.workspace, testFixture.sessionId, {
+    noTimeout = await startBackgroundLongRunningResource(testFixture.workspace, testFixture.sessionId, {
       timeoutMs: null,
     });
     await delay(150);
@@ -259,14 +282,54 @@ test("keep and null timeout resources obey cleanup and explicit stop rules", asy
   }
 });
 
+test("POSIX shell 禁止末尾 & 后台运行，普通命令等执行完，长跑命令被超时终止", { skip: process.platform === "win32" }, async () => {
+  const testFixture = fixture();
+  let keepRunId = null;
+  try {
+    // 末尾 & 直接抛业务错误，命令根本无法启动。
+    await assert.rejects(
+      manager.startProcess({
+        cwd: testFixture.workspace,
+        command: "sleep 60 &",
+        shell: true,
+        stopPolicy: "keep",
+        name: "posix-background",
+        sessionId: testFixture.sessionId,
+      }),
+      (error) => error instanceof manager.ResourceError,
+    );
+    // 普通短命令等执行完返回 exited 与输出。
+    const short = await manager.startProcess({
+      cwd: testFixture.workspace,
+      program: process.execPath,
+      args: ["-e", "process.stdout.write('posix-ok'); process.exit(3)"],
+      sessionId: testFixture.sessionId,
+    });
+    assert.equal(short.status, "exited");
+    assert.equal(short.exit_code, 3);
+    assert.equal(short.output, "posix-ok");
+    // 长跑命令 cleanup + 短 timeoutMs 被超时终止，账本清空。
+    const long = await longRunningProcess(testFixture.workspace, testFixture.sessionId, { timeoutMs: 60 });
+    assert.equal(long.status, "exited");
+    assert.equal(long.timed_out, true);
+    assert.equal(manager.processAlive(long.pid), false);
+    assert.deepEqual(manager.listProcesses({ cwd: testFixture.workspace, sessionId: testFixture.sessionId }), []);
+  } finally {
+    if (keepRunId) {
+      await manager.stopProcess({ cwd: testFixture.workspace, runId: keepRunId, sessionId: testFixture.sessionId, includeKeep: true });
+    }
+    testFixture.restore();
+  }
+});
+
 test("session isolation prevents cleanup from stopping another session", async () => {
   const testFixture = fixture();
   const otherSession = `session-other-${manager.sha256Text(testFixture.root)}`;
   let first;
   let second;
   try {
-    first = await longRunningProcess(testFixture.workspace, testFixture.sessionId);
-    second = await longRunningProcess(testFixture.workspace, otherSession);
+    first = await startBackgroundLongRunningResource(testFixture.workspace, testFixture.sessionId, { timeoutMs: null });
+    second = await startBackgroundLongRunningResource(testFixture.workspace, otherSession, { timeoutMs: null });
     const cleanup = await manager.cleanupForStop({ cwd: testFixture.workspace, sessionId: testFixture.sessionId });
     assert.deepEqual(cleanup.stopped.map((item) => item.run_id), [first.run_id]);
     assert.equal(manager.processAlive(first.pid), false);
