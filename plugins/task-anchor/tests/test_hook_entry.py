@@ -7,6 +7,8 @@ import os
 import subprocess
 import sys
 import shutil
+import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -631,23 +633,56 @@ class HookEntryTests(unittest.TestCase):
         HOOK.resource_manager.set_active_context(
             str(self.workspace), self.session_id, f"hook-task-{uuid.uuid4()}"
         )
-        cleanup_resource = HOOK.resource_manager.start_process(
-            cwd=str(self.workspace),
-            program=sys.executable,
-            args=["-c", "import time; time.sleep(30)"],
-            wait=False,
-            session_id=self.session_id,
-        )
-        keep_resource = HOOK.resource_manager.start_process(
-            cwd=str(self.workspace),
-            program=sys.executable,
-            args=["-c", "import time; time.sleep(30)"],
-            wait=False,
-            stop_policy="keep",
-            name="hook-test-keep",
-            session_id=self.session_id,
-        )
+        threads: list[threading.Thread] = []
+
+        def start_resource_in_background(
+            *, stop_policy: str | None = None, name: str | None = None
+        ) -> dict:
+            """在守护线程中启动永久进程，并从资源账本取得登记记录。"""
+            start_kwargs = {
+                "cwd": str(self.workspace),
+                "program": sys.executable,
+                "args": ["-c", "import time; time.sleep(30)"],
+                "timeout_ms": None,
+                "session_id": self.session_id,
+            }
+            if stop_policy is not None:
+                start_kwargs["stop_policy"] = stop_policy
+            if name is not None:
+                start_kwargs["name"] = name
+
+            launch_error: list[BaseException] = []
+
+            def run_start_process() -> None:
+                """在后台线程中执行同步启动调用，避免永久进程阻塞测试主线程。"""
+                try:
+                    HOOK.resource_manager.start_process(**start_kwargs)
+                except BaseException as error:
+                    launch_error.append(error)
+
+            thread = threading.Thread(target=run_start_process, daemon=True)
+            threads.append(thread)
+            thread.start()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                resources = HOOK.resource_manager.list_processes(
+                    cwd=str(self.workspace), session_id=self.session_id
+                )
+                for resource in resources:
+                    if resource.get("name") == name:
+                        return resource
+                time.sleep(0.05)
+            if launch_error:
+                raise launch_error[0]
+            raise AssertionError(f"未在 5 秒内登记资源: {name or 'cleanup'}")
+
+        cleanup_resource = None
+        keep_resource = None
         try:
+            cleanup_resource = start_resource_in_background()
+            keep_resource = start_resource_in_background(
+                stop_policy="keep", name="hook-test-keep"
+            )
             self.assertIsNone(HOOK.handle_hook(self.stop(), self.data_root))
             self.assertFalse(
                 HOOK.resource_manager._process_alive(cleanup_resource["pid"])
@@ -656,11 +691,14 @@ class HookEntryTests(unittest.TestCase):
                 HOOK.resource_manager._process_alive(keep_resource["pid"])
             )
         finally:
-            HOOK.resource_manager.stop_process(
-                cwd=str(self.workspace),
-                run_id=keep_resource["run_id"],
-                include_keep=True,
-            )
+            if keep_resource is not None:
+                HOOK.resource_manager.stop_process(
+                    cwd=str(self.workspace),
+                    run_id=keep_resource["run_id"],
+                    include_keep=True,
+                )
+            for thread in threads:
+                thread.join(timeout=10)
 
     def test_cross_workspace_post_compact_is_not_injected(self) -> None:
         (self.other_workspace / ".git").mkdir()

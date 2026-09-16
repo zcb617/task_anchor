@@ -7,6 +7,8 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -480,19 +482,52 @@ class ClaudeHookEntryTests(unittest.TestCase):
 
     def test_session_end_cleanup_is_idempotent(self) -> None:
         self.assertIsNone(self.expand("task-anchor", "background task"))
-        result = STATE.resource_manager.start_process(
-            cwd=str(self.workspace),
-            program=os.environ.get("PYTHON", "python"),
-            args=["-c", "import time; time.sleep(30)"],
-            wait=False,
-            session_id=self.session_id,
-        )
-        self.assertEqual(result["status"], "running")
-        self.assertIsNone(HOOK.handle_hook(self.payload("SessionEnd"), self.data_root))
-        resources = STATE.resource_manager.list_processes(
-            cwd=str(self.workspace), session_id=self.session_id
-        )
-        self.assertEqual(resources, [])
+        launch_error: list[BaseException] = []
+
+        def run_start_process() -> None:
+            """在后台线程中执行同步启动调用，避免永久进程阻塞测试主线程。"""
+            try:
+                STATE.resource_manager.start_process(
+                    cwd=str(self.workspace),
+                    program=sys.executable,
+                    args=["-c", "import time; time.sleep(30)"],
+                    timeout_ms=None,
+                    session_id=self.session_id,
+                )
+            except BaseException as error:
+                launch_error.append(error)
+
+        thread = threading.Thread(target=run_start_process, daemon=True)
+        thread.start()
+        try:
+            resource = None
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                resources = STATE.resource_manager.list_processes(
+                    cwd=str(self.workspace), session_id=self.session_id
+                )
+                for candidate in resources:
+                    if "pid" in candidate and "run_id" in candidate:
+                        resource = candidate
+                        break
+                if resource is not None:
+                    break
+                time.sleep(0.05)
+            if resource is None:
+                if launch_error:
+                    raise launch_error[0]
+                raise AssertionError("未在 5 秒内登记资源")
+            self.assertIn("pid", resource)
+            self.assertIn("run_id", resource)
+            self.assertIsNone(
+                HOOK.handle_hook(self.payload("SessionEnd"), self.data_root)
+            )
+            resources = STATE.resource_manager.list_processes(
+                cwd=str(self.workspace), session_id=self.session_id
+            )
+            self.assertEqual(resources, [])
+        finally:
+            thread.join(timeout=10)
 
 
 class ClaudePluginContractTests(unittest.TestCase):
