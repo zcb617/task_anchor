@@ -70,7 +70,7 @@ claude plugin validate plugins/task-anchor-claude --strict
 
 `/task-anchor:task-anchor` 只保存命令参数作为原始任务指令；普通对话里出现的 `$task-anchor` 文本不会触发任务创建。
 
-Claude Code 的 `managed_exec` 通过 Node MCP 直接启动真实命令并绑定当前会话和项目。普通资源到达 `timeout_ms` 会结束整个进程树，`wait=false` 也会继续计时，`timeout_ms=null` 不自动超时；`stop_policy=keep` 必须设置 `name`，不受 timeout_ms、Stop/SessionEnd 影响，须显式调用 `operation=stop` 关闭。
+Claude Code 的 `managed_exec` 通过 Node MCP 直接启动真实命令并绑定当前会话和项目，遵循上面的输出与生命周期语义。普通资源到达 `timeout_ms` 会结束整个进程树，`timeout_ms=null` 不自动超时；`stop_policy=keep` 必须设置 `name`，不受 timeout_ms、Stop/SessionEnd 影响，须显式调用 `operation=stop` 关闭。
 
 插件状态保存在 `${CLAUDE_PLUGIN_DATA}`；插件更新不会抹掉这些数据。
 
@@ -90,7 +90,7 @@ codex plugin add task-anchor@task-anchor-local
 
 在 Codex 中启用 Task Anchor，并允许/信任其 `UserPromptSubmit`、`PostCompact`、`PreToolUse` 和 `Stop` Hook。Hook 文件更新后需要重新审查和信任。
 
-Codex 的 `managed_exec` 通过 Node MCP 直接启动真实命令；普通资源到达 `timeout_ms` 会结束整个进程树，`wait=false` 也会继续计时，`timeout_ms=null` 不自动超时。`stop_policy=keep` 必须设置 `name`，不受 timeout_ms、Stop/SessionEnd 影响，须在不需要时显式调用 `operation=stop`。
+Codex 的 `managed_exec` 通过 Node MCP 直接启动真实命令，遵循上面的输出与生命周期语义；普通资源到达 `timeout_ms` 会结束整个进程树，`timeout_ms=null` 不自动超时。`stop_policy=keep` 必须设置 `name`，不受 timeout_ms、Stop/SessionEnd 影响，须在不需要时显式调用 `operation=stop`。
 
 ### 使用
 
@@ -101,7 +101,7 @@ $task-anchor-readonly
 $task-anchor-write
 ```
 
-Codex 版通过 Node MCP 的 `managed_exec` 直接启动并登记真实命令；普通资源支持 `timeout_ms` 超时结束整棵进程树，`wait=false` 仍会继续计时，`timeout_ms=null` 不自动超时。`stop_policy=keep` 资源必须设置 `name`，不受 Stop/SessionEnd 影响，须显式调用 `operation=stop` 停止。
+Codex 版通过 Node MCP 的 `managed_exec` 直接启动并登记真实命令，遵循上面的输出与生命周期语义；普通资源支持 `timeout_ms` 超时结束整棵进程树，`timeout_ms=null` 不自动超时。`stop_policy=keep` 资源必须设置 `name`，不受 Stop/SessionEnd 影响，须显式调用 `operation=stop` 停止。
 
 ## 测试
 
