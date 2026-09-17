@@ -18,11 +18,23 @@ Task Anchor 将用户显式开始的任务持久化到当前会话和项目边�
 - 只读门控按“会话 + 工作区”保存；它不替代宿主自身的权限、沙箱或审批机制。
 - managed_exec 资源按“会话 + 工作区”登记；默认 cleanup 资源在 Stop/SessionEnd 清理，keep 资源仅由显式 stop 关闭。
 
+### managed_exec 输出与生命周期
+
+`managed_exec` 的“输出”和“进程结束”是两个独立维度：
+
+- 命令产生 stdout/stderr 后立即返回或转发这段输出，不等待进程结束。
+- 进程退出后，再返回 `exited`、`exit_code` 和最终结果。
+- 持续运行的命令（如 `java -jar`、`mvn spring-boot:run`）启动后立即返回已经产生的启动输出；后续输出继续返回给模型，并继续受 Task Anchor 管控。
+- 会结束的命令（如 `ls -l`）有输出就输出，结束时再给出退出结果。
+- 不使用 `wait` 参数，不用命令类型或人为时间窗口区分这两个维度。
+- `timeout_ms`、`stop_policy`、Stop/SessionEnd、按 `name`/`run_id` 停止和进程组终止只负责生命周期。
+- POSIX 下 `shell=true` 命令末尾未加引号的单个 `&` 禁止使用，避免进程脱离 Task Anchor 管控。
+
 ## 前置条件
 
 - Node.js：直接运行 managed_exec MCP，负责本地进程启动、资源登记、超时和停止。
 - Python 3.10+：运行 Hook 和任务状态机；可使用 `TASK_ANCHOR_PYTHON` 指定解释器。
-- 普通资源到达 `timeout_ms` 会真正结束整个进程树；`wait=false` 仍然计时，`timeout_ms=null` 不自动超时。
+- 普通资源到达 `timeout_ms` 会真正结束整个进程树；`timeout_ms=null` 不自动超时。
 - `stop_policy=keep` 必须设置 `name`，且不受 timeout_ms、Stop 或 SessionEnd 影响；不需要时必须显式调用 `operation=stop`。
 
 ## Claude Code
