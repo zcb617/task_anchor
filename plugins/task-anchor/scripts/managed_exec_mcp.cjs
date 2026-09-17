@@ -50,8 +50,6 @@ const TOOL_SCHEMA = {
     name: { type: "string", description: "资源名称，便于后续 stop。" },
     // 显式停止目标资源的唯一 ID。
     run_id: { type: "string" },
-    // 当前可信会话标识。
-    session_id: { type: "string", description: "通常不需要，默认从 Task Anchor 当前上下文解析。" },
     // 当前任务标识。
     task_id: { type: "string", description: "通常不需要，默认从 Task Anchor 当前上下文解析。" },
     // stop 是否连 keep 资源一并停止。

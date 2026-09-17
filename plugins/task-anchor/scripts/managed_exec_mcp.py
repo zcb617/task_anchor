@@ -50,7 +50,6 @@ TOOL_SCHEMA = {
         },
         "name": {"type": "string", "description": "资源名称，便于后续 stop。"},
         "run_id": {"type": "string"},
-        "session_id": {"type": "string", "description": "通常不需要，默认从 Task Anchor 当前上下文解析。"},
         "task_id": {"type": "string", "description": "通常不需要，默认从 Task Anchor 当前上下文解析。"},
         "include_keep": {"type": "boolean", "default": True},
     },
