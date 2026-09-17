@@ -76,48 +76,50 @@ class ResourceManagerTests(unittest.TestCase):
         stop_policy=None,
         name=None,
     ):
-        """在后台启动永久等待命令，供生命周期停止场景取得账本资源。"""
+        """启动永久等待命令并取得立即返回的 running 资源快照。"""
         resolved_cwd = str(cwd or self.workspace)
         resolved_session_id = session_id or self.session_id
+        resource = RESOURCE_MANAGER.start_process(
+            cwd=resolved_cwd,
+            program=sys.executable,
+            args=["-c", "import time; time.sleep(30)"],
+            timeout_ms=None,
+            stop_policy=stop_policy,
+            name=name,
+            session_id=resolved_session_id,
+            task_id=task_id,
+        )
+        if resource["status"] != "running":
+            raise AssertionError("后台长跑命令未返回 running 快照。")
+        self._background_resources.append((resource, resolved_cwd, resolved_session_id))
+        return resource
+
+    def run_to_completion(self, **options):
+        """启动命令并等待 completion 回调，兼容瞬时退出和持续运行。"""
+        completion = threading.Event()
         result_holder = {}
         error_holder = []
 
-        def run_process():
-            try:
-                result_holder["result"] = RESOURCE_MANAGER.start_process(
-                    cwd=resolved_cwd,
-                    program=sys.executable,
-                    args=["-c", "import time; time.sleep(30)"],
-                    timeout_ms=None,
-                    stop_policy=stop_policy,
-                    name=name,
-                    session_id=resolved_session_id,
-                    task_id=task_id,
-                )
-            except BaseException as exc:
-                error_holder.append(exc)
+        def on_completion(result):
+            result_holder["result"] = result
+            completion.set()
 
-        thread = threading.Thread(target=run_process, daemon=True)
-        self._background_threads.append(thread)
-        thread.start()
-        deadline = time.monotonic() + 5
-        resource = None
-        while time.monotonic() < deadline:
-            if error_holder:
-                raise error_holder[0]
-            records = RESOURCE_MANAGER.list_processes(
-                cwd=resolved_cwd, session_id=resolved_session_id
-            )
-            if records:
-                resource = records[-1]
-                break
-            if not thread.is_alive():
-                break
-            time.sleep(0.01)
-        if resource is None:
-            raise AssertionError("后台长跑命令未登记到资源账本。")
-        self._background_resources.append((resource, resolved_cwd, resolved_session_id))
-        return resource
+        def on_error(event):
+            error_holder.append(RuntimeError(event["error"]))
+            completion.set()
+
+        initial = RESOURCE_MANAGER.start_process(
+            **options,
+            on_completion=on_completion,
+            on_error=on_error,
+        )
+        if initial["status"] == "exited":
+            return initial
+        if not completion.wait(timeout=10):
+            raise AssertionError("命令 completion 回调未到达。")
+        if error_holder:
+            raise error_holder[0]
+        return result_holder["result"]
 
     def start_sleep(self, stop_policy=None):
         """启动测试用长跑资源并返回已登记的账本记录。"""
@@ -129,7 +131,7 @@ class ResourceManagerTests(unittest.TestCase):
     def test_start_process_uses_provided_environment(self) -> None:
         environment = dict(os.environ)
         environment["TASK_ANCHOR_ENV_TEST"] = "managed-environment"
-        result = RESOURCE_MANAGER.start_process(
+        result = self.run_to_completion(
             cwd=str(self.workspace),
             program=sys.executable,
             args=[
@@ -405,8 +407,53 @@ class ResourceManagerTests(unittest.TestCase):
                 cwd=str(self.workspace), run_id=resource["run_id"], include_keep=True
             )
 
+    def test_output_callbacks_arrive_before_completion(self) -> None:
+        """验证 stdout/stderr 分段输出先回调，退出后再返回完整结果。"""
+        output_events = []
+        completion = threading.Event()
+        result_holder = {}
+        error_holder = []
+
+        def on_output(event):
+            output_events.append(event)
+
+        def on_completion(result):
+            result_holder["result"] = result
+            completion.set()
+
+        def on_error(event):
+            error_holder.append(RuntimeError(event["error"]))
+            completion.set()
+
+        initial = RESOURCE_MANAGER.start_process(
+            cwd=str(self.workspace),
+            program=sys.executable,
+            args=[
+                "-c",
+                "import sys,time; sys.stdout.write('out-1'); sys.stdout.flush(); time.sleep(.08); sys.stderr.write('err-2'); sys.stdout.flush()",
+            ],
+            timeout_ms=None,
+            session_id=self.session_id,
+            on_output=on_output,
+            on_completion=on_completion,
+            on_error=on_error,
+        )
+        self.assertEqual(initial["status"], "running")
+        self.assertTrue(completion.wait(timeout=10))
+        self.assertFalse(error_holder)
+        result = result_holder["result"]
+        self.assertEqual(result["status"], "exited")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertGreaterEqual(len(output_events), 2)
+        self.assertTrue(all(event["run_id"] == result["run_id"] for event in output_events))
+        self.assertTrue(all(event["pid"] == result["pid"] for event in output_events))
+        self.assertEqual({event["stream"] for event in output_events}, {"stdout", "stderr"})
+        self.assertIn("out-1", "".join(event["output"] for event in output_events))
+        self.assertIn("err-2", "".join(event["output"] for event in output_events))
+        self.assertEqual(result["output"], "out-1err-2")
+
     def test_waiting_command_is_removed_after_exit(self) -> None:
-        result = RESOURCE_MANAGER.start_process(
+        result = self.run_to_completion(
             cwd=str(self.workspace),
             program=sys.executable,
             args=["-c", "print('managed-ok')"],
@@ -438,7 +485,7 @@ class ResourceManagerTests(unittest.TestCase):
 
     def test_long_running_cleanup_command_times_out(self) -> None:
         """长跑命令 cleanup + 短 timeout_ms 被超时，进程终止且账本清空。"""
-        result = RESOURCE_MANAGER.start_process(
+        result = self.run_to_completion(
             cwd=str(self.workspace),
             program=sys.executable,
             args=["-c", "import time; time.sleep(30)"],
@@ -478,6 +525,31 @@ class ManagedExecMcpTests(unittest.TestCase):
         else:
             os.environ["TASK_ANCHOR_RUNTIME_ROOT"] = self.previous_runtime_root
         shutil.rmtree(self.root, ignore_errors=True)
+
+    def run_to_completion(self, arguments):
+        """调用 MCP 工具并等待异步 completion 回调。"""
+        completion = threading.Event()
+        result_holder = {}
+        error_holder = []
+
+        def on_completion(result):
+            result_holder["result"] = result
+            completion.set()
+
+        def on_error(event):
+            error_holder.append(RuntimeError(event["error"]))
+            completion.set()
+
+        initial = MCP.execute_tool(
+            arguments,
+            hooks={"on_completion": on_completion, "on_error": on_error},
+        )
+        if initial["status"] == "exited":
+            return initial
+        self.assertTrue(completion.wait(timeout=10))
+        if error_holder:
+            raise error_holder[0]
+        return result_holder["result"]
 
     def test_initialize_and_tool_list(self) -> None:
         initialize = MCP.handle_request(
@@ -552,7 +624,7 @@ class ManagedExecMcpTests(unittest.TestCase):
     def test_tool_call_passes_environment_to_managed_process(self) -> None:
         environment = dict(os.environ)
         environment["TASK_ANCHOR_MCP_ENV_TEST"] = "mcp-environment"
-        result = MCP.execute_tool(
+        result = self.run_to_completion(
             {
                 "program": sys.executable,
                 "args": [
@@ -568,8 +640,52 @@ class ManagedExecMcpTests(unittest.TestCase):
         self.assertEqual(result["output"], "mcp-environment\n")
         self.assertIsInstance(result["diagnostic_log_path"], str)
 
+    def test_tool_call_returns_running_and_emits_output_and_completion(self) -> None:
+        """验证 MCP hooks 传递输出事件、running 初始结果和 exited 完成结果。"""
+        output_events = []
+        completion = threading.Event()
+        result_holder = {}
+        error_holder = []
+
+        def on_output(event):
+            output_events.append(event)
+
+        def on_completion(result):
+            result_holder["result"] = result
+            completion.set()
+
+        def on_error(event):
+            error_holder.append(RuntimeError(event["error"]))
+            completion.set()
+
+        initial = MCP.execute_tool(
+            {
+                "program": sys.executable,
+                "args": [
+                    "-c",
+                    "import sys,time; print('mcp-out', end=''); sys.stdout.flush(); time.sleep(.08); print('mcp-err', end='', file=sys.stderr); sys.stderr.flush()",
+                ],
+                "cwd": str(self.workspace),
+                "timeout_ms": None,
+                "session_id": "mcp-session",
+            },
+            hooks={
+                "on_output": on_output,
+                "on_completion": on_completion,
+                "on_error": on_error,
+            },
+        )
+        self.assertEqual(initial["status"], "running")
+        self.assertTrue(completion.wait(timeout=10))
+        self.assertFalse(error_holder)
+        result = result_holder["result"]
+        self.assertEqual(result["status"], "exited")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertTrue(any("mcp-out" in event["output"] for event in output_events))
+        self.assertTrue(any("mcp-err" in event["output"] for event in output_events))
+
     def test_tool_call_waits_for_timeout_and_cleans_a_managed_process(self) -> None:
-        resource = MCP.execute_tool(
+        resource = self.run_to_completion(
             {
                 "program": sys.executable,
                 "args": ["-c", "import time; time.sleep(30)"],

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from typing import Any
 
 try:
@@ -252,9 +253,12 @@ def _require_cwd(arguments: dict[str, Any]) -> str:
     return cwd
 
 
-def execute_tool(arguments: dict[str, Any]) -> dict[str, Any]:
+def execute_tool(
+    arguments: dict[str, Any], hooks: dict[str, Any] | None = None
+) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise resource_manager.ResourceError("工具参数必须是对象。")
+    internal_hooks = hooks or {}
     operation = arguments.get("operation", "run")
     if operation not in {"run", "stop", "list", "cleanup"}:
         raise resource_manager.ResourceError("operation 只能是 run、stop、list 或 cleanup。")
@@ -276,6 +280,9 @@ def execute_tool(arguments: dict[str, Any]) -> dict[str, Any]:
             stop_policy=arguments.get("stop_policy"),
             name=arguments.get("name"),
             env=arguments.get("env"),
+            on_output=internal_hooks.get("on_output"),
+            on_completion=internal_hooks.get("on_completion"),
+            on_error=internal_hooks.get("on_error"),
         )
     if operation == "stop":
         return resource_manager.stop_process(
@@ -293,7 +300,9 @@ def _error(code: int, message: str, request_id: Any = None) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
 
-def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
+def handle_request(
+    request: dict[str, Any], hooks: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
     method = request.get("method")
     request_id = request.get("id")
     if not isinstance(method, str):
@@ -337,7 +346,7 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
             return _error(-32602, "未知的工具。", request_id)
         arguments = params.get("arguments", {})
         try:
-            result = execute_tool(arguments)
+            result = execute_tool(arguments, hooks=hooks)
             return {"jsonrpc": "2.0", "id": request_id, "result": _tool_result(result)}
         except Exception as exc:  # MCP 工具错误需要作为工具结果返回，避免服务退出。
             return {
@@ -348,17 +357,60 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
     return _error(-32601, f"不支持的方法：{method}", request_id)
 
 
+def _notification(level: str, data: dict[str, Any]) -> dict[str, Any]:
+    """构造标准 MCP notifications/message 生命周期通知。"""
+    return {
+        # JSON-RPC 协议版本。
+        "jsonrpc": "2.0",
+        # MCP 服务端主动通知方法。
+        "method": "notifications/message",
+        # 通知级别、日志器和业务事件数据。
+        "params": {"level": level, "logger": "managed_exec", "data": data},
+    }
+
+
 def main() -> int:
+    # 初始响应和后台线程通知共用锁，确保每行 JSON 原子写出。
+    output_lock = threading.Lock()
+
+    def write_json_line(value: dict[str, Any]) -> None:
+        """线程安全地写出一行 JSON-RPC，并立即刷新 stdout。"""
+        with output_lock:
+            try:
+                sys.stdout.write(json.dumps(value, ensure_ascii=False) + "\n")
+                sys.stdout.flush()
+            except (BrokenPipeError, OSError):
+                # 客户端断开时不再向后台生命周期线程泄漏写出异常。
+                return
+
+    def on_output(event: dict[str, Any]) -> None:
+        """把 stdout/stderr 原始数据转换为 MCP output 通知。"""
+        write_json_line(_notification("info", {"event": "output", **event}))
+
+    def on_completion(result: dict[str, Any]) -> None:
+        """把进程最终退出结果转换为独立 exited 通知。"""
+        write_json_line(_notification("info", {"event": "exited", **result}))
+
+    def on_error(event: dict[str, Any]) -> None:
+        """把异步生命周期错误转换为 MCP error 通知。"""
+        write_json_line(_notification("error", {"event": "error", **event}))
+
+    hooks = {
+        # stdout/stderr 数据到达时的内部回调。
+        "on_output": on_output,
+        # 进程完成时的内部回调。
+        "on_completion": on_completion,
+        # 异步生命周期错误的内部回调。
+        "on_error": on_error,
+    }
     for line in sys.stdin:
         try:
             request = json.loads(line)
-            response = handle_request(request)
+            response = handle_request(request, hooks=hooks)
             if response is not None:
-                sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
+                write_json_line(response)
         except json.JSONDecodeError:
-            sys.stdout.write(json.dumps(_error(-32700, "无效的 JSON。"), ensure_ascii=False) + "\n")
-            sys.stdout.flush()
+            write_json_line(_error(-32700, "无效的 JSON。"))
     return 0
 
 

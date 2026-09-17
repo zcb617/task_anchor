@@ -15,12 +15,13 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from task_anchor_logger import TaskAnchorLogger
 
@@ -508,7 +509,11 @@ def start_process(
     session_id: str | None = None,
     task_id: str | None = None,
     env: dict[str, str] | None = None,
+    on_output: Callable[[dict[str, Any]], None] | None = None,
+    on_completion: Callable[[dict[str, Any]], None] | None = None,
+    on_error: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    """启动并登记受管进程，输出和退出状态通过后台回调即时交付。"""
     platform_name = current_platform()
     normalized_cwd = normalize_path(cwd)
     if not Path(normalized_cwd).is_dir():
@@ -583,19 +588,16 @@ def start_process(
         },
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_handle = None
     popen_kwargs: dict[str, Any] = {
         "cwd": normalized_cwd,
         "shell": shell,
         "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
         "env": env,
     }
     popen_kwargs.update(launch_options)
-
     try:
-        log_handle = log_path.open("ab")
-        popen_kwargs["stdout"] = log_handle
-        popen_kwargs["stderr"] = subprocess.STDOUT
         process = subprocess.Popen(popen_args, **popen_kwargs)
         logger.info("spawn_succeeded", {"pid": process.pid})
     except (OSError, ValueError) as exc:
@@ -608,9 +610,6 @@ def start_process(
             },
         )
         raise ResourceError(f"启动命令失败：{exc}；诊断日志：{diagnostic_log_path}") from exc
-    finally:
-        if log_handle is not None:
-            log_handle.close()
     _LIVE_PROCESSES[process.pid] = process
 
     record = {
@@ -636,13 +635,13 @@ def start_process(
         "args": normalized_args,
         # 展示命令。
         "command": display_command,
-        # 操作系统 PID。
+        # 操作系统进程 ID。
         "pid": process.pid,
         # UTC 启动时间。
         "started_at": utc_now(),
         # Unix 启动时间戳。
         "started_at_epoch": time.time(),
-        # 停止策略。
+        # Stop 时清理或保留的策略。
         "stop_policy": normalized_policy,
         # keep 资源名称。
         "name": normalized_name,
@@ -661,7 +660,79 @@ def start_process(
             _save_records(normalized_cwd, records)
     except (OSError, ResourceError) as exc:
         logger.warning("ledger_write_failed", {"run_id": run_id, "error": str(exc)})
+        try:
+            _terminate_pid(process.pid)
+        except (OSError, ResourceError, subprocess.SubprocessError) as termination_error:
+            logger.warning("ledger_write_failed", {"run_id": run_id, "error": str(termination_error)})
         raise
+
+    state_lock = threading.Lock()
+    output_lock = threading.Lock()
+    completion_event = threading.Event()
+    state: dict[str, Any] = {
+        # 进程和输出是否已完成。
+        "finished": False,
+        # 首次调用是否已经返回 running 快照。
+        "returned_running": False,
+        # 完成回调是否已经发送。
+        "completion_sent": False,
+        # 进程退出码和启动错误。
+        "completion": None,
+        # 最终业务结果。
+        "result": None,
+        # timeout 是否触发。
+        "timeout_triggered": False,
+        # 超时终止是否失败并需要保留账本。
+        "preserve_ledger": False,
+    }
+
+    def invoke_callback(callback: Callable[[dict[str, Any]], None] | None, event: dict[str, Any], name: str) -> None:
+        """安全调用后台生命周期回调，避免回调异常泄漏到工作线程。"""
+        if callback is None:
+            return
+        try:
+            callback(event)
+        except Exception as exc:  # 回调属于通知路径，不覆盖进程生命周期结果。
+            logger.warning(
+                "callback_failed",
+                {"callback": name, "error": str(exc)},
+            )
+
+    def read_output(stream_name: str, pipe: Any) -> None:
+        """持续读取单个输出管道，避免子进程因管道写满而阻塞。"""
+        try:
+            while True:
+                chunk = pipe.read(4096)
+                if not chunk:
+                    break
+                with output_lock:
+                    log_handle.write(chunk)
+                    log_handle.flush()
+                output = bytes(chunk).decode("utf-8", errors="replace")
+                invoke_callback(
+                    on_output,
+                    {
+                        # Task Anchor 分配的运行 ID。
+                        "run_id": run_id,
+                        # 被执行进程的操作系统 PID。
+                        "pid": process.pid,
+                        # 原始输出所属的流。
+                        "stream": stream_name,
+                        # 当前到达的数据块原始字符串。
+                        "output": output,
+                    },
+                    "on_output",
+                )
+        except Exception as exc:
+            logger.warning(
+                "output_read_failed",
+                {"run_id": run_id, "pid": process.pid, "stream": stream_name, "error": str(exc)},
+            )
+        finally:
+            try:
+                pipe.close()
+            except OSError:
+                pass
 
     def remove_completed_record() -> None:
         """在进程完成后移除账本记录并记录移除异常。"""
@@ -675,12 +746,132 @@ def start_process(
                 _save_records(normalized_cwd, records)
         except (OSError, ResourceError) as exc:
             logger.warning("ledger_remove_failed", {"run_id": run_id, "error": str(exc)})
-            raise
 
-    timeout_seconds = None if timeout_ms is None else max(0, timeout_ms) / 1000
-    try:
-        exit_code = process.wait(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
+    def build_final_result(completion: dict[str, Any]) -> dict[str, Any]:
+        """构造退出通知和同步结果共用的完整业务结果。"""
+        result: dict[str, Any] = {
+            # 受管运行唯一 ID。
+            "run_id": run_id,
+            # 操作系统进程 ID。
+            "pid": process.pid,
+            # 进程已经退出。
+            "status": "exited",
+            # 停止策略。
+            "stop_policy": normalized_policy,
+            # 展示命令。
+            "command": display_command,
+            # 规范化工作目录。
+            "cwd": normalized_cwd,
+            # 运行平台。
+            "platform": platform_name,
+            # 合并输出日志路径。
+            "log_path": str(log_path),
+            # 结构化生命周期诊断日志路径。
+            "diagnostic_log_path": str(diagnostic_log_path),
+            # 被执行程序的完整合并输出。
+            "output": _read_log(log_path),
+        }
+        if state["timeout_triggered"]:
+            # 是否因 timeout_ms 触发了整树终止。
+            result["timed_out"] = True
+        elif isinstance(completion.get("code"), int):
+            # 正常退出时返回进程退出码。
+            result["exit_code"] = completion["code"]
+        return result
+
+    timeout_timer: threading.Timer | None = None
+
+    def monitor_process() -> None:
+        """等待进程和两个输出读取器完成，再清账本并发送退出通知。"""
+        exit_code: int | None = None
+        wait_error: Exception | None = None
+        try:
+            exit_code = process.wait()
+        except Exception as exc:
+            wait_error = exc
+        for reader in readers:
+            reader.join()
+        with output_lock:
+            try:
+                log_handle.flush()
+            finally:
+                log_handle.close()
+        if timeout_timer is not None:
+            timeout_timer.cancel()
+        logger.info(
+            "process_exited",
+            {
+                "run_id": run_id,
+                "pid": process.pid,
+                "exit_code": exit_code,
+                "signal": None,
+            },
+        )
+        completion = {
+            # 进程退出码。
+            "code": exit_code,
+            # 等待进程时产生的生命周期错误。
+            "error": wait_error,
+        }
+        with state_lock:
+            state["completion"] = completion
+        if not state["preserve_ledger"]:
+            remove_completed_record()
+        _LIVE_PROCESSES.pop(process.pid, None)
+        final_result = build_final_result(completion)
+        with state_lock:
+            state["finished"] = True
+            state["result"] = final_result
+            should_notify = state["returned_running"] and not state["completion_sent"]
+            if should_notify:
+                state["completion_sent"] = True
+        if wait_error is not None:
+            invoke_callback(
+                on_error,
+                {
+                    # Task Anchor 分配的运行 ID。
+                    "run_id": run_id,
+                    # 被执行进程的操作系统 PID。
+                    "pid": process.pid,
+                    # 等待失败时账本仍记录运行状态。
+                    "status": "running",
+                    # 异步等待错误文本。
+                    "error": str(wait_error),
+                },
+                "on_error",
+            )
+        if should_notify:
+            invoke_callback(on_completion, final_result, "on_completion")
+        completion_event.set()
+
+    log_handle = log_path.open("ab")
+    readers = [
+        threading.Thread(
+            target=read_output,
+            args=("stdout", process.stdout),
+            name=f"task-anchor-{run_id}-stdout",
+            daemon=True,
+        ),
+        threading.Thread(
+            target=read_output,
+            args=("stderr", process.stderr),
+            name=f"task-anchor-{run_id}-stderr",
+            daemon=True,
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+    monitor = threading.Thread(
+        target=monitor_process,
+        name=f"task-anchor-{run_id}-monitor",
+        daemon=True,
+    )
+    monitor.start()
+
+    def terminate_on_timeout() -> None:
+        """超时后异步终止进程树，不阻塞 start_process 的首次响应。"""
+        with state_lock:
+            state["timeout_triggered"] = True
         logger.warning(
             "timeout_triggered",
             {"run_id": run_id, "pid": process.pid, "timeout_ms": timeout_ms},
@@ -699,47 +890,75 @@ def start_process(
                     "status": termination.get("status"),
                 },
             )
-            remove_completed_record()
         except (OSError, ResourceError, subprocess.SubprocessError) as exc:
             error_message = (
                 f"Task Anchor 超时停止 PID {process.pid} 失败：{exc}；"
                 f"资源账本已保留，可通过 operation=stop 重试。"
             )
+            with state_lock:
+                state["preserve_ledger"] = True
             logger.warning(
                 "timeout_stop_failed",
                 {"run_id": run_id, "pid": process.pid, "error": error_message},
             )
-            raise ResourceError(error_message) from exc
-        return {
-            "run_id": run_id,
-            "pid": process.pid,
-            "status": "exited",
-            "timed_out": True,
-            "stop_policy": normalized_policy,
-            "command": display_command,
-            "cwd": normalized_cwd,
-            "platform": platform_name,
-            "log_path": str(log_path),
-            "diagnostic_log_path": str(diagnostic_log_path),
-            "output": _read_log(log_path),
-        }
+            invoke_callback(
+                on_error,
+                {
+                    # Task Anchor 分配的运行 ID。
+                    "run_id": run_id,
+                    # 被执行进程的操作系统 PID。
+                    "pid": process.pid,
+                    # 超时终止失败时进程仍需显式停止。
+                    "timed_out": True,
+                    # 异步错误发生时账本仍记录运行状态。
+                    "status": "running",
+                    # 面向模型的错误文本。
+                    "error": error_message,
+                },
+                "on_error",
+            )
 
-    logger.info(
-        "process_exited",
-        {"run_id": run_id, "pid": process.pid, "exit_code": exit_code, "signal": None},
-    )
-    remove_completed_record()
-    _LIVE_PROCESSES.pop(process.pid, None)
+    timeout_timer: threading.Timer | None = None
+    if normalized_policy == STOP_POLICY_CLEANUP and timeout_ms is not None:
+        timeout_timer = threading.Timer(max(0, timeout_ms) / 1000, terminate_on_timeout)
+        timeout_timer.daemon = True
+        timeout_timer.start()
+
+    if process.poll() is not None:
+        completion_event.wait()
+        with state_lock:
+            completed_result = state["result"]
+            completed = state["completion"]
+        if completed and completed.get("error") is not None:
+            raise ResourceError(
+                f"启动命令失败：{completed['error']}；诊断日志：{diagnostic_log_path}"
+            )
+        return completed_result
+
+    with state_lock:
+        if state["finished"]:
+            return state["result"]
+        state["returned_running"] = True
     return {
+        # 受管运行唯一 ID。
         "run_id": run_id,
+        # 操作系统进程 ID。
         "pid": process.pid,
-        "status": "exited",
-        "exit_code": exit_code,
+        # 进程仍在运行。
+        "status": "running",
+        # 停止策略。
         "stop_policy": normalized_policy,
+        # 展示命令。
         "command": display_command,
+        # 规范化工作目录。
         "cwd": normalized_cwd,
+        # 运行平台。
+        "platform": platform_name,
+        # 合并输出日志路径。
         "log_path": str(log_path),
+        # 结构化生命周期诊断日志路径。
         "diagnostic_log_path": str(diagnostic_log_path),
+        # 返回快照时已经写入的完整日志。
         "output": _read_log(log_path),
     }
 

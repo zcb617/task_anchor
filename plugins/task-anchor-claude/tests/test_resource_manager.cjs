@@ -48,8 +48,8 @@ function windowsBatchEnvironment(directory) {
   return environment;
 }
 
-/** 启动一个不会自行退出的 Node 子进程，供停止和超时场景复用。 */
-function longRunningProcess(cwd, sessionId, options = {}) {
+/** 启动一个不会自行退出的 Node 子进程，返回立即可管理的 running 快照。 */
+async function longRunningProcess(cwd, sessionId, options = {}) {
   return manager.startProcess({
     cwd,
     program: process.execPath,
@@ -59,31 +59,77 @@ function longRunningProcess(cwd, sessionId, options = {}) {
   });
 }
 
-/** 发起永久命令后轮询资源账本，供生命周期停止测试取得运行资源。 */
-async function startBackgroundLongRunningResource(cwd, sessionId, options = {}) {
-  const completion = longRunningProcess(cwd, sessionId, options);
-  let startupError;
-  completion.catch((error) => {
-    startupError = error;
+/** 启动命令并等待内部 completion 回调，兼容瞬时 exited 与持续 running 两种快照。 */
+async function runToCompletion(options) {
+  let resolveCompletion;
+  let rejectCompletion;
+  const completion = new Promise((resolve, reject) => {
+    resolveCompletion = resolve;
+    rejectCompletion = reject;
   });
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
-    if (startupError) {
-      throw startupError;
-    }
-    const resources = manager.listProcesses({ cwd, sessionId });
-    if (resources.length > 0) {
-      return resources[resources.length - 1];
-    }
-    await delay(10);
+  const initial = await manager.startProcess({
+    ...options,
+    onCompletion: resolveCompletion,
+    onError: (event) => rejectCompletion(new Error(event.error)),
+  });
+  if (initial.status === "exited") {
+    return initial;
   }
-  throw new Error("永久命令未登记到资源账本。");
+  return completion;
 }
+
+/** 发起永久命令并确认首次调用返回 running，供生命周期停止测试取得资源。 */
+async function startBackgroundLongRunningResource(cwd, sessionId, options = {}) {
+  const resource = await longRunningProcess(cwd, sessionId, options);
+  if (resource.status !== "running") {
+    throw new Error("永久命令未返回 running 快照。");
+  }
+  return resource;
+}
+
+test("stdout and stderr callbacks arrive before completion with full output", async () => {
+  const testFixture = fixture();
+  const outputEvents = [];
+  let resolveCompletion;
+  let rejectCompletion;
+  const completion = new Promise((resolve, reject) => {
+    resolveCompletion = resolve;
+    rejectCompletion = reject;
+  });
+  try {
+    const initial = await manager.startProcess({
+      cwd: testFixture.workspace,
+      program: process.execPath,
+      args: [
+        "-e",
+        "process.stdout.write('out-1'); setTimeout(() => { process.stderr.write('err-2'); process.stdout.write('out-3'); }, 80)",
+      ],
+      timeoutMs: null,
+      sessionId: testFixture.sessionId,
+      onOutput: (event) => outputEvents.push(event),
+      onCompletion: resolveCompletion,
+      onError: (event) => rejectCompletion(new Error(event.error)),
+    });
+    assert.equal(initial.status, "running");
+    const result = await completion;
+    assert.equal(result.status, "exited");
+    assert.equal(result.exit_code, 0);
+    assert.equal(outputEvents.length >= 2, true);
+    assert.equal(outputEvents.every((event) => event.run_id === result.run_id), true);
+    assert.equal(outputEvents.every((event) => event.pid === result.pid), true);
+    assert.deepEqual(new Set(outputEvents.map((event) => event.stream)), new Set(["stdout", "stderr"]));
+    assert.equal(outputEvents.some((event) => event.output.includes("out-1")), true);
+    assert.equal(outputEvents.some((event) => event.output.includes("err-2")), true);
+    assert.equal(result.output, "out-1err-2out-3");
+  } finally {
+    testFixture.restore();
+  }
+});
 
 test("program and args preserve environment, cwd, and non-zero exit", async () => {
   const testFixture = fixture();
   try {
-    const result = await manager.startProcess({
+    const result = await runToCompletion({
       cwd: testFixture.workspace,
       program: process.execPath,
       args: ["-e", "process.stdout.write(process.cwd() + '|' + process.env.TASK_ANCHOR_NODE_TEST); process.exit(7)"],
@@ -129,7 +175,7 @@ test("windows .cmd programs work by absolute path and PATH command name", { skip
     fs.writeFileSync(batchPath, "@echo off\r\necho batch:%~1\r\n", "utf8");
     const environment = windowsBatchEnvironment(batchDirectory);
 
-    const direct = await manager.startProcess({
+    const direct = await runToCompletion({
       cwd: testFixture.workspace,
       program: batchPath,
       args: ["direct"],
@@ -139,7 +185,7 @@ test("windows .cmd programs work by absolute path and PATH command name", { skip
     assert.equal(direct.exit_code, 0);
     assert.equal(direct.output.trim(), "batch:direct");
 
-    const fromPath = await manager.startProcess({
+    const fromPath = await runToCompletion({
       cwd: testFixture.workspace,
       program: "managed-batch",
       args: ["path"],
@@ -180,7 +226,7 @@ test("legacy lock file does not block the new lock directory", async () => {
     assert.equal(fs.existsSync(newLock), false);
 
     manager.setActiveContext(testFixture.workspace, testFixture.sessionId, "legacy-lock-task");
-    resource = await manager.startProcess({
+    resource = await runToCompletion({
       cwd: testFixture.workspace,
       program: process.execPath,
       args: ["-e", "process.stdout.write('legacy-lock')"],
@@ -197,7 +243,7 @@ test("legacy lock file does not block the new lock directory", async () => {
 test("timeout ends the process tree and removes the ordinary resource", async () => {
   const testFixture = fixture();
   try {
-    const result = await manager.startProcess({
+    const result = await runToCompletion({
       cwd: testFixture.workspace,
       program: process.execPath,
       args: ["-e", "setInterval(() => {}, 1000)"],
@@ -233,7 +279,13 @@ test("timeout ends the process tree and removes the ordinary resource", async ()
 test("long-running cleanup command is terminated by timeout and ledger is cleared", async () => {
   const testFixture = fixture();
   try {
-    const resource = await longRunningProcess(testFixture.workspace, testFixture.sessionId, { timeoutMs: 60 });
+    const resource = await runToCompletion({
+      cwd: testFixture.workspace,
+      program: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      timeoutMs: 60,
+      sessionId: testFixture.sessionId,
+    });
     assert.equal(resource.status, "exited");
     assert.equal(resource.timed_out, true);
     assert.equal(manager.processAlive(resource.pid), false);
@@ -299,7 +351,7 @@ test("POSIX shell 禁止末尾 & 后台运行，普通命令等执行完，长�
       (error) => error instanceof manager.ResourceError,
     );
     // 普通短命令等执行完返回 exited 与输出。
-    const short = await manager.startProcess({
+    const short = await runToCompletion({
       cwd: testFixture.workspace,
       program: process.execPath,
       args: ["-e", "process.stdout.write('posix-ok'); process.exit(3)"],
@@ -309,7 +361,13 @@ test("POSIX shell 禁止末尾 & 后台运行，普通命令等执行完，长�
     assert.equal(short.exit_code, 3);
     assert.equal(short.output, "posix-ok");
     // 长跑命令 cleanup + 短 timeoutMs 被超时终止，账本清空。
-    const long = await longRunningProcess(testFixture.workspace, testFixture.sessionId, { timeoutMs: 60 });
+    const long = await runToCompletion({
+      cwd: testFixture.workspace,
+      program: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      timeoutMs: 60,
+      sessionId: testFixture.sessionId,
+    });
     assert.equal(long.status, "exited");
     assert.equal(long.timed_out, true);
     assert.equal(manager.processAlive(long.pid), false);

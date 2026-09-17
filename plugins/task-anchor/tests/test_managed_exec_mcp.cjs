@@ -33,6 +33,24 @@ function fixture() {
   };
 }
 
+/** 调用 MCP 工具并等待异步退出通知，兼容初始 running 快照。 */
+async function runToCompletion(argumentsObject) {
+  let resolveCompletion;
+  let rejectCompletion;
+  const completion = new Promise((resolve, reject) => {
+    resolveCompletion = resolve;
+    rejectCompletion = reject;
+  });
+  const initial = await mcp.executeTool(argumentsObject, {
+    onCompletion: resolveCompletion,
+    onError: (event) => rejectCompletion(new Error(event.error)),
+  });
+  if (initial.status === "exited") {
+    return initial;
+  }
+  return completion;
+}
+
 test("initialize, ping, tools/list, and notifications follow JSON-RPC contract", async () => {
   const initialize = mcp.handleRequest({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
   assert.equal(initialize.result.serverInfo.name, "task-anchor");
@@ -64,10 +82,55 @@ test("tool errors stay in structured content and do not terminate the service", 
   assert.deepEqual(mcp.handleRequest({ jsonrpc: "2.0", id: 5, method: "ping" }).result, {});
 });
 
+test("tools/call returns running first and emits output and exited notifications", async () => {
+  const testFixture = fixture();
+  const outputEvents = [];
+  let resolveCompletion;
+  let rejectCompletion;
+  const completion = new Promise((resolve, reject) => {
+    resolveCompletion = resolve;
+    rejectCompletion = reject;
+  });
+  try {
+    const initial = await mcp.executeTool(
+      {
+        program: process.execPath,
+        args: [
+          "-e",
+          "process.stdout.write('mcp-out'); setTimeout(() => process.stderr.write('mcp-err'), 80)",
+        ],
+        cwd: testFixture.workspace,
+        timeout_ms: null,
+        session_id: testFixture.sessionId,
+      },
+      {
+        onOutput: (event) => outputEvents.push(event),
+        onCompletion: resolveCompletion,
+        onError: (event) => rejectCompletion(new Error(event.error)),
+      },
+    );
+    assert.equal(initial.status, "running");
+    const result = await completion;
+    assert.equal(result.status, "exited");
+    assert.equal(result.exit_code, 0);
+    assert.equal(outputEvents.some((event) => event.output.includes("mcp-out")), true);
+    assert.equal(outputEvents.some((event) => event.output.includes("mcp-err")), true);
+    const notification = mcp.createNotification("info", {
+      event: "output",
+      ...outputEvents[0],
+    });
+    assert.equal(notification.method, "notifications/message");
+    assert.equal(Object.hasOwn(notification, "id"), false);
+    assert.equal(notification.params.data.output, outputEvents[0].output);
+  } finally {
+    testFixture.restore();
+  }
+});
+
 test("tools/call preserves program args, shell command, and environment", async () => {
   const testFixture = fixture();
   try {
-    const direct = await mcp.executeTool({
+    const direct = await runToCompletion({
       program: process.execPath,
       args: ["-e", "process.stdout.write(process.env.TASK_ANCHOR_MCP_TEST)"],
       cwd: testFixture.workspace,
@@ -78,7 +141,7 @@ test("tools/call preserves program args, shell command, and environment", async 
     assert.equal(direct.output, "direct");
     assert.equal(typeof direct.diagnostic_log_path, "string");
 
-    const shell = await mcp.executeTool({
+    const shell = await runToCompletion({
       command: process.platform === "win32" ? "echo shell" : "printf shell",
       shell: true,
       cwd: testFixture.workspace,
@@ -105,7 +168,7 @@ test("tools/call returns the stable structured list and cleans timeout resources
       },
     });
     assert.deepEqual(listed.result.structuredContent, { resources: [] });
-    resource = await mcp.executeTool({
+    resource = await runToCompletion({
       program: process.execPath,
       args: ["-e", "setInterval(() => {}, 1000)"],
       cwd: testFixture.workspace,

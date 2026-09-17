@@ -582,75 +582,156 @@ function removeRecord(cwd, runId) {
   });
 }
 
-/** 将 Node child close/error 事件及合并日志刷新转换为可等待的受管完成状态。 */
-function trackProcess(child, logStream = null, logger = null) {
-  const completion = new Promise((resolve) => {
-    let settled = false;
-    let processFinished = false;
-    let outputFinished = logStream === null;
-    let outputError = null;
-    let result = null;
-    const finish = () => {
-      if (!processFinished || !outputFinished || settled) {
-        return;
+/** 将 Node child 的 stdout/stderr 数据即时写入日志并转换为可等待的受管完成状态。 */
+function trackProcess(child, logStream = null, logger = null, runId = null, onOutput = null) {
+  let processFinished = false;
+  let outputFinished = logStream === null;
+  let outputError = null;
+  let result = null;
+  let settled = false;
+  let remainingStreams = 0;
+  const streams = [];
+
+  // 安全调用内部回调，避免模型通知失败破坏进程生命周期线程。
+  const invokeCallback = (callback, event, callbackName) => {
+    if (typeof callback !== "function") {
+      return;
+    }
+    try {
+      const callbackResult = callback(event);
+      if (callbackResult && typeof callbackResult.catch === "function") {
+        callbackResult.catch((error) => {
+          if (logger) {
+            logger.warning("callback_failed", {
+              callback: callbackName,
+              error: error && error.message ? error.message : String(error),
+            });
+          }
+        });
       }
-      settled = true;
-      resolve(result);
-    };
-    const finishOutput = () => {
-      if (outputFinished) {
-        finish();
-        return;
+    } catch (error) {
+      if (logger) {
+        logger.warning("callback_failed", {
+          callback: callbackName,
+          error: error && error.message ? error.message : String(error),
+        });
       }
-      outputFinished = true;
-      if (logStream) {
-        logStream.end(() => finish());
-      } else {
-        finish();
-      }
-    };
+    }
+  };
+  const finish = () => {
+    if (!processFinished || !outputFinished || settled) {
+      return;
+    }
+    settled = true;
+    resolveCompletion(result);
+  };
+  const finishOutput = () => {
+    if (outputFinished) {
+      finish();
+      return;
+    }
+    outputFinished = true;
     if (logStream) {
-      logStream.once("error", (error) => {
+      logStream.end(() => finish());
+    } else {
+      finish();
+    }
+  };
+  const handleStreamEnd = () => {
+    remainingStreams -= 1;
+    if (remainingStreams <= 0) {
+      finishOutput();
+    }
+  };
+  const handleStream = (stream, streamName) => {
+    if (!stream) {
+      return;
+    }
+    remainingStreams += 1;
+    stream.setEncoding("utf8");
+    stream.on("data", (output) => {
+      const rawOutput = String(output);
+      try {
+        if (logStream && !outputFinished) {
+          logStream.write(rawOutput);
+        }
+      } catch (error) {
         outputError = error;
-        outputFinished = true;
-        finish();
+      }
+      invokeCallback(
+        onOutput,
+        {
+          // Task Anchor 分配的运行 ID。
+          run_id: runId,
+          // 被执行进程的操作系统 PID。
+          pid: Number.isInteger(child.pid) ? child.pid : null,
+          // 原始输出所属的流。
+          stream: streamName,
+          // 当前到达的数据块原始字符串。
+          output: rawOutput,
+        },
+        "onOutput",
+      );
+    });
+    stream.once("end", handleStreamEnd);
+    stream.once("error", (error) => {
+      outputError = error;
+      handleStreamEnd();
+    });
+  };
+
+  let resolveCompletion;
+  const completion = new Promise((resolve) => {
+    resolveCompletion = resolve;
+  });
+  if (logStream) {
+    logStream.once("error", (error) => {
+      outputError = error;
+      outputFinished = true;
+      finish();
+    });
+  }
+  handleStream(child.stdout, "stdout");
+  handleStream(child.stderr, "stderr");
+  if (remainingStreams === 0) {
+    finishOutput();
+  }
+  child.once("error", (error) => {
+    if (processFinished) {
+      return;
+    }
+    processFinished = true;
+    if (logger) {
+      logger.warning("spawn_failed", {
+        error: error && error.message ? error.message : String(error),
+        ...(error && error.code ? { code: error.code } : {}),
       });
     }
-    child.once("error", (error) => {
-      if (processFinished) {
-        return;
-      }
-      processFinished = true;
-      if (logger) {
-        logger.warning("spawn_failed", {
-          error: error && error.message ? error.message : String(error),
-          ...(error && error.code ? { code: error.code } : {}),
-        });
-      }
-      result = { code: null, signal: null, error: error || outputError };
-      finishOutput();
-    });
-    child.once("close", (code, signal) => {
-      if (processFinished) {
-        return;
-      }
-      processFinished = true;
-      if (logger) {
-        logger.info("process_exited", {
-          pid: Number.isInteger(child.pid) ? child.pid : null,
-          exit_code: code,
-          signal: signal || null,
-        });
-      }
-      result = { code, signal, error: outputError };
-      finishOutput();
-    });
+    result = { code: null, signal: null, error: error || outputError };
+    finishOutput();
+  });
+  child.once("close", (code, signal) => {
+    if (processFinished) {
+      return;
+    }
+    processFinished = true;
+    if (logger) {
+      logger.info("process_exited", {
+        pid: Number.isInteger(child.pid) ? child.pid : null,
+        exit_code: code,
+        signal: signal || null,
+      });
+    }
+    result = { code, signal, error: outputError };
+    finishOutput();
   });
   const entry = {
     // 被跟踪的 Node 子进程对象。
     child,
     // 子进程关闭且 stdout/stderr 日志刷新后的完成 Promise。
     completion,
+    // 判断首次响应快照时进程和输出是否都已完成。
+    isFinished: () => processFinished && outputFinished,
   };
   if (Number.isInteger(child.pid)) {
     LIVE_PROCESSES.set(child.pid, entry);
@@ -712,6 +793,9 @@ async function startProcess({
   sessionId = null,
   taskId = null,
   env = undefined,
+  onOutput = null,
+  onCompletion = null,
+  onError = null,
 }) {
   const platformName = currentPlatform();
   const normalizedCwd = normalizePath(cwd);
@@ -832,7 +916,7 @@ async function startProcess({
     if (child.stderr) {
       child.stderr.pipe(logStream, { end: false });
     }
-    const tracked = trackProcess(child, logStream, logger);
+    const tracked = trackProcess(child, logStream, logger, runId, onOutput);
 
     const record = {
       // 资源记录格式版本。
@@ -903,125 +987,200 @@ async function startProcess({
 
     let timer = null;
     let timeoutTriggered = false;
-    // 超时终止失败的可观察错误信息，失败时保留账本供后续 stop 重试。
     let timeoutFailureMessage = null;
-    let timeoutPromise = null;
-    const removeOnCompletion = tracked.completion.then(async (completion) => {
+    let preserveLedgerOnTimeoutFailure = false;
+    let initialSnapshotReturned = false;
+
+    // 构造统一的最终退出结果，保证通知和同步返回使用同一字段语义。
+    const buildFinalResult = (completion) => {
+      const result = {
+        // 受管运行唯一 ID。
+        run_id: runId,
+        // 操作系统进程 ID。
+        pid: child.pid,
+        // 进程已经退出。
+        status: "exited",
+        // 停止策略。
+        stop_policy: normalizedPolicy,
+        // 展示命令。
+        command: displayCommand,
+        // 规范化工作目录。
+        cwd: normalizedCwd,
+        // 运行平台。
+        platform: platformName,
+        // 合并输出日志路径。
+        log_path: logPath,
+        // 结构化生命周期诊断日志路径。
+        diagnostic_log_path: diagnosticLogPath,
+        // 被执行进程的合并输出。
+        output: readLog(logPath),
+      };
+      if (timeoutTriggered) {
+        // 是否因 timeout_ms 触发了整树终止。
+        result.timed_out = true;
+      } else if (completion && Number.isInteger(completion.code)) {
+        // 正常退出时返回进程退出码。
+        result.exit_code = completion.code;
+      }
+      return result;
+    };
+    const emitError = (errorMessage, timedOut = timeoutTriggered) => {
+      if (typeof onError !== "function") {
+        return;
+      }
+      try {
+        const callbackResult = onError({
+          // Task Anchor 分配的运行 ID。
+          run_id: runId,
+          // 被执行进程的操作系统 PID。
+          pid: child.pid,
+          // 超时是否已经触发。
+          timed_out: timedOut,
+          // 异步错误发生时进程仍由账本管理。
+          status: "running",
+          // 面向模型的错误文本。
+          error: errorMessage,
+        });
+        if (callbackResult && typeof callbackResult.catch === "function") {
+          callbackResult.catch(() => {});
+        }
+      } catch (callbackError) {
+        logger.warning("callback_failed", {
+          callback: "onError",
+          error: callbackError && callbackError.message
+            ? callbackError.message
+            : String(callbackError),
+        });
+      }
+    };
+
+    // 完成链独立运行，只负责超时器、账本和最终状态，不阻塞首次响应。
+    const completionTask = tracked.completion.then((completion) => {
       if (timer !== null) {
         clearTimeout(timer);
         timer = null;
       }
-      try {
-        removeRecord(normalizedCwd, runId);
-      } catch (error) {
-        logger.warning("ledger_remove_failed", {
-          run_id: runId,
-          error: error && error.message ? error.message : String(error),
-        });
+      if (!preserveLedgerOnTimeoutFailure) {
+        try {
+          removeRecord(normalizedCwd, runId);
+        } catch (error) {
+          logger.warning("ledger_remove_failed", {
+            run_id: runId,
+            error: error && error.message ? error.message : String(error),
+          });
+        }
       }
-      return completion;
+      const finalResult = buildFinalResult(completion);
+      if (completion && completion.error) {
+        emitError(
+          `启动命令失败：${completion.error.message}；诊断日志：${diagnosticLogPath}`,
+          timeoutTriggered,
+        );
+      }
+      if (initialSnapshotReturned && typeof onCompletion === "function") {
+        try {
+          const callbackResult = onCompletion(finalResult);
+          if (callbackResult && typeof callbackResult.catch === "function") {
+            callbackResult.catch(() => {});
+          }
+        } catch (error) {
+          logger.warning("callback_failed", {
+            callback: "onCompletion",
+            error: error && error.message ? error.message : String(error),
+          });
+        }
+      }
+      return { completion, finalResult };
+    }).catch((error) => {
+      const message = error && error.message ? error.message : String(error);
+      emitError(`启动命令完成处理失败：${message}`);
+      return { completion: { error }, finalResult: null };
     });
 
+    // 超时计时器只触发独立终止，不等待 close，也不改变首次返回时机。
     if (normalizedPolicy === STOP_POLICY_CLEANUP && timeoutMs !== null) {
-      timeoutPromise = new Promise((resolve) => {
-        timer = setTimeout(() => {
-          timeoutTriggered = true;
-          logger.warning("timeout_triggered", {
-            run_id: runId,
-            pid: child.pid,
-            timeout_ms: timeoutMs,
-          });
-          (async () => {
-            try {
-              const termination = await terminatePid(child.pid);
-              if (
-                !termination ||
-                !["stopped", "already_stopped"].includes(termination.status)
-              ) {
-                timeoutFailureMessage =
-                  `Task Anchor 超时停止 PID ${child.pid} 未确认终止，资源账本已保留，可通过 operation=stop 重试。`;
-                logger.warning("timeout_stop_failed", {
-                  run_id: runId,
-                  pid: child.pid,
-                  error: timeoutFailureMessage,
-                });
-              } else {
-                logger.info("timeout_stop_succeeded", {
-                  run_id: runId,
-                  pid: child.pid,
-                  status: termination.status,
-                });
-                try {
-                  removeRecord(normalizedCwd, runId);
-                } catch (error) {
-                  logger.warning("ledger_remove_failed", {
-                    run_id: runId,
-                    error: error && error.message ? error.message : String(error),
-                  });
-                }
-              }
-            } catch (error) {
+      timer = setTimeout(() => {
+        timeoutTriggered = true;
+        logger.warning("timeout_triggered", {
+          run_id: runId,
+          pid: child.pid,
+          timeout_ms: timeoutMs,
+        });
+        (async () => {
+          try {
+            const termination = await terminatePid(child.pid);
+            if (
+              !termination ||
+              !["stopped", "already_stopped"].includes(termination.status)
+            ) {
               timeoutFailureMessage =
-                `Task Anchor 超时停止 PID ${child.pid} 失败：${error.message}；资源账本已保留，可通过 operation=stop 重试。`;
+                `Task Anchor 超时停止 PID ${child.pid} 未确认终止，资源账本已保留，可通过 operation=stop 重试。`;
+              preserveLedgerOnTimeoutFailure = true;
               logger.warning("timeout_stop_failed", {
                 run_id: runId,
                 pid: child.pid,
-                error: error && error.message ? error.message : String(error),
+                error: timeoutFailureMessage,
               });
-            } finally {
-              timer = null;
-              resolve();
+              emitError(timeoutFailureMessage, true);
+            } else {
+              logger.info("timeout_stop_succeeded", {
+                run_id: runId,
+                pid: child.pid,
+                status: termination.status,
+              });
             }
-          })();
-        }, timeoutMs);
-      });
+          } catch (error) {
+            timeoutFailureMessage =
+              `Task Anchor 超时停止 PID ${child.pid} 失败：${error.message}；资源账本已保留，可通过 operation=stop 重试。`;
+            preserveLedgerOnTimeoutFailure = true;
+            logger.warning("timeout_stop_failed", {
+              run_id: runId,
+              pid: child.pid,
+              error: error && error.message ? error.message : String(error),
+            });
+            emitError(timeoutFailureMessage, true);
+          } finally {
+            timer = null;
+          }
+        })().catch((error) => {
+          emitError(`Task Anchor 超时处理失败：${error.message}`, true);
+        });
+      }, timeoutMs);
     }
 
-    let completion;
-    if (timeoutPromise) {
-      const racedCompletion = await Promise.race([removeOnCompletion, timeoutPromise]);
-      if (racedCompletion === undefined) {
-        if (timeoutFailureMessage) {
-          throw new ResourceError(timeoutFailureMessage);
-        }
-        completion = await waitWithTimeout(removeOnCompletion, 10000);
-      } else {
-        completion = racedCompletion;
+    // 只检查一次初始快照：已完成命令直接返回 exited，否则立即返回 running。
+    if (tracked.isFinished()) {
+      const completed = await completionTask;
+      if (completed.finalResult && completed.completion && completed.completion.error) {
+        throw new ResourceError(
+          `启动命令失败：${completed.completion.error.message}；诊断日志：${diagnosticLogPath}`,
+        );
       }
-    } else {
-      completion = await removeOnCompletion;
+      return completed.finalResult;
     }
-    if (completion && completion.error) {
-      throw new ResourceError(
-        `启动命令失败：${completion.error.message}；诊断日志：${diagnosticLogPath}`,
-      );
-    }
-    const result = {
+    initialSnapshotReturned = true;
+    return {
       // 受管运行唯一 ID。
       run_id: runId,
       // 操作系统进程 ID。
       pid: child.pid,
-      // 进程已经退出。
-      status: "exited",
+      // 进程仍在运行。
+      status: "running",
       // 停止策略。
       stop_policy: normalizedPolicy,
       // 展示命令。
       command: displayCommand,
       // 规范化工作目录。
       cwd: normalizedCwd,
+      // 运行平台。
+      platform: platformName,
       // 合并输出日志路径。
       log_path: logPath,
       // 结构化生命周期诊断日志路径。
       diagnostic_log_path: diagnosticLogPath,
-      // 被执行进程的合并输出。
+      // 返回快照时已经写入的完整日志。
       output: readLog(logPath),
     };
-    if (timeoutTriggered) {
-      result.timed_out = true;
-    } else if (completion && Number.isInteger(completion.code)) {
-      result.exit_code = completion.code;
-    }
-    return result;
   } catch (error) {
     if (logStream !== null && child === null) {
       try {

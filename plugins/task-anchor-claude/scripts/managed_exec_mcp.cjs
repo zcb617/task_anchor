@@ -248,7 +248,7 @@ function requireCwd(argumentsObject) {
 }
 
 /** 执行 managed_exec 的业务操作并返回结构化结果。 */
-async function executeTool(argumentsObject) {
+async function executeTool(argumentsObject, hooks = {}) {
   if (!argumentsObject || typeof argumentsObject !== "object" || Array.isArray(argumentsObject)) {
     throw new resourceManager.ResourceError("工具参数必须是对象。");
   }
@@ -286,6 +286,12 @@ async function executeTool(argumentsObject) {
       name: argumentsObject.name,
       // 子进程环境变量。
       env: argumentsObject.env,
+      // stdout/stderr 数据到达时的内部通知回调。
+      onOutput: hooks.onOutput,
+      // 进程完成时的内部通知回调。
+      onCompletion: hooks.onCompletion,
+      // 异步生命周期错误的内部通知回调。
+      onError: hooks.onError,
     });
   }
   if (operation === "stop") {
@@ -318,7 +324,7 @@ function errorResponse(code, message, requestId = null) {
 }
 
 /** 处理一条 JSON-RPC 请求，通知请求按协议不返回响应。 */
-function handleRequest(request) {
+function handleRequest(request, hooks = {}) {
   if (!request || typeof request !== "object" || Array.isArray(request)) {
     return errorResponse(-32600, "无效的 JSON-RPC 请求。");
   }
@@ -375,7 +381,7 @@ function handleRequest(request) {
       return errorResponse(-32602, "未知的工具。", requestId);
     }
     const argumentsObject = parameters.arguments === undefined ? {} : parameters.arguments;
-    return executeTool(argumentsObject)
+    return executeTool(argumentsObject, hooks)
       .then((result) => ({ jsonrpc: "2.0", id: requestId, result: toolResult(result) }))
       .catch((error) => ({
         jsonrpc: "2.0",
@@ -386,23 +392,62 @@ function handleRequest(request) {
   return errorResponse(-32601, `不支持的方法：${method}`, requestId);
 }
 
-/** 读取 stdin 的一行 JSON-RPC，并将响应仅写入 stdout。 */
+/** 构造标准 MCP notifications/message 生命周期通知。 */
+function createNotification(level, data) {
+  return {
+    // JSON-RPC 协议版本。
+    jsonrpc: "2.0",
+    // MCP 服务端主动通知方法。
+    method: "notifications/message",
+    // 通知级别、日志器和业务事件数据。
+    params: { level, logger: "managed_exec", data },
+  };
+}
+
+/** 读取 stdin 的一行 JSON-RPC，并即时写出初始响应和生命周期通知。 */
 async function main() {
   const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   const pending = new Set();
+  // 所有 JSON 行共用同一写出队列，避免异步回调交叉写入半行内容。
+  let outputChain = Promise.resolve();
+  const writeJsonLine = (value) => {
+    outputChain = outputChain
+      .then(() => new Promise((resolve) => {
+        try {
+          process.stdout.write(`${JSON.stringify(value)}\n`, () => resolve());
+        } catch (error) {
+          resolve();
+        }
+      }))
+      .catch(() => {});
+    return outputChain;
+  };
+  const writeNotification = (level, data) => writeJsonLine(createNotification(level, data));
+  const hooks = {
+    // stdout/stderr 数据到达时立即发送 MCP output 通知。
+    onOutput: (event) => {
+      writeNotification("info", { event: "output", ...event });
+    },
+    // 进程退出后发送独立的 exited 通知。
+    onCompletion: (result) => {
+      writeNotification("info", { event: "exited", ...result });
+    },
+    // 异步生命周期错误通过 error 通知交付模型。
+    onError: (event) => {
+      writeNotification("error", { event: "error", ...event });
+    },
+  };
   for await (const line of input) {
     let response;
     try {
-      response = handleRequest(JSON.parse(line));
+      response = handleRequest(JSON.parse(line), hooks);
     } catch (error) {
       response = errorResponse(-32700, "无效的 JSON。");
     }
     if (response === null) {
       continue;
     }
-    const responsePromise = Promise.resolve(response).then((resolved) => {
-      process.stdout.write(`${JSON.stringify(resolved)}\n`);
-    });
+    const responsePromise = Promise.resolve(response).then((resolved) => writeJsonLine(resolved));
     pending.add(responsePromise);
     responsePromise.finally(() => pending.delete(responsePromise));
   }
@@ -421,6 +466,7 @@ module.exports = {
   requireCwd,
   executeTool,
   errorResponse,
+  createNotification,
   handleRequest,
   main,
 };
