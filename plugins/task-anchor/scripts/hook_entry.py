@@ -36,6 +36,7 @@ WRITE_SKILL_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_-])\$task-anchor-write(?![A-Za-z0-9_-])"
 )
 POST_COMPACT = "PostCompact"
+POST_COMPACT_DEFAULT_RELOAD_COUNT = 20
 # Codex 上下文压缩后提醒用户重新读取项目规则和最近对话。
 POST_COMPACT_CONTINUITY_REMINDER = (
     "你刚刚经历了上下文压缩，请立刻重新读取AGENTS.md规则文件，以及最近的20条和用户的对话内容。"
@@ -213,10 +214,39 @@ def warning(message: str) -> dict[str, Any]:
     return {"continue": True, "systemMessage": message}
 
 
+def read_post_compact_reload_count() -> int:
+    """读取 Codex PostCompact 提醒条数配置，异常时返回默认值。"""
+    try:
+        config_path = Path.home() / ".task_anchor" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError):
+        return POST_COMPACT_DEFAULT_RELOAD_COUNT
+    if not isinstance(config, dict):
+        return POST_COMPACT_DEFAULT_RELOAD_COUNT
+
+    reload_count = config.get("reloadCount")
+    if (
+        isinstance(reload_count, bool)
+        or not isinstance(reload_count, int)
+        or reload_count <= 0
+    ):
+        return POST_COMPACT_DEFAULT_RELOAD_COUNT
+    return reload_count
+
+
+def post_compact_continuity_reminder() -> str:
+    """按当前配置生成 Codex PostCompact 连续性提醒文本。"""
+    reload_count = read_post_compact_reload_count()
+    return (
+        "你刚刚经历了上下文压缩，请立刻重新读取AGENTS.md规则文件，以及最近的"
+        f"{reload_count}条和用户的对话内容。以确保工作的延续性和连贯性。"
+    )
+
+
 def post_compact_output(task_context: str | None = None) -> dict[str, Any]:
     """构造 Codex PostCompact 的连续性提醒及可选任务恢复上下文。"""
 
-    additional_context = POST_COMPACT_CONTINUITY_REMINDER
+    additional_context = post_compact_continuity_reminder()
     if task_context:
         additional_context = f"{additional_context}\n\n{task_context}"
     return {

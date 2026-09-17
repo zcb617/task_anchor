@@ -161,6 +161,64 @@ class ClaudeHookEntryTests(unittest.TestCase):
         )
         self.assertNotIn(instruction, rejected["hookSpecificOutput"]["additionalContext"])
 
+    def test_post_compact_uses_configured_reload_count_and_restores_task(self) -> None:
+        """验证 Claude Code PostCompact 使用配置条数并保留任务恢复正文。"""
+        self.config_path.write_text(
+            json.dumps({"excludeProjects": [], "reloadCount": 7}),
+            encoding="utf-8",
+        )
+        instruction = "使用配置条数恢复 Claude Code 当前任务"
+        self.assertIsNone(self.expand("task-anchor", instruction))
+        task_id = self.current_task_id()
+
+        restored = HOOK.handle_hook(
+            self.payload("PostCompact", trigger="auto"), self.data_root
+        )
+
+        self.assertIsNotNone(restored)
+        assert restored is not None
+        hook_output = restored["hookSpecificOutput"]
+        self.assertEqual(hook_output["hookEventName"], "PostCompact")
+        self.assertIsInstance(hook_output["additionalContext"], str)
+        context = hook_output["additionalContext"]
+        self.assertIn("最近的7条", context)
+        self.assertIn("CLAUDE.md", context)
+        self.assertIn(instruction, context)
+        self.assertIn(f"task_id: {task_id}", context)
+        self.assertIn("/task-anchor:task-anchor", context)
+
+    def test_post_compact_invalid_reload_count_uses_default(self) -> None:
+        """验证 Claude Code PostCompact 的非法条数回退默认值。"""
+        instruction = "非法配置仍恢复 Claude Code 当前任务"
+        self.assertIsNone(self.expand("task-anchor", instruction))
+        task_id = self.current_task_id()
+        invalid_configs = (
+            {"excludeProjects": []},
+            {"excludeProjects": [], "reloadCount": 0},
+            {"excludeProjects": [], "reloadCount": -1},
+            {"excludeProjects": [], "reloadCount": True},
+            {"excludeProjects": [], "reloadCount": 7.0},
+            {"excludeProjects": [], "reloadCount": "7"},
+        )
+
+        for config in invalid_configs:
+            with self.subTest(config=config):
+                self.config_path.write_text(json.dumps(config), encoding="utf-8")
+                restored = HOOK.handle_hook(
+                    self.payload("PostCompact", trigger="auto"), self.data_root
+                )
+
+                self.assertIsNotNone(restored)
+                assert restored is not None
+                hook_output = restored["hookSpecificOutput"]
+                self.assertEqual(hook_output["hookEventName"], "PostCompact")
+                self.assertIsInstance(hook_output["additionalContext"], str)
+                context = hook_output["additionalContext"]
+                self.assertIn("最近的20条", context)
+                self.assertIn("CLAUDE.md", context)
+                self.assertIn(instruction, context)
+                self.assertIn(f"task_id: {task_id}", context)
+
     def test_post_compact_without_anchor_emits_continuity_reminder(self) -> None:
         """验证没有锚定任务时仍向 Claude Code 注入固定连续性提醒。"""
         result = HOOK.handle_hook(

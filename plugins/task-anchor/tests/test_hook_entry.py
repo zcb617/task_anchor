@@ -12,6 +12,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -400,6 +401,63 @@ class HookEntryTests(unittest.TestCase):
         self.assertIn("自动完成状态无法验证", context)
         self.assertIn("不要求作答，不改变任务状态，也不阻断当前任务", context)
         self.assertNotIn("$task-anchor-end", context)
+
+    def test_post_compact_uses_configured_reload_count_and_restores_task(self) -> None:
+        """验证 Codex PostCompact 使用配置条数并保留任务恢复正文。"""
+        home = self.data_root / "home-reload-count"
+        config_path = home / ".task_anchor" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
+            json.dumps({"excludeProjects": [], "reloadCount": 7}),
+            encoding="utf-8",
+        )
+
+        task_prompt = "$task-anchor 使用配置条数恢复当前任务"
+        with patch.object(HOOK.Path, "home", return_value=home):
+            task_id = self.activate(task_prompt)
+            result = HOOK.handle_hook(self.post_compact(), self.data_root)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        hook_output = result["hookSpecificOutput"]
+        self.assertEqual(hook_output["hookEventName"], "PostCompact")
+        self.assertIsInstance(hook_output["additionalContext"], str)
+        context = hook_output["additionalContext"]
+        self.assertIn("最近的7条", context)
+        self.assertIn(task_prompt, context)
+        self.assertIn(f"task_id: {task_id}", context)
+
+    def test_post_compact_invalid_reload_count_uses_default(self) -> None:
+        """验证 Codex PostCompact 的缺失或非法条数回退默认值。"""
+        home = self.data_root / "home-invalid-reload-count"
+        config_path = home / ".task_anchor" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        task_prompt = "$task-anchor 非法配置仍恢复当前任务"
+
+        invalid_configs = (
+            {"excludeProjects": []},
+            {"excludeProjects": [], "reloadCount": 0},
+            {"excludeProjects": [], "reloadCount": -1},
+            {"excludeProjects": [], "reloadCount": True},
+            {"excludeProjects": [], "reloadCount": 7.0},
+            {"excludeProjects": [], "reloadCount": "7"},
+        )
+        with patch.object(HOOK.Path, "home", return_value=home):
+            task_id = self.activate(task_prompt)
+            for config in invalid_configs:
+                with self.subTest(config=config):
+                    config_path.write_text(json.dumps(config), encoding="utf-8")
+                    result = HOOK.handle_hook(self.post_compact(), self.data_root)
+
+                    self.assertIsNotNone(result)
+                    assert result is not None
+                    hook_output = result["hookSpecificOutput"]
+                    self.assertEqual(hook_output["hookEventName"], "PostCompact")
+                    self.assertIsInstance(hook_output["additionalContext"], str)
+                    context = hook_output["additionalContext"]
+                    self.assertIn("最近的20条", context)
+                    self.assertIn(task_prompt, context)
+                    self.assertIn(f"task_id: {task_id}", context)
 
     def test_post_compact_without_anchor_emits_continuity_reminder(self) -> None:
         """验证没有锚定任务时仍向 Codex 注入固定连续性提醒。"""
