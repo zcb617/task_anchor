@@ -910,12 +910,6 @@ async function startProcess({
         pid: Number.isInteger(child.pid) ? child.pid : null,
       });
     });
-    if (child.stdout) {
-      child.stdout.pipe(logStream, { end: false });
-    }
-    if (child.stderr) {
-      child.stderr.pipe(logStream, { end: false });
-    }
     const tracked = trackProcess(child, logStream, logger, runId, onOutput);
 
     const record = {

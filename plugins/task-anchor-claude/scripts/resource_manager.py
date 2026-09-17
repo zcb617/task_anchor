@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import platform
+import selectors
 import signal
 import subprocess
 import sys
@@ -698,41 +699,144 @@ def start_process(
                 {"callback": name, "error": str(exc)},
             )
 
+    def deliver_output(stream_name: str, chunk: bytes) -> None:
+        """将单个输出数据块按读取顺序写入日志并即时通知调用方。"""
+        with output_lock:
+            log_handle.write(chunk)
+            log_handle.flush()
+        output = bytes(chunk).decode("utf-8", errors="replace")
+        invoke_callback(
+            on_output,
+            {
+                # Task Anchor 分配的运行 ID。
+                "run_id": run_id,
+                # 被执行进程的操作系统 PID。
+                "pid": process.pid,
+                # 原始输出所属的流。
+                "stream": stream_name,
+                # 当前到达的数据块原始字符串。
+                "output": output,
+            },
+            "on_output",
+        )
+
+    def report_output_read_failure(stream_name: str, exc: Exception) -> None:
+        """记录指定输出流的读取异常，保证监控线程仍能完成生命周期收尾。"""
+        logger.warning(
+            "output_read_failed",
+            {"run_id": run_id, "pid": process.pid, "stream": stream_name, "error": str(exc)},
+        )
+
     def read_output(stream_name: str, pipe: Any) -> None:
-        """持续读取单个输出管道，避免子进程因管道写满而阻塞。"""
+        """在线程中读取单个输出管道，作为 Windows 管道选择器兼容路径。"""
         try:
             while True:
                 chunk = pipe.read(4096)
                 if not chunk:
                     break
-                with output_lock:
-                    log_handle.write(chunk)
-                    log_handle.flush()
-                output = bytes(chunk).decode("utf-8", errors="replace")
-                invoke_callback(
-                    on_output,
-                    {
-                        # Task Anchor 分配的运行 ID。
-                        "run_id": run_id,
-                        # 被执行进程的操作系统 PID。
-                        "pid": process.pid,
-                        # 原始输出所属的流。
-                        "stream": stream_name,
-                        # 当前到达的数据块原始字符串。
-                        "output": output,
-                    },
-                    "on_output",
-                )
+                deliver_output(stream_name, chunk)
         except Exception as exc:
-            logger.warning(
-                "output_read_failed",
-                {"run_id": run_id, "pid": process.pid, "stream": stream_name, "error": str(exc)},
-            )
+            report_output_read_failure(stream_name, exc)
         finally:
             try:
                 pipe.close()
-            except OSError:
+            except (OSError, ValueError):
                 pass
+
+    def read_outputs() -> None:
+        """统一读取 stdout/stderr，POSIX 按管道可读事件合并输出并保持先后顺序。"""
+        streams = (("stdout", process.stdout), ("stderr", process.stderr))
+        if platform_name == PLATFORM_WINDOWS:
+            readers = [
+                threading.Thread(
+                    target=read_output,
+                    args=(stream_name, pipe),
+                    name=f"task-anchor-{run_id}-{stream_name}",
+                    daemon=True,
+                )
+                for stream_name, pipe in streams
+            ]
+            for reader in readers:
+                reader.start()
+            for reader in readers:
+                reader.join()
+            return
+
+        selector: Any = None
+        registered: dict[str, Any] = {}
+        closed_streams: set[str] = set()
+
+        def unregister_and_close(stream_name: str, pipe: Any) -> None:
+            """注销并关闭指定输出管道，避免 EOF 或异常路径重复关闭。"""
+            if stream_name in registered:
+                try:
+                    selector.unregister(pipe)
+                except (KeyError, OSError, ValueError):
+                    pass
+                registered.pop(stream_name, None)
+            if stream_name not in closed_streams:
+                closed_streams.add(stream_name)
+                try:
+                    pipe.close()
+                except (OSError, ValueError):
+                    pass
+
+        try:
+            try:
+                selector = selectors.DefaultSelector()
+            except Exception as exc:
+                for stream_name, pipe in streams:
+                    if pipe is not None:
+                        report_output_read_failure(stream_name, exc)
+                        unregister_and_close(stream_name, pipe)
+                return
+
+            for stream_name, pipe in streams:
+                if pipe is None:
+                    continue
+                try:
+                    selector.register(pipe, selectors.EVENT_READ, data=stream_name)
+                    registered[stream_name] = pipe
+                except Exception as exc:
+                    report_output_read_failure(stream_name, exc)
+                    unregister_and_close(stream_name, pipe)
+
+            while registered:
+                try:
+                    events = selector.select()
+                except Exception as exc:
+                    for stream_name, pipe in list(registered.items()):
+                        report_output_read_failure(stream_name, exc)
+                        unregister_and_close(stream_name, pipe)
+                    break
+
+                for key, _ in events:
+                    stream_name = key.data
+                    pipe = registered.get(stream_name)
+                    if pipe is None:
+                        continue
+                    try:
+                        chunk = os.read(pipe.fileno(), 4096)
+                    except Exception as exc:
+                        report_output_read_failure(stream_name, exc)
+                        unregister_and_close(stream_name, pipe)
+                        continue
+                    if not chunk:
+                        unregister_and_close(stream_name, pipe)
+                        continue
+                    try:
+                        deliver_output(stream_name, chunk)
+                    except Exception as exc:
+                        report_output_read_failure(stream_name, exc)
+                        unregister_and_close(stream_name, pipe)
+        finally:
+            for stream_name, pipe in list(registered.items()):
+                unregister_and_close(stream_name, pipe)
+            if selector is not None:
+                try:
+                    selector.close()
+                except (OSError, ValueError):
+                    pass
 
     def remove_completed_record() -> None:
         """在进程完成后移除账本记录并记录移除异常。"""
@@ -782,15 +886,14 @@ def start_process(
     timeout_timer: threading.Timer | None = None
 
     def monitor_process() -> None:
-        """等待进程和两个输出读取器完成，再清账本并发送退出通知。"""
+        """等待进程和统一输出读取线程完成，再清账本并发送退出通知。"""
         exit_code: int | None = None
         wait_error: Exception | None = None
         try:
             exit_code = process.wait()
         except Exception as exc:
             wait_error = exc
-        for reader in readers:
-            reader.join()
+        output_reader.join()
         with output_lock:
             try:
                 log_handle.flush()
@@ -845,22 +948,12 @@ def start_process(
         completion_event.set()
 
     log_handle = log_path.open("ab")
-    readers = [
-        threading.Thread(
-            target=read_output,
-            args=("stdout", process.stdout),
-            name=f"task-anchor-{run_id}-stdout",
-            daemon=True,
-        ),
-        threading.Thread(
-            target=read_output,
-            args=("stderr", process.stderr),
-            name=f"task-anchor-{run_id}-stderr",
-            daemon=True,
-        ),
-    ]
-    for reader in readers:
-        reader.start()
+    output_reader = threading.Thread(
+        target=read_outputs,
+        name=f"task-anchor-{run_id}-output-reader",
+        daemon=True,
+    )
+    output_reader.start()
     monitor = threading.Thread(
         target=monitor_process,
         name=f"task-anchor-{run_id}-monitor",
