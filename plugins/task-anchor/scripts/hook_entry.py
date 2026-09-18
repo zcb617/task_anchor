@@ -1279,7 +1279,7 @@ def guard_pre_tool_use(
             "permissionDecision": "deny",
             "permissionDecisionReason": (
                 f"Process keyword {matched_keyword!r} requires "
-                "mcp__task_anchor__managed_exec."
+                "mcp__task_anchor__managed_exec. Start the process with operation \"run\"; afterwards, to read its output/logs, call operation \"output\" with the run_id returned by run and a positive integer \"lines\"."
             ),
         },
     }

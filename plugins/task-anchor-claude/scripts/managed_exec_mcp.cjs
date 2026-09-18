@@ -21,7 +21,7 @@ const TOOL_SCHEMA = {
       type: "string",
       enum: ["run", "stop", "list", "cleanup", "output"],
       default: "run",
-      description: "run 启动命令；stop 停止指定资源；list 查看登记；cleanup 清理默认资源；output 读取运行输出。",
+      description: "run 启动命令；stop 停止指定资源；list 查看登记；cleanup 清理默认资源；output 读取已启动进程的输出/日志。启动进程用 run；之后需要查看该进程输出或日志时用 output，并传 run 返回的 run_id 和正整数 lines。",
     },
     // 直接启动的可执行程序。
     program: { type: "string", description: "可执行程序，例如 npm、python、java。" },
@@ -49,11 +49,11 @@ const TOOL_SCHEMA = {
     // keep 资源用于显式 stop 的名称。
     name: { type: "string", description: "资源名称，便于后续 stop。" },
     // 显式停止目标资源的唯一 ID，output 操作按此读取日志。
-    run_id: { type: "string" },
+    run_id: { type: "string", description: "受管运行的唯一标识。output 操作必填，取 run 操作返回值中的 run_id；stop 操作按此指定目标。" },
     // output 操作读取末尾的日志行数，必须是正整数。
-    lines: { type: "integer", description: "output 操作必须提供的末尾日志行数。" },
+    lines: { type: "integer", description: "output 操作必填，读取进程合并输出日志末尾的行数，必须是正整数。" },
     // output 操作是否持续订阅后续日志输出。
-    follow: { type: "boolean", default: false, description: "是否持续接收进程后续输出。" },
+    follow: { type: "boolean", default: false, description: "仅对 output 操作有效，默认 false。为 true 且进程仍在运行时，持续接收该进程后续输出。" },
     // 当前任务标识。
     task_id: { type: "string", description: "通常不需要，默认从 Task Anchor 当前上下文解析。" },
     // stop 是否连 keep 资源一并停止。
