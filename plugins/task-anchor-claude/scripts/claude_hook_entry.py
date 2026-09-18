@@ -73,7 +73,8 @@ def handle_hook(
         return _handle_prompt_expansion(data, data_root)
     if event_name == SESSION_START:
         if data.get("source") == "compact":
-            return task_state.post_compact_continuity_reminder()
+            restore_result = task_state.restore_after_post_compact(data, data_root)
+            return task_state.post_compact_result_to_session_start_text(restore_result)
         return None
     if event_name == POST_COMPACT:
         return task_state.restore_after_post_compact(data, data_root)

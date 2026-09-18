@@ -261,6 +261,27 @@ def post_compact_warning(message: str) -> dict[str, Any]:
     return {**warning(message), **post_compact_output()}
 
 
+def post_compact_result_to_session_start_text(
+    result: dict[str, Any] | None,
+) -> str:
+    """将 PostCompact 恢复结果转换为 SessionStart 所需的纯文本注入。"""
+    if result is None:
+        return ""
+
+    text_parts: list[str] = []
+    system_message = result.get("systemMessage")
+    if isinstance(system_message, str) and system_message:
+        text_parts.append(system_message)
+
+    hook_output = result.get("hookSpecificOutput")
+    if isinstance(hook_output, dict):
+        additional_context = hook_output.get("additionalContext")
+        if isinstance(additional_context, str) and additional_context:
+            text_parts.append(additional_context)
+
+    return "\n\n".join(text_parts)
+
+
 def read_session_id(data: dict[str, Any]) -> str | None:
     value = data.get("session_id")
     return value if isinstance(value, str) and value else None
@@ -962,7 +983,10 @@ def restore_after_post_compact(
     data: dict[str, Any],
     data_root: Path | None,
 ) -> dict[str, Any] | None:
-    if data.get("trigger") not in {"auto", "manual"}:
+    """按原有边界校验恢复 PostCompact 或 SessionStart compact 的当前任务。"""
+    valid_post_compact_trigger = data.get("trigger") in {"auto", "manual"}
+    valid_session_start_source = data.get("source") == "compact"
+    if not (valid_post_compact_trigger or valid_session_start_source):
         write_audit_event(data_root, data, "post_compact_ignored_trigger")
         return post_compact_output()
     if data_root is None:

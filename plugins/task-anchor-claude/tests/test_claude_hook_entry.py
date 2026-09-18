@@ -187,12 +187,15 @@ class ClaudeHookEntryTests(unittest.TestCase):
         self.assertIn(f"task_id: {task_id}", context)
         self.assertIn("/task-anchor:task-anchor", context)
 
-    def test_session_start_compact_emits_continuity_reminder(self) -> None:
-        """验证 Claude Code 压缩后的 SessionStart 注入固定连续性提醒。"""
+    def test_session_start_compact_restores_complete_current_task_context(self) -> None:
+        """验证 SessionStart compact 注入连续性提醒和完整当前任务恢复内容。"""
         self.config_path.write_text(
             json.dumps({"excludeProjects": [], "reloadCount": 7}),
             encoding="utf-8",
         )
+        instruction = "SessionStart compact 恢复当前任务指令"
+        self.assertIsNone(self.expand("task-anchor", instruction))
+        task_id = self.current_task_id()
 
         result = HOOK.handle_hook(
             self.payload("SessionStart", source="compact"), self.data_root
@@ -202,7 +205,44 @@ class ClaudeHookEntryTests(unittest.TestCase):
         assert isinstance(result, str)
         self.assertIn("最近的7条", result)
         self.assertIn("CLAUDE.md", result)
-        self.assertEqual(result, STATE.post_compact_continuity_reminder())
+        self.assertIn("/task-anchor:task-anchor", result)
+        self.assertIn(f"task_id: {task_id}", result)
+        self.assertIn("status: 1", result)
+        self.assertIn("本提醒不要求作答", result)
+        self.assertIn("[最初任务指令]", result)
+        self.assertIn(instruction, result)
+
+    def test_session_start_compact_without_anchor_emits_only_continuity_reminder(self) -> None:
+        """验证 SessionStart compact 没有当前任务时仍只注入连续性提醒。"""
+        result = HOOK.handle_hook(
+            self.payload("SessionStart", source="compact"), self.data_root
+        )
+
+        self.assertIsInstance(result, str)
+        assert isinstance(result, str)
+        self.assertIn(STATE.POST_COMPACT_CONTINUITY_REMINDER, result)
+        self.assertNotIn("[最初任务指令]", result)
+        self.assertNotIn("task_id:", result)
+
+    def test_session_start_compact_boundary_warning_is_visible(self) -> None:
+        """验证 SessionStart compact 项目边界异常不会丢失 systemMessage 文本。"""
+        instruction = "只允许在原项目恢复的任务指令"
+        self.assertIsNone(self.expand("task-anchor", instruction))
+
+        result = HOOK.handle_hook(
+            self.payload(
+                "SessionStart",
+                source="compact",
+                cwd=str(self.other_workspace),
+            ),
+            self.data_root,
+        )
+
+        self.assertIsInstance(result, str)
+        assert isinstance(result, str)
+        self.assertIn("跨项目", result)
+        self.assertIn(STATE.POST_COMPACT_CONTINUITY_REMINDER, result)
+        self.assertNotIn(instruction, result)
 
     def test_session_start_non_compact_does_not_emit_continuity_reminder(self) -> None:
         """验证 Claude Code 非 compact 的 SessionStart 不注入连续性提醒。"""
