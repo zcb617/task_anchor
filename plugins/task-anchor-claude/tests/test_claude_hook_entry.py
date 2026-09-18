@@ -187,6 +187,34 @@ class ClaudeHookEntryTests(unittest.TestCase):
         self.assertIn(f"task_id: {task_id}", context)
         self.assertIn("/task-anchor:task-anchor", context)
 
+    def test_session_start_compact_emits_continuity_reminder(self) -> None:
+        """验证 Claude Code 压缩后的 SessionStart 注入固定连续性提醒。"""
+        self.config_path.write_text(
+            json.dumps({"excludeProjects": [], "reloadCount": 7}),
+            encoding="utf-8",
+        )
+
+        result = HOOK.handle_hook(
+            self.payload("SessionStart", source="compact"), self.data_root
+        )
+
+        self.assertIsInstance(result, str)
+        assert isinstance(result, str)
+        self.assertIn("最近的7条", result)
+        self.assertIn("CLAUDE.md", result)
+        self.assertEqual(result, STATE.post_compact_continuity_reminder())
+
+    def test_session_start_non_compact_does_not_emit_continuity_reminder(self) -> None:
+        """验证 Claude Code 非 compact 的 SessionStart 不注入连续性提醒。"""
+        for source in ("startup", None, "resume", 7):
+            with self.subTest(source=source):
+                extra = {} if source is None else {"source": source}
+                self.assertIsNone(
+                    HOOK.handle_hook(
+                        self.payload("SessionStart", **extra), self.data_root
+                    )
+                )
+
     def test_post_compact_invalid_reload_count_uses_default(self) -> None:
         """验证 Claude Code PostCompact 的非法条数回退默认值。"""
         instruction = "非法配置仍恢复 Claude Code 当前任务"
@@ -611,9 +639,22 @@ class ClaudePluginContractTests(unittest.TestCase):
         config = json.loads((PLUGIN_ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
         self.assertEqual(
             set(config["hooks"]),
-            {"UserPromptExpansion", "PostCompact", "PreToolUse", "Stop", "SessionEnd"},
+            {
+                "UserPromptExpansion",
+                "PostCompact",
+                "SessionStart",
+                "PreToolUse",
+                "Stop",
+                "SessionEnd",
+            },
         )
         self.assertEqual(config["hooks"]["PostCompact"][0]["matcher"], "auto|manual")
+        self.assertEqual(config["hooks"]["SessionStart"][0]["matcher"], "compact")
+        post_compact_startup = config["hooks"]["PostCompact"][0]["hooks"][0]
+        session_start_hook = config["hooks"]["SessionStart"][0]["hooks"][0]
+        self.assertEqual(session_start_hook["command"], post_compact_startup["command"])
+        self.assertEqual(session_start_hook["args"], post_compact_startup["args"])
+        self.assertEqual(session_start_hook["timeout"], post_compact_startup["timeout"])
         self.assertEqual(config["hooks"]["PreToolUse"][0]["matcher"], ".*")
         for name in (
             "task-anchor",

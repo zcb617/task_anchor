@@ -14,6 +14,7 @@ import task_state
 
 USER_PROMPT_EXPANSION = "UserPromptExpansion"
 POST_COMPACT = "PostCompact"
+SESSION_START = "SessionStart"
 PRE_TOOL_USE = "PreToolUse"
 STOP = "Stop"
 SESSION_END = "SessionEnd"
@@ -64,10 +65,16 @@ def _handle_prompt_expansion(
     )
 
 
-def handle_hook(data: dict[str, Any], data_root: Path | None) -> dict[str, Any] | None:
+def handle_hook(
+    data: dict[str, Any], data_root: Path | None
+) -> dict[str, Any] | str | None:
     event_name = data.get("hook_event_name")
     if event_name == USER_PROMPT_EXPANSION:
         return _handle_prompt_expansion(data, data_root)
+    if event_name == SESSION_START:
+        if data.get("source") == "compact":
+            return task_state.post_compact_continuity_reminder()
+        return None
     if event_name == POST_COMPACT:
         return task_state.restore_after_post_compact(data, data_root)
     if event_name == PRE_TOOL_USE:
@@ -94,7 +101,9 @@ def main() -> int:
     raw_data_root = os.environ.get("CLAUDE_PLUGIN_DATA")
     data_root = Path(raw_data_root) if raw_data_root else None
     payload = handle_hook(data, data_root)
-    if payload is not None:
+    if isinstance(payload, str):
+        sys.stdout.write(payload)
+    elif payload is not None:
         sys.stdout.write(json.dumps(payload, ensure_ascii=False))
     return 0
 
