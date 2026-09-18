@@ -19,9 +19,9 @@ const TOOL_SCHEMA = {
     // 资源业务操作：启动、停止、查询或清理。
     operation: {
       type: "string",
-      enum: ["run", "stop", "list", "cleanup"],
+      enum: ["run", "stop", "list", "cleanup", "output"],
       default: "run",
-      description: "run 启动命令；stop 停止指定资源；list 查看登记；cleanup 清理默认资源。",
+      description: "run 启动命令；stop 停止指定资源；list 查看登记；cleanup 清理默认资源；output 读取运行输出。",
     },
     // 直接启动的可执行程序。
     program: { type: "string", description: "可执行程序，例如 npm、python、java。" },
@@ -48,8 +48,12 @@ const TOOL_SCHEMA = {
     },
     // keep 资源用于显式 stop 的名称。
     name: { type: "string", description: "资源名称，便于后续 stop。" },
-    // 显式停止目标资源的唯一 ID。
+    // 显式停止目标资源的唯一 ID，output 操作按此读取日志。
     run_id: { type: "string" },
+    // output 操作读取末尾的日志行数，必须是正整数。
+    lines: { type: "integer", description: "output 操作必须提供的末尾日志行数。" },
+    // output 操作是否持续订阅后续日志输出。
+    follow: { type: "boolean", default: false, description: "是否持续接收进程后续输出。" },
     // 当前任务标识。
     task_id: { type: "string", description: "通常不需要，默认从 Task Anchor 当前上下文解析。" },
     // stop 是否连 keep 资源一并停止。
@@ -173,14 +177,29 @@ const TOOL_OUTPUT_SCHEMA = {
         cwd: { type: "string", description: "进程工作目录的规范化绝对路径。" },
         // 启动平台。
         platform: { type: "string", description: "进程运行平台；运行中可能返回。" },
-        // 输出日志路径。
-        log_path: { type: "string", description: "合并输出日志文件路径。" },
-        // 结构化生命周期诊断日志路径。
-        diagnostic_log_path: { type: "string", description: "结构化生命周期诊断日志文件路径。" },
         // 被执行程序产生的原始输出。
         output: { type: "string", description: "被执行程序写入 stdout 和 stderr 的原始合并文本。" },
       },
-      required: ["run_id", "pid", "status", "stop_policy", "command", "cwd", "log_path", "diagnostic_log_path"],
+      required: ["run_id", "pid", "status", "stop_policy", "command", "cwd"],
+      additionalProperties: false,
+    },
+    {
+      // output 操作的结果结构。
+      title: "output 操作结果",
+      type: "object",
+      properties: {
+        // Task Anchor 分配的运行 ID。
+        run_id: { type: "string", description: "受管运行的唯一标识。" },
+        // 当前进程状态。
+        status: { type: "string", enum: ["running", "exited"], description: "进程当前是否仍在运行。" },
+        // 日志末尾指定行数的文本。
+        output: { type: "string", description: "进程合并输出日志的末尾内容。" },
+        // 进程退出码，进程退出后提供。
+        exit_code: { type: "integer", description: "进程退出码。" },
+        // 是否已订阅后续输出通知。
+        follow: { type: "boolean", description: "是否持续接收后续输出。" },
+      },
+      required: ["run_id", "status", "output", "follow"],
       additionalProperties: false,
     },
     {
@@ -251,8 +270,8 @@ async function executeTool(argumentsObject, hooks = {}) {
     throw new resourceManager.ResourceError("工具参数必须是对象。");
   }
   const operation = argumentsObject.operation === undefined ? "run" : argumentsObject.operation;
-  if (!["run", "stop", "list", "cleanup"].includes(operation)) {
-    throw new resourceManager.ResourceError("operation 只能是 run、stop、list 或 cleanup。");
+  if (!["run", "stop", "list", "cleanup", "output"].includes(operation)) {
+    throw new resourceManager.ResourceError("operation 只能是 run、stop、list、cleanup 或 output。");
   }
   const cwd = requireCwd(argumentsObject);
   const common = {
@@ -291,6 +310,39 @@ async function executeTool(argumentsObject, hooks = {}) {
       // 异步生命周期错误的内部通知回调。
       onError: hooks.onError,
     });
+  }
+  if (operation === "output") {
+    if (!Object.prototype.hasOwnProperty.call(argumentsObject, "lines")
+      || !Number.isInteger(argumentsObject.lines) || argumentsObject.lines <= 0) {
+      throw new resourceManager.ResourceError("output 操作必须提供正整数 lines。");
+    }
+    if (typeof argumentsObject.run_id !== "string" || !argumentsObject.run_id.trim()) {
+      throw new resourceManager.ResourceError("output 操作必须提供 run_id。");
+    }
+    const record = resourceManager.findRecord(cwd, argumentsObject.run_id);
+    const owner = resourceManager.resolveOwner(cwd, argumentsObject.session_id, argumentsObject.task_id);
+    if (!record || !resourceManager.matchesOwner(record, owner.ownerKey, resourceManager.workspaceKey(cwd))) {
+      throw new resourceManager.ResourceError(`找不到 run_id 对应的受管进程：${argumentsObject.run_id}`);
+    }
+    const running = resourceManager.processAlive(Number(record.pid));
+    const result = {
+      // Task Anchor 分配的运行 ID。
+      run_id: argumentsObject.run_id,
+      // 当前进程状态。
+      status: running ? "running" : "exited",
+      // 日志末尾指定行数的文本。
+      output: resourceManager.readOutputLines(record.log_path, argumentsObject.lines),
+      // 是否已订阅后续输出通知。
+      follow: Boolean(argumentsObject.follow ?? false),
+    };
+    if (!running && Number.isInteger(record.exit_code)) {
+      // 账本存在退出码时向调用方返回退出码。
+      result.exit_code = record.exit_code;
+    }
+    if (result.follow && running) {
+      resourceManager.subscribeOutput(argumentsObject.run_id, hooks.onOutput);
+    }
+    return result;
   }
   if (operation === "stop") {
     return resourceManager.stopProcess({

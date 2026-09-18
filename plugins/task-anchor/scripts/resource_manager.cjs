@@ -29,6 +29,8 @@ const LOCK_RETRY_MS = 25;
 const EXPLICIT_RUN_ID_REQUIRES_OWNER = true;
 // 当前 Node 进程内登记的子进程，用于等待关闭和复用进程句柄。
 const LIVE_PROCESSES = new Map();
+// 每个受管运行的输出订阅回调集合，用于 output follow 模式。
+const OUTPUT_LISTENERS = new Map();
 // Windows 需要经由命令解释器启动的批处理包装程序扩展名。
 const WINDOWS_BATCH_EXTENSIONS = new Set([".bat", ".cmd"]);
 
@@ -570,6 +572,39 @@ function readLog(logPath, limit = 20000) {
   return `[输出已截断，保留末尾 ${limit} 个字符]\n${content.slice(-limit)}`;
 }
 
+/** 读取日志文件末尾指定行数，提供 output 操作的 tail -n 语义。 */
+function readOutputLines(logPath, lines) {
+  let content = "";
+  try {
+    content = fs.readFileSync(logPath, "utf8");
+  } catch (error) {
+    return "";
+  }
+  if (!content) {
+    return "";
+  }
+  return content.split("\n").slice(-lines).join("\n");
+}
+
+/** 按工作目录和运行 ID 查找内部账本记录，供 output 读取日志。 */
+function findRecord(cwd, runId) {
+  const normalizedCwd = normalizePath(cwd);
+  return loadRecords(normalizedCwd).find((record) => record.run_id === runId) || null;
+}
+
+/** 订阅指定受管运行的后续输出数据。 */
+function subscribeOutput(runId, callback) {
+  if (typeof callback !== "function") {
+    return;
+  }
+  let listeners = OUTPUT_LISTENERS.get(runId);
+  if (!listeners) {
+    listeners = new Set();
+    OUTPUT_LISTENERS.set(runId, listeners);
+  }
+  listeners.add(callback);
+}
+
 /** 从账本中移除已结束的资源记录，保证正常退出和超时都不残留。 */
 function removeRecord(cwd, runId) {
   const filePath = ledgerPath(cwd);
@@ -591,6 +626,14 @@ function trackProcess(child, logStream = null, logger = null, runId = null, onOu
   let settled = false;
   let remainingStreams = 0;
   const streams = [];
+  if (runId && typeof onOutput === "function") {
+    let listeners = OUTPUT_LISTENERS.get(runId);
+    if (!listeners) {
+      listeners = new Set();
+      OUTPUT_LISTENERS.set(runId, listeners);
+    }
+    listeners.add(onOutput);
+  }
 
   // 安全调用内部回调，避免模型通知失败破坏进程生命周期线程。
   const invokeCallback = (callback, event, callbackName) => {
@@ -658,20 +701,20 @@ function trackProcess(child, logStream = null, logger = null, runId = null, onOu
       } catch (error) {
         outputError = error;
       }
-      invokeCallback(
-        onOutput,
-        {
-          // Task Anchor 分配的运行 ID。
-          run_id: runId,
-          // 被执行进程的操作系统 PID。
-          pid: Number.isInteger(child.pid) ? child.pid : null,
-          // 原始输出所属的流。
-          stream: streamName,
-          // 当前到达的数据块原始字符串。
-          output: rawOutput,
-        },
-        "onOutput",
-      );
+      const outputEvent = {
+        // Task Anchor 分配的运行 ID。
+        run_id: runId,
+        // 被执行进程的操作系统 PID。
+        pid: Number.isInteger(child.pid) ? child.pid : null,
+        // 原始输出所属的流。
+        stream: streamName,
+        // 当前到达的数据块原始字符串。
+        output: rawOutput,
+      };
+      const listeners = OUTPUT_LISTENERS.get(runId) || new Set();
+      for (const callback of listeners) {
+        invokeCallback(callback, outputEvent, "onOutput");
+      }
     });
     stream.once("end", handleStreamEnd);
     stream.once("error", (error) => {
@@ -740,6 +783,7 @@ function trackProcess(child, logStream = null, logger = null, runId = null, onOu
     if (Number.isInteger(child.pid)) {
       LIVE_PROCESSES.delete(child.pid);
     }
+    OUTPUT_LISTENERS.delete(runId);
   });
   return entry;
 }
@@ -1002,10 +1046,6 @@ async function startProcess({
         cwd: normalizedCwd,
         // 运行平台。
         platform: platformName,
-        // 合并输出日志路径。
-        log_path: logPath,
-        // 结构化生命周期诊断日志路径。
-        diagnostic_log_path: diagnosticLogPath,
         // 被执行进程的合并输出。
         output: readLog(logPath),
       };
@@ -1168,10 +1208,6 @@ async function startProcess({
       cwd: normalizedCwd,
       // 运行平台。
       platform: platformName,
-      // 合并输出日志路径。
-      log_path: logPath,
-      // 结构化生命周期诊断日志路径。
-      diagnostic_log_path: diagnosticLogPath,
       // 返回快照时已经写入的完整日志。
       output: readLog(logPath),
     };
@@ -1340,6 +1376,7 @@ module.exports = {
   PLATFORM_LINUX,
   EXPLICIT_RUN_ID_REQUIRES_OWNER,
   LIVE_PROCESSES,
+  OUTPUT_LISTENERS,
   ResourceError,
   currentPlatform,
   utcNow,
@@ -1373,6 +1410,9 @@ module.exports = {
   resolveWindowsBatchProgram,
   validateArgs,
   readLog,
+  readOutputLines,
+  subscribeOutput,
+  findRecord,
   isPosixShellBackgroundCommand,
   startProcess,
   matchesOwner,

@@ -61,8 +61,8 @@ test("initialize, ping, tools/list, and notifications follow JSON-RPC contract",
   assert.equal(tools.result.tools[0].inputSchema.properties.stop_policy.default, "cleanup");
   const outputSchema = tools.result.tools[0].outputSchema;
   const runSchema = outputSchema.oneOf.find((item) => item.title === "run 操作结果");
-  assert.equal(runSchema.properties.diagnostic_log_path.type, "string");
-  assert.equal(runSchema.required.includes("diagnostic_log_path"), true);
+  assert.equal(Object.hasOwn(runSchema.properties, "diagnostic_log_path"), false);
+  assert.equal(runSchema.required.includes("diagnostic_log_path"), false);
   assert.equal(outputSchema.$defs.registeredResource.required.includes("diagnostic_log_path"), true);
   assert.equal(mcp.handleRequest({ jsonrpc: "2.0", method: "ping" }), null);
 });
@@ -75,9 +75,9 @@ test("tool errors stay in structured content and do not terminate the service", 
     params: { name: "managed_exec", arguments: { operation: "invalid" } },
   });
   assert.deepEqual(response.result.content, [
-    { type: "text", text: "operation 只能是 run、stop、list 或 cleanup。" },
+    { type: "text", text: "operation 只能是 run、stop、list、cleanup 或 output。" },
   ]);
-  assert.deepEqual(response.result.structuredContent, { error: "operation 只能是 run、stop、list 或 cleanup。" });
+  assert.deepEqual(response.result.structuredContent, { error: "operation 只能是 run、stop、list、cleanup 或 output。" });
   assert.equal(response.result.isError, true);
   assert.deepEqual(mcp.handleRequest({ jsonrpc: "2.0", id: 5, method: "ping" }).result, {});
 });
@@ -139,7 +139,14 @@ test("tools/call preserves program args, shell command, and environment", async 
     });
     assert.equal(direct.exit_code, 0);
     assert.equal(direct.output, "direct");
-    assert.equal(typeof direct.diagnostic_log_path, "string");
+    const normalizedCwd = manager.normalizePath(testFixture.workspace);
+    const diagnosticLogPath = path.join(
+      manager.workspaceRuntimeDirectory(normalizedCwd),
+      "logs",
+      `${direct.run_id}.events.jsonl`,
+    );
+    assert.equal(fs.existsSync(diagnosticLogPath), true);
+    assert.equal(fs.readFileSync(diagnosticLogPath, "utf8").trim().length > 0, true);
 
     const shell = await runToCompletion({
       command: process.platform === "win32" ? "echo shell" : "printf shell",
@@ -150,6 +157,97 @@ test("tools/call preserves program args, shell command, and environment", async 
     assert.equal(shell.exit_code, 0);
     assert.equal(shell.output.trim(), "shell");
   } finally {
+    testFixture.restore();
+  }
+});
+
+test("operation=output validates lines and supports tail and follow", async () => {
+  const testFixture = fixture();
+  let resource;
+  let resolveCompletion;
+  let rejectCompletion;
+  const outputEvents = [];
+  const completion = new Promise((resolve, reject) => {
+    resolveCompletion = resolve;
+    rejectCompletion = reject;
+  });
+  try {
+    await assert.rejects(
+      mcp.executeTool({
+        operation: "output",
+        run_id: "missing",
+        cwd: testFixture.workspace,
+        session_id: testFixture.sessionId,
+      }),
+      (error) => error.message === "output 操作必须提供正整数 lines。",
+    );
+    await assert.rejects(
+      mcp.executeTool({
+        operation: "output",
+        run_id: "missing",
+        lines: 0,
+        cwd: testFixture.workspace,
+        session_id: testFixture.sessionId,
+      }),
+      (error) => error.message === "output 操作必须提供正整数 lines。",
+    );
+
+    resource = await mcp.executeTool(
+      {
+        program: process.execPath,
+        args: [
+          "-e",
+          "const n=String.fromCharCode(10); process.stdout.write('line-1'+n+'line-2'+n+'line-3'); setTimeout(() => process.stdout.write(n+'follow-line'), 120); setTimeout(() => process.exit(0), 220)",
+        ],
+        cwd: testFixture.workspace,
+        timeout_ms: null,
+        session_id: testFixture.sessionId,
+      },
+      {
+        onOutput: (event) => outputEvents.push(event),
+        onCompletion: resolveCompletion,
+        onError: (event) => rejectCompletion(new Error(event.error)),
+      },
+    );
+    assert.equal(resource.status, "running");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const tail = await mcp.executeTool({
+      operation: "output",
+      run_id: resource.run_id,
+      lines: 2,
+      follow: false,
+      cwd: testFixture.workspace,
+      session_id: testFixture.sessionId,
+    });
+    assert.equal(tail.status, "running");
+    assert.equal(tail.follow, false);
+    assert.equal(tail.output, ["line-2", "line-3"].join(String.fromCharCode(10)));
+
+    const followed = await mcp.executeTool({
+      operation: "output",
+      run_id: resource.run_id,
+      lines: 1,
+      follow: true,
+      cwd: testFixture.workspace,
+      session_id: testFixture.sessionId,
+    });
+    assert.equal(followed.status, "running");
+    assert.equal(followed.follow, true);
+    assert.equal(followed.output, "line-3");
+    const completed = await completion;
+    assert.equal(completed.status, "exited");
+    assert.equal(outputEvents.some((event) => event.output.includes("follow-line")), true);
+  } finally {
+    if (resource && manager.processAlive(resource.pid)) {
+      await mcp.executeTool({
+        operation: "stop",
+        run_id: resource.run_id,
+        cwd: testFixture.workspace,
+        session_id: testFixture.sessionId,
+        include_keep: true,
+      });
+    }
     testFixture.restore();
   }
 });

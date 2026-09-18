@@ -139,8 +139,14 @@ test("program and args preserve environment, cwd, and non-zero exit", async () =
     assert.equal(result.status, "exited");
     assert.equal(result.exit_code, 7);
     assert.equal(result.output, `${manager.normalizePath(testFixture.workspace)}|managed`);
-    assert.equal(typeof result.diagnostic_log_path, "string");
-    const events = fs.readFileSync(result.diagnostic_log_path, "utf8")
+    const normalizedCwd = manager.normalizePath(testFixture.workspace);
+    const diagnosticLogPath = path.join(
+      manager.workspaceRuntimeDirectory(normalizedCwd),
+      "logs",
+      `${result.run_id}.events.jsonl`,
+    );
+    assert.equal(fs.existsSync(diagnosticLogPath), true);
+    const events = fs.readFileSync(diagnosticLogPath, "utf8")
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line));
@@ -253,9 +259,16 @@ test("timeout ends the process tree and removes the ordinary resource", async ()
     assert.equal(result.status, "exited");
     assert.equal(result.timed_out, true);
     let events = [];
+    const normalizedCwd = manager.normalizePath(testFixture.workspace);
+    const diagnosticLogPath = path.join(
+      manager.workspaceRuntimeDirectory(normalizedCwd),
+      "logs",
+      `${result.run_id}.events.jsonl`,
+    );
+    assert.equal(fs.existsSync(diagnosticLogPath), true);
     const eventDeadline = Date.now() + 3000;
     while (Date.now() < eventDeadline) {
-      events = fs.readFileSync(result.diagnostic_log_path, "utf8")
+      events = fs.readFileSync(diagnosticLogPath, "utf8")
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line));

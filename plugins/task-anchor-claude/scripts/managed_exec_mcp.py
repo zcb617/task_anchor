@@ -29,9 +29,9 @@ TOOL_SCHEMA = {
     "properties": {
         "operation": {
             "type": "string",
-            "enum": ["run", "stop", "list", "cleanup"],
+            "enum": ["run", "stop", "list", "cleanup", "output"],
             "default": "run",
-            "description": "run 启动命令；stop 停止指定资源；list 查看登记；cleanup 清理默认资源。",
+            "description": "run 启动命令；stop 停止指定资源；list 查看登记；cleanup 清理默认资源；output 读取运行输出。",
         },
         "program": {"type": "string", "description": "可执行程序，例如 npm、python、java。"},
         "args": {
@@ -50,7 +50,9 @@ TOOL_SCHEMA = {
             "description": "默认 cleanup：Stop 时关闭；keep：Stop 时保留。",
         },
         "name": {"type": "string", "description": "资源名称，便于后续 stop。"},
-        "run_id": {"type": "string"},
+        "run_id": {"type": "string", "description": "运行 ID，output 操作按此读取日志。"},
+        "lines": {"type": "integer", "description": "output 操作必须提供的末尾日志行数。"},
+        "follow": {"type": "boolean", "default": False, "description": "是否持续接收进程后续输出。"},
         "task_id": {"type": "string", "description": "通常不需要，默认从 Task Anchor 当前上下文解析。"},
         "include_keep": {"type": "boolean", "default": True},
     },
@@ -174,7 +176,6 @@ TOOL_OUTPUT_SCHEMA = {
                 "command": {"type": "string", "description": "用于展示和登记的完整命令。"},
                 "cwd": {"type": "string", "description": "进程工作目录的规范化绝对路径。"},
                 "platform": {"type": "string", "description": "进程运行平台；运行中可能返回。"},
-                "log_path": {"type": "string", "description": "合并输出日志文件路径。"},
                 "output": {
                     "type": "string",
                     "description": (
@@ -183,7 +184,20 @@ TOOL_OUTPUT_SCHEMA = {
                     ),
                 },
             },
-            "required": ["run_id", "pid", "status", "stop_policy", "command", "cwd", "log_path"],
+            "required": ["run_id", "pid", "status", "stop_policy", "command", "cwd"],
+            "additionalProperties": False,
+        },
+        {
+            "title": "output 操作结果",
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "受管运行的唯一标识。"},
+                "status": {"type": "string", "enum": ["running", "exited"], "description": "进程当前是否仍在运行。"},
+                "output": {"type": "string", "description": "进程合并输出日志的末尾内容。"},
+                "exit_code": {"type": "integer", "description": "进程退出码。"},
+                "follow": {"type": "boolean", "description": "是否持续接收后续输出。"},
+            },
+            "required": ["run_id", "status", "output", "follow"],
             "additionalProperties": False,
         },
         {
@@ -259,8 +273,8 @@ def execute_tool(
         raise resource_manager.ResourceError("工具参数必须是对象。")
     internal_hooks = hooks or {}
     operation = arguments.get("operation", "run")
-    if operation not in {"run", "stop", "list", "cleanup"}:
-        raise resource_manager.ResourceError("operation 只能是 run、stop、list 或 cleanup。")
+    if operation not in {"run", "stop", "list", "cleanup", "output"}:
+        raise resource_manager.ResourceError("operation 只能是 run、stop、list、cleanup 或 output。")
 
     cwd = _require_cwd(arguments)
     common = {
@@ -283,6 +297,42 @@ def execute_tool(
             on_completion=internal_hooks.get("on_completion"),
             on_error=internal_hooks.get("on_error"),
         )
+    if operation == "output":
+        if (
+            "lines" not in arguments
+            or not isinstance(arguments.get("lines"), int)
+            or isinstance(arguments.get("lines"), bool)
+            or arguments["lines"] <= 0
+        ):
+            raise resource_manager.ResourceError("output 操作必须提供正整数 lines。")
+        run_id = arguments.get("run_id")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise resource_manager.ResourceError("output 操作必须提供 run_id。")
+        record = resource_manager.find_record(cwd, run_id)
+        owner_key, _, _ = resource_manager.resolve_owner(
+            cwd, arguments.get("session_id"), arguments.get("task_id")
+        )
+        if not record or not resource_manager._matches_owner(
+            record, owner_key, resource_manager.workspace_key(cwd)
+        ):
+            raise resource_manager.ResourceError(f"找不到 run_id 对应的受管进程：{run_id}")
+        running = resource_manager._process_alive(int(record.get("pid", 0)))
+        result: dict[str, Any] = {
+            # Task Anchor 分配的运行 ID。
+            "run_id": run_id,
+            # 当前进程状态。
+            "status": "running" if running else "exited",
+            # 日志末尾指定行数的文本。
+            "output": resource_manager.read_output_lines(record.get("log_path", ""), arguments["lines"]),
+            # 是否已订阅后续输出通知。
+            "follow": bool(arguments.get("follow", False)),
+        }
+        if not running and isinstance(record.get("exit_code"), int):
+            # 账本存在退出码时向调用方返回退出码。
+            result["exit_code"] = record["exit_code"]
+        if result["follow"] and running:
+            resource_manager.subscribe_output(run_id, internal_hooks.get("on_output"))
+        return result
     if operation == "stop":
         return resource_manager.stop_process(
             **common,

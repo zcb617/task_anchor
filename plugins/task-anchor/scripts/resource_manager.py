@@ -32,6 +32,8 @@ STOP_POLICY_CLEANUP = "cleanup"
 STOP_POLICY_KEEP = "keep"
 VALID_STOP_POLICIES = {STOP_POLICY_CLEANUP, STOP_POLICY_KEEP}
 _LIVE_PROCESSES: dict[int, subprocess.Popen[Any]] = {}
+# 每个受管运行的输出订阅回调集合，用于 output follow 模式。
+_OUTPUT_LISTENERS: dict[str, list[Callable[[dict[str, Any]], None]]] = {}
 
 PLATFORM_WINDOWS = "windows"
 PLATFORM_MACOS = "macos"
@@ -469,6 +471,33 @@ def _read_log(log_path: Path, limit: int = 20_000) -> str:
     return f"[输出已截断，保留末尾 {limit} 个字符]\n{content[-limit:]}"
 
 
+def read_output_lines(log_path: str | Path, lines: int) -> str:
+    """读取合并日志末尾指定行数，提供 output 操作的 tail -n 语义。"""
+    try:
+        content = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if not content:
+        return ""
+    return "\n".join(content.split("\n")[-lines:])
+
+
+def find_record(cwd: str, run_id: str) -> dict[str, Any] | None:
+    """按工作目录和运行 ID 查找内部账本记录，供 output 读取日志。"""
+    normalized_cwd = normalize_path(cwd)
+    return next(
+        (record for record in _load_records(normalized_cwd) if record.get("run_id") == run_id),
+        None,
+    )
+
+
+def subscribe_output(run_id: str, callback: Callable[[dict[str, Any]], None]) -> None:
+    """订阅指定受管运行的后续输出数据。"""
+    if not callable(callback):
+        return
+    _OUTPUT_LISTENERS.setdefault(run_id, []).append(callback)
+
+
 def _is_posix_shell_background_command(
     command: Any, platform_name: str, shell: bool
 ) -> bool:
@@ -687,6 +716,9 @@ def start_process(
         "preserve_ledger": False,
     }
 
+    if callable(on_output):
+        _OUTPUT_LISTENERS.setdefault(run_id, []).append(on_output)
+
     def invoke_callback(callback: Callable[[dict[str, Any]], None] | None, event: dict[str, Any], name: str) -> None:
         """安全调用后台生命周期回调，避免回调异常泄漏到工作线程。"""
         if callback is None:
@@ -705,20 +737,20 @@ def start_process(
             log_handle.write(chunk)
             log_handle.flush()
         output = bytes(chunk).decode("utf-8", errors="replace")
-        invoke_callback(
-            on_output,
-            {
-                # Task Anchor 分配的运行 ID。
-                "run_id": run_id,
-                # 被执行进程的操作系统 PID。
-                "pid": process.pid,
-                # 原始输出所属的流。
-                "stream": stream_name,
-                # 当前到达的数据块原始字符串。
-                "output": output,
-            },
-            "on_output",
-        )
+        output_event = {
+            # Task Anchor 分配的运行 ID。
+            "run_id": run_id,
+            # 被执行进程的操作系统 PID。
+            "pid": process.pid,
+            # 原始输出所属的流。
+            "stream": stream_name,
+            # 当前到达的数据块原始字符串。
+            "output": output,
+        }
+        invoke_callback(on_output, output_event, "on_output")
+        for callback in list(_OUTPUT_LISTENERS.get(run_id, [])):
+            if callback is not on_output:
+                invoke_callback(callback, output_event, "on_output")
 
     def report_output_read_failure(stream_name: str, exc: Exception) -> None:
         """记录指定输出流的读取异常，保证监控线程仍能完成生命周期收尾。"""
@@ -868,10 +900,6 @@ def start_process(
             "cwd": normalized_cwd,
             # 运行平台。
             "platform": platform_name,
-            # 合并输出日志路径。
-            "log_path": str(log_path),
-            # 结构化生命周期诊断日志路径。
-            "diagnostic_log_path": str(diagnostic_log_path),
             # 被执行程序的完整合并输出。
             "output": _read_log(log_path),
         }
@@ -921,6 +949,7 @@ def start_process(
         if not state["preserve_ledger"]:
             remove_completed_record()
         _LIVE_PROCESSES.pop(process.pid, None)
+        _OUTPUT_LISTENERS.pop(run_id, None)
         final_result = build_final_result(completion)
         with state_lock:
             state["finished"] = True
@@ -1047,10 +1076,6 @@ def start_process(
         "cwd": normalized_cwd,
         # 运行平台。
         "platform": platform_name,
-        # 合并输出日志路径。
-        "log_path": str(log_path),
-        # 结构化生命周期诊断日志路径。
-        "diagnostic_log_path": str(diagnostic_log_path),
         # 返回快照时已经写入的完整日志。
         "output": _read_log(log_path),
     }

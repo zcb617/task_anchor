@@ -143,10 +143,15 @@ class ResourceManagerTests(unittest.TestCase):
         )
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(result["output"], "managed-environment\n")
-        self.assertIsInstance(result["diagnostic_log_path"], str)
+        diagnostic_log_path = (
+            RESOURCE_MANAGER.workspace_runtime_directory(str(self.workspace))
+            / "logs"
+            / f"{result['run_id']}.events.jsonl"
+        )
+        self.assertTrue(diagnostic_log_path.is_file())
         events = [
             json.loads(line)
-            for line in Path(result["diagnostic_log_path"]).read_text(encoding="utf-8").splitlines()
+            for line in diagnostic_log_path.read_text(encoding="utf-8").splitlines()
         ]
         expected_messages = [
             "launch_requested",
@@ -545,7 +550,7 @@ class ManagedExecMcpTests(unittest.TestCase):
         self.assertEqual(result["content"], [])
         self.assertEqual(
             result["structuredContent"],
-            {"error": "operation 只能是 run、stop、list 或 cleanup。"},
+            {"error": "operation 只能是 run、stop、list、cleanup 或 output。"},
         )
         self.assertTrue(result["isError"])
 
@@ -566,7 +571,12 @@ class ManagedExecMcpTests(unittest.TestCase):
         )
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(result["output"], "mcp-environment\n")
-        self.assertIsInstance(result["diagnostic_log_path"], str)
+        diagnostic_log_path = (
+            RESOURCE_MANAGER.workspace_runtime_directory(str(self.workspace))
+            / "logs"
+            / f"{result['run_id']}.events.jsonl"
+        )
+        self.assertTrue(diagnostic_log_path.is_file())
 
     def test_tool_call_returns_running_and_emits_output_and_completion(self) -> None:
         """验证 MCP hooks 传递输出事件、running 初始结果和 exited 完成结果。"""
