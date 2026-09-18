@@ -276,6 +276,8 @@ test("tools/call returns the stable structured list and cleans timeout resources
     assert.equal(resource.status, "exited");
     assert.equal(resource.timed_out, true);
     assert.equal(manager.processAlive(resource.pid), false);
+    const retained = manager.dbFindRecord(testFixture.workspace, resource.run_id);
+    assert.equal(retained.status, "exited");
     const stopped = await mcp.executeTool({
       operation: "stop",
       run_id: resource.run_id,
@@ -283,7 +285,8 @@ test("tools/call returns the stable structured list and cleans timeout resources
       session_id: testFixture.sessionId,
       include_keep: true,
     });
-    assert.equal(stopped.stopped.length, 0);
+    assert.equal(stopped.stopped.length, 1);
+    assert.equal(manager.dbFindRecord(testFixture.workspace, resource.run_id), null);
   } finally {
     if (resource) {
       await mcp.executeTool({ operation: "stop", run_id: resource.run_id, cwd: testFixture.workspace, session_id: testFixture.sessionId, include_keep: true });

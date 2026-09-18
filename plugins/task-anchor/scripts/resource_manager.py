@@ -13,6 +13,7 @@ import os
 import platform
 import selectors
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -34,6 +35,12 @@ VALID_STOP_POLICIES = {STOP_POLICY_CLEANUP, STOP_POLICY_KEEP}
 _LIVE_PROCESSES: dict[int, subprocess.Popen[Any]] = {}
 # 每个受管运行的输出订阅回调集合，用于 output follow 模式。
 _OUTPUT_LISTENERS: dict[str, list[Callable[[dict[str, Any]], None]]] = {}
+# 当前 Python 进程复用的 SQLite 账本连接。
+_DB_CONNECTION: sqlite3.Connection | None = None
+# 当前 SQLite 账本连接对应的绝对路径。
+_DB_PATH: Path | None = None
+# SQLite 账本操作锁，避免监控线程和主线程并发写入。
+_DB_LOCK = threading.RLock()
 
 PLATFORM_WINDOWS = "windows"
 PLATFORM_MACOS = "macos"
@@ -96,17 +103,12 @@ def workspace_key(cwd: str) -> str:
 
 
 def runtime_root() -> Path:
+    """返回 Task Anchor 运行时根目录，默认统一位于家目录 .task_anchor，支持环境变量覆盖。"""
     override = os.environ.get("TASK_ANCHOR_RUNTIME_ROOT")
     if override and override.strip():
         return Path(override).expanduser()
 
-    if current_platform() == PLATFORM_WINDOWS:
-        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-        return Path(base) / "TaskAnchor" / "runtime"
-
-    state_home = os.environ.get("XDG_STATE_HOME")
-    base = Path(state_home) if state_home else Path.home() / ".local" / "state"
-    return base / "task-anchor"
+    return Path.home() / ".task_anchor"
 
 
 def workspace_runtime_directory(cwd: str) -> Path:
@@ -115,6 +117,187 @@ def workspace_runtime_directory(cwd: str) -> Path:
 
 def ledger_path(cwd: str) -> Path:
     return workspace_runtime_directory(cwd) / "resources.json"
+
+
+def _ledger_db_path() -> Path:
+    """返回全局 SQLite 账本路径，与运行时根目录保持一致。"""
+    return runtime_root() / "ledger.db"
+
+
+def _init_db(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """初始化 SQLite 账本连接的 WAL 模式和资源记录表。"""
+    conn.executescript(
+        """
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS records (
+          run_id TEXT PRIMARY KEY,
+          schema_version INTEGER NOT NULL DEFAULT 1,
+          owner_key TEXT NOT NULL,
+          session_key TEXT,
+          task_id TEXT,
+          workspace_key TEXT NOT NULL,
+          cwd TEXT NOT NULL,
+          platform TEXT NOT NULL,
+          program TEXT,
+          args TEXT,
+          command TEXT NOT NULL,
+          pid INTEGER NOT NULL,
+          started_at TEXT NOT NULL,
+          started_at_epoch REAL NOT NULL,
+          stop_policy TEXT NOT NULL,
+          name TEXT,
+          log_path TEXT NOT NULL,
+          diagnostic_log_path TEXT,
+          status TEXT NOT NULL DEFAULT 'running',
+          exit_code INTEGER,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def _get_db() -> sqlite3.Connection:
+    """懒加载全局 SQLite 账本连接，并在运行时根目录变化时切换连接。"""
+    global _DB_CONNECTION, _DB_PATH
+    database_path = _ledger_db_path()
+    with _DB_LOCK:
+        if _DB_CONNECTION is not None and _DB_PATH != database_path:
+            _DB_CONNECTION.close()
+            _DB_CONNECTION = None
+            _DB_PATH = None
+        if _DB_CONNECTION is None:
+            database_path.parent.mkdir(parents=True, exist_ok=True)
+            _DB_CONNECTION = sqlite3.connect(
+                str(database_path), check_same_thread=False
+            )
+            _DB_CONNECTION.row_factory = sqlite3.Row
+            _DB_PATH = database_path
+            _init_db(_DB_CONNECTION)
+        return _DB_CONNECTION
+
+
+def _db_record_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    """将 SQLite 查询行还原为兼容旧账本接口的资源记录对象。"""
+    record = dict(row)
+    raw_args = record.get("args")
+    if isinstance(raw_args, str) and raw_args:
+        try:
+            parsed = json.loads(raw_args)
+        except json.JSONDecodeError as exc:
+            raise ResourceError(
+                f"资源记录损坏：SQLite run_id={record.get('run_id')}"
+            ) from exc
+        record["args"] = parsed if isinstance(parsed, list) else []
+    else:
+        record["args"] = []
+    return record
+
+
+def _db_insert_record(record: dict[str, Any]) -> None:
+    """向 SQLite 账本插入一条受管资源记录。"""
+    with _DB_LOCK:
+        conn = _get_db()
+        conn.execute(
+            """
+            INSERT INTO records (
+              run_id, schema_version, owner_key, session_key, task_id, workspace_key, cwd,
+              platform, program, args, command, pid, started_at, started_at_epoch,
+              stop_policy, name, log_path, diagnostic_log_path, status, exit_code
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record["run_id"],
+                record.get("schema_version", SCHEMA_VERSION),
+                record["owner_key"],
+                record.get("session_key"),
+                record.get("task_id"),
+                record["workspace_key"],
+                record["cwd"],
+                record["platform"],
+                record.get("program"),
+                json.dumps(record.get("args", []), ensure_ascii=False),
+                record["command"],
+                record["pid"],
+                record["started_at"],
+                record["started_at_epoch"],
+                record["stop_policy"],
+                record.get("name"),
+                record["log_path"],
+                record.get("diagnostic_log_path"),
+                record.get("status", "running"),
+                record.get("exit_code"),
+            ),
+        )
+        conn.commit()
+
+
+def _db_update_record(run_id: str, fields: dict[str, Any]) -> None:
+    """更新 SQLite 账本中的指定记录并刷新更新时间。"""
+    writable_fields = {
+        "schema_version", "owner_key", "session_key", "task_id", "workspace_key", "cwd",
+        "platform", "program", "args", "command", "pid", "started_at", "started_at_epoch",
+        "stop_policy", "name", "log_path", "diagnostic_log_path", "status", "exit_code",
+    }
+    updates: list[str] = []
+    values: list[Any] = []
+    for field, value in fields.items():
+        if field not in writable_fields or value is None and field not in {"session_key", "task_id", "program", "name", "diagnostic_log_path", "exit_code"}:
+            continue
+        updates.append(f"{field} = ?")
+        values.append(json.dumps(value, ensure_ascii=False) if field == "args" else value)
+    updates.append("updated_at = datetime('now')")
+    values.append(run_id)
+    with _DB_LOCK:
+        conn = _get_db()
+        conn.execute(
+            f"UPDATE records SET {', '.join(updates)} WHERE run_id = ?", values
+        )
+        conn.commit()
+
+
+def _db_remove_record(run_id: str) -> None:
+    """从 SQLite 账本删除一条资源记录。"""
+    with _DB_LOCK:
+        conn = _get_db()
+        conn.execute("DELETE FROM records WHERE run_id = ?", (run_id,))
+        conn.commit()
+
+
+def _db_load_records(cwd: str) -> list[dict[str, Any]]:
+    """读取指定工作区的全部 SQLite 账本记录。"""
+    workspace = workspace_key(cwd)
+    with _DB_LOCK:
+        rows = _get_db().execute(
+            "SELECT * FROM records WHERE workspace_key = ? ORDER BY started_at_epoch, created_at, run_id",
+            (workspace,),
+        ).fetchall()
+    return [_db_record_from_row(row) for row in rows]
+
+
+def _db_find_record(cwd: str, run_id: str) -> dict[str, Any] | None:
+    """按工作区和运行 ID 读取 SQLite 账本记录。"""
+    workspace = workspace_key(cwd)
+    with _DB_LOCK:
+        row = _get_db().execute(
+            "SELECT * FROM records WHERE workspace_key = ? AND run_id = ?",
+            (workspace, run_id),
+        ).fetchone()
+    return _db_record_from_row(row) if row is not None else None
+
+
+def _db_delete_records(run_ids: list[str] | set[str]) -> None:
+    """批量删除 SQLite 账本中的资源记录。"""
+    values = list(run_ids)
+    if not values:
+        return
+    placeholders = ", ".join("?" for _ in values)
+    with _DB_LOCK:
+        conn = _get_db()
+        conn.execute(f"DELETE FROM records WHERE run_id IN ({placeholders})", values)
+        conn.commit()
 
 
 def context_path(cwd: str) -> Path:
@@ -282,14 +465,26 @@ def resolve_owner(
 
 
 def _load_records(cwd: str) -> list[dict[str, Any]]:
-    value = _read_json(ledger_path(cwd), [])
-    if not isinstance(value, list):
-        raise ResourceError("资源记录不是数组。")
-    return [item for item in value if isinstance(item, dict)]
+    """读取资源账本并返回指定工作区的 SQLite 记录。"""
+    return _db_load_records(cwd)
 
 
 def _save_records(cwd: str, records: list[dict[str, Any]]) -> None:
-    _write_json(ledger_path(cwd), records)
+    """保存资源账本，按记录差异同步指定工作区的 SQLite 数据。"""
+    current_records = _db_load_records(cwd)
+    current_ids = {record.get("run_id") for record in current_records}
+    incoming_records = [
+        record
+        for record in records
+        if isinstance(record, dict) and isinstance(record.get("run_id"), str)
+    ]
+    incoming_ids = {record["run_id"] for record in incoming_records}
+    _db_delete_records([run_id for run_id in current_ids if run_id not in incoming_ids])
+    for record in incoming_records:
+        if record["run_id"] in current_ids:
+            _db_update_record(record["run_id"], record)
+        else:
+            _db_insert_record(record)
 
 
 def _process_alive(pid: int) -> bool:
@@ -483,12 +678,9 @@ def read_output_lines(log_path: str | Path, lines: int) -> str:
 
 
 def find_record(cwd: str, run_id: str) -> dict[str, Any] | None:
-    """按工作目录和运行 ID 查找内部账本记录，供 output 读取日志。"""
+    """按工作目录和运行 ID 查找 SQLite 账本记录，供 output 读取日志。"""
     normalized_cwd = normalize_path(cwd)
-    return next(
-        (record for record in _load_records(normalized_cwd) if record.get("run_id") == run_id),
-        None,
-    )
+    return _db_find_record(normalized_cwd, run_id)
 
 
 def subscribe_output(run_id: str, callback: Callable[[dict[str, Any]], None]) -> None:
@@ -682,13 +874,9 @@ def start_process(
         # 当前登记状态。
         "status": "running",
     }
-    path = ledger_path(normalized_cwd)
     try:
-        with file_lock(path.with_suffix(".lock.d")):
-            records = _load_records(normalized_cwd)
-            records.append(record)
-            _save_records(normalized_cwd, records)
-    except (OSError, ResourceError) as exc:
+        _db_insert_record(record)
+    except (OSError, ResourceError, sqlite3.Error) as exc:
         logger.warning("ledger_write_failed", {"run_id": run_id, "error": str(exc)})
         try:
             _terminate_pid(process.pid)
@@ -870,18 +1058,15 @@ def start_process(
                 except (OSError, ValueError):
                     pass
 
-    def remove_completed_record() -> None:
-        """在进程完成后移除账本记录并记录移除异常。"""
+    def _update_completed_record(completed_run_id: str, exit_code: int | None) -> None:
+        """在进程完成后保留账本记录并更新退出状态和退出码。"""
         try:
-            with file_lock(path.with_suffix(".lock.d")):
-                records = [
-                    item
-                    for item in _load_records(normalized_cwd)
-                    if item.get("run_id") != run_id
-                ]
-                _save_records(normalized_cwd, records)
-        except (OSError, ResourceError) as exc:
-            logger.warning("ledger_remove_failed", {"run_id": run_id, "error": str(exc)})
+            _db_update_record(
+                completed_run_id,
+                {"status": "exited", "exit_code": exit_code},
+            )
+        except (OSError, ResourceError, sqlite3.Error) as exc:
+            logger.warning("ledger_update_failed", {"run_id": completed_run_id, "error": str(exc)})
 
     def build_final_result(completion: dict[str, Any]) -> dict[str, Any]:
         """构造退出通知和同步结果共用的完整业务结果。"""
@@ -946,8 +1131,7 @@ def start_process(
         }
         with state_lock:
             state["completion"] = completion
-        if not state["preserve_ledger"]:
-            remove_completed_record()
+        _update_completed_record(run_id, exit_code)
         _LIVE_PROCESSES.pop(process.pid, None)
         _OUTPUT_LISTENERS.pop(run_id, None)
         final_result = build_final_result(completion)
@@ -1101,88 +1285,82 @@ def stop_process(
     if run_id is None:
         owner_key, _, _ = resolve_owner(normalized_cwd, session_id, task_id)
     workspace = workspace_key(normalized_cwd)
-    path = ledger_path(normalized_cwd)
-    with file_lock(path.with_suffix(".lock.d")):
-        records = _load_records(normalized_cwd)
-        selected: list[dict[str, Any]] = []
-        remaining: list[dict[str, Any]] = []
-        for record in records:
-            if run_id is not None:
-                matched = record.get("run_id") == run_id
-            elif name is not None:
-                matched = owner_key is not None and record.get("name") == name and _matches_owner(
-                    record, owner_key, workspace
-                )
-            else:
-                matched = owner_key is not None and _matches_owner(record, owner_key, workspace)
-            if matched and (
-                include_keep or record.get("stop_policy") != STOP_POLICY_KEEP
-            ):
-                selected.append(record)
-            else:
-                remaining.append(record)
-
-        results: list[dict[str, Any]] = []
-        failed: list[dict[str, Any]] = []
-        succeeded_run_ids: set[str] = set()
-        for record in selected:
-            diagnostic_path = record.get("diagnostic_log_path")
-            logger = (
-                TaskAnchorLogger(diagnostic_path)
-                if isinstance(diagnostic_path, str) and diagnostic_path.strip()
-                else None
+    records = _db_load_records(normalized_cwd)
+    selected: list[dict[str, Any]] = []
+    for record in records:
+        if run_id is not None:
+            matched = record.get("run_id") == run_id
+        elif name is not None:
+            matched = owner_key is not None and record.get("name") == name and _matches_owner(
+                record, owner_key, workspace
             )
+        else:
+            matched = owner_key is not None and _matches_owner(record, owner_key, workspace)
+        if matched and (
+            include_keep or record.get("stop_policy") != STOP_POLICY_KEEP
+        ):
+            selected.append(record)
+
+    results: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    succeeded_run_ids: set[str] = set()
+    for record in selected:
+        diagnostic_path = record.get("diagnostic_log_path")
+        logger = (
+            TaskAnchorLogger(diagnostic_path)
+            if isinstance(diagnostic_path, str) and diagnostic_path.strip()
+            else None
+        )
+        if logger is not None:
+            logger.info(
+                "stop_requested",
+                {"run_id": record.get("run_id"), "pid": record.get("pid")},
+            )
+        try:
+            termination = _terminate_pid(int(record.get("pid", 0)))
             if logger is not None:
                 logger.info(
-                    "stop_requested",
-                    {"run_id": record.get("run_id"), "pid": record.get("pid")},
-                )
-            try:
-                termination = _terminate_pid(int(record.get("pid", 0)))
-                if logger is not None:
-                    logger.info(
-                        "stop_succeeded",
-                        {
-                            "run_id": record.get("run_id"),
-                            "pid": record.get("pid"),
-                            "status": termination.get("status"),
-                        },
-                    )
-                results.append(
+                    "stop_succeeded",
                     {
-                        # 停止状态和操作系统 PID。
-                        **termination,
-                        # Task Anchor 分配的运行 ID。
                         "run_id": record.get("run_id"),
-                        # 调用方设置的资源名称。
-                        "name": record.get("name"),
-                    }
+                        "pid": record.get("pid"),
+                        "status": termination.get("status"),
+                    },
                 )
-                succeeded_run_ids.add(str(record.get("run_id")))
-            except (ResourceError, ValueError, TypeError) as exc:
-                error_message = str(exc)
-                if logger is not None:
-                    logger.warning(
-                        "stop_failed",
-                        {
-                            "run_id": record.get("run_id"),
-                            "pid": record.get("pid"),
-                            "error": error_message,
-                        },
-                    )
-                failed.append({"run_id": record.get("run_id"), "error": error_message})
-                remaining.append(record)
-        try:
-            _save_records(normalized_cwd, remaining)
-        except (OSError, ResourceError) as exc:
-            for record in selected:
-                diagnostic_path = record.get("diagnostic_log_path")
-                if isinstance(diagnostic_path, str) and diagnostic_path.strip():
-                    TaskAnchorLogger(diagnostic_path).warning(
-                        "ledger_write_failed",
-                        {"run_id": record.get("run_id"), "error": str(exc)},
-                    )
-            raise
+            results.append(
+                {
+                    # 停止状态和操作系统 PID。
+                    **termination,
+                    # Task Anchor 分配的运行 ID。
+                    "run_id": record.get("run_id"),
+                    # 调用方设置的资源名称。
+                    "name": record.get("name"),
+                }
+            )
+            succeeded_run_ids.add(str(record.get("run_id")))
+        except (ResourceError, ValueError, TypeError) as exc:
+            error_message = str(exc)
+            if logger is not None:
+                logger.warning(
+                    "stop_failed",
+                    {
+                        "run_id": record.get("run_id"),
+                        "pid": record.get("pid"),
+                        "error": error_message,
+                    },
+                )
+            failed.append({"run_id": record.get("run_id"), "error": error_message})
+    try:
+        _db_delete_records(succeeded_run_ids)
+    except (OSError, ResourceError, sqlite3.Error) as exc:
+        for record in selected:
+            diagnostic_path = record.get("diagnostic_log_path")
+            if isinstance(diagnostic_path, str) and diagnostic_path.strip():
+                TaskAnchorLogger(diagnostic_path).warning(
+                    "ledger_write_failed",
+                    {"run_id": record.get("run_id"), "error": str(exc)},
+                )
+        raise
     return {
         "stopped": results,
         "failed": failed,
@@ -1220,8 +1398,7 @@ def list_processes(
     normalized_cwd = normalize_path(cwd)
     owner_key, _, _ = resolve_owner(normalized_cwd, session_id, task_id)
     workspace = workspace_key(normalized_cwd)
-    with file_lock(ledger_path(normalized_cwd).with_suffix(".lock.d")):
-        records = _load_records(normalized_cwd)
+    records = _db_load_records(normalized_cwd)
     return [
         item
         for item in records
