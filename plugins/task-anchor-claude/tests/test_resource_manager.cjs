@@ -27,6 +27,7 @@ function fixture() {
     workspace,
     sessionId,
     restore() {
+      manager.closeDb();
       if (previousRuntimeRoot === undefined) {
         delete process.env.TASK_ANCHOR_RUNTIME_ROOT;
       } else {
@@ -444,10 +445,8 @@ test("explicit run_id requires matching session owner", async () => {
       (error) => error.message === `run_id 不属于当前受控会话：${resource.run_id}`,
     );
     assert.equal(manager.processAlive(resource.pid), true);
-    await assert.rejects(
-      manager.stopProcess({ runId: "missing-run-id", sessionId: testFixture.sessionId, includeKeep: true }),
-      (error) => error.message === "找不到 run_id 对应的受管进程：missing-run-id",
-    );
+    const missingStopped = await manager.stopProcess({ runId: "missing-run-id", sessionId: testFixture.sessionId, includeKeep: true });
+    assert.deepEqual(missingStopped, { stopped: [], failed: [], kept: [] });
   } finally {
     if (resource) {
       await manager.stopProcess({

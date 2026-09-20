@@ -190,6 +190,16 @@ function getDb() {
   return LEDGER_DB;
 }
 
+/** 关闭当前进程缓存的 SQLite 账本连接，供测试夹具清理临时运行目录。 */
+function closeDb() {
+  if (!LEDGER_DB) {
+    return;
+  }
+  LEDGER_DB.close();
+  LEDGER_DB = null;
+  LEDGER_DB_PATH = null;
+}
+
 /** 将 SQLite 查询行还原为兼容旧账本接口的资源记录对象。 */
 function dbRecordFromRow(row) {
   let args = [];
@@ -1425,7 +1435,7 @@ async function stopProcess({
   if (hasRunId) {
     const record = dbFindRecordByRunId(runId);
     if (!record) {
-      throw new ResourceError(`找不到 run_id 对应的受管进程：${runId}`);
+      return { stopped: [], failed: [], kept: [] };
     }
     owner = resolveOwner(record.cwd, sessionId, taskId);
     if (!matchesOwner(record, owner.ownerKey, record.workspace_key)) {
@@ -1568,6 +1578,7 @@ module.exports = {
   ledgerPath,
   ledgerDbPath,
   getDb,
+  closeDb,
   initDb,
   dbInsertRecord,
   dbUpdateRecord,

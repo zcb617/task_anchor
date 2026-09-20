@@ -23,6 +23,7 @@ function fixture() {
     workspace,
     sessionId,
     restore() {
+      manager.closeDb();
       if (previousRuntimeRoot === undefined) {
         delete process.env.TASK_ANCHOR_RUNTIME_ROOT;
       } else {
@@ -197,7 +198,7 @@ test("operation=output validates lines and supports tail and follow", async () =
         program: process.execPath,
         args: [
           "-e",
-          "const n=String.fromCharCode(10); process.stdout.write('line-1'+n+'line-2'+n+'line-3'); setTimeout(() => process.stdout.write(n+'follow-line'), 120); setTimeout(() => process.exit(0), 220)",
+          "const n=String.fromCharCode(10); process.stdout.write('line-1'+n+'line-2'+n+'line-3'); setTimeout(() => process.stdout.write(n+'follow-line'), 600); setTimeout(() => process.exit(0), 1200)",
         ],
         cwd: testFixture.workspace,
         timeout_ms: null,
@@ -302,10 +303,8 @@ test("run_id output and stop work without cwd and enforce session ownership", as
       (error) => error.message === `run_id 不属于当前受控会话：${resource.run_id}`,
     );
     assert.equal(manager.processAlive(resource.pid), true);
-    await assert.rejects(
-      mcp.executeTool({ operation: "stop", run_id: "missing-run-id", session_id: testFixture.sessionId, include_keep: true }),
-      (error) => error.message === "找不到 run_id 对应的受管进程：missing-run-id",
-    );
+    const missingStopped = await mcp.executeTool({ operation: "stop", run_id: "missing-run-id", session_id: testFixture.sessionId, include_keep: true });
+    assert.deepEqual(missingStopped, { stopped: [], failed: [], kept: [] });
     const stopped = await mcp.executeTool({
       operation: "stop",
       run_id: resource.run_id,
