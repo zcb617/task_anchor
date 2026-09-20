@@ -252,6 +252,76 @@ test("operation=output validates lines and supports tail and follow", async () =
   }
 });
 
+test("run_id output and stop work without cwd and enforce session ownership", async () => {
+  const testFixture = fixture();
+  const otherSession = `mcp-session-other-${manager.sha256Text(testFixture.root)}`;
+  let resource;
+  try {
+    const completed = await runToCompletion({
+      program: process.execPath,
+      args: ["-e", "process.stdout.write('line-1' + String.fromCharCode(10) + 'line-2')"],
+      cwd: testFixture.workspace,
+      timeout_ms: null,
+      session_id: testFixture.sessionId,
+    });
+    const tail = await mcp.executeTool({
+      operation: "output",
+      run_id: completed.run_id,
+      lines: 2,
+      session_id: testFixture.sessionId,
+    });
+    assert.equal(tail.status, "exited");
+    assert.equal(tail.output, "line-1\nline-2");
+    const legacyTail = await mcp.executeTool({
+      operation: "output",
+      run_id: completed.run_id,
+      lines: 1,
+      cwd: testFixture.workspace,
+      session_id: testFixture.sessionId,
+    });
+    assert.equal(legacyTail.output, "line-2");
+    await assert.rejects(
+      mcp.executeTool({ operation: "output", run_id: completed.run_id, lines: 1, session_id: otherSession }),
+      (error) => error.message === `run_id 不属于当前受控会话：${completed.run_id}`,
+    );
+    await assert.rejects(
+      mcp.executeTool({ operation: "output", run_id: "missing-run-id", lines: 1, session_id: testFixture.sessionId }),
+      (error) => error.message === "找不到 run_id 对应的受管进程：missing-run-id",
+    );
+
+    resource = await mcp.executeTool({
+      program: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      cwd: testFixture.workspace,
+      timeout_ms: null,
+      session_id: testFixture.sessionId,
+    });
+    assert.equal(resource.status, "running");
+    await assert.rejects(
+      mcp.executeTool({ operation: "stop", run_id: resource.run_id, session_id: otherSession, include_keep: true }),
+      (error) => error.message === `run_id 不属于当前受控会话：${resource.run_id}`,
+    );
+    assert.equal(manager.processAlive(resource.pid), true);
+    await assert.rejects(
+      mcp.executeTool({ operation: "stop", run_id: "missing-run-id", session_id: testFixture.sessionId, include_keep: true }),
+      (error) => error.message === "找不到 run_id 对应的受管进程：missing-run-id",
+    );
+    const stopped = await mcp.executeTool({
+      operation: "stop",
+      run_id: resource.run_id,
+      session_id: testFixture.sessionId,
+      include_keep: true,
+    });
+    assert.deepEqual(stopped.stopped.map((item) => item.run_id), [resource.run_id]);
+    assert.equal(manager.processAlive(resource.pid), false);
+  } finally {
+    if (resource && manager.processAlive(resource.pid)) {
+      await mcp.executeTool({ operation: "stop", run_id: resource.run_id, session_id: testFixture.sessionId, include_keep: true });
+    }
+    testFixture.restore();
+  }
+});
+
 test("tools/call returns the stable structured list and cleans timeout resources", async () => {
   const testFixture = fixture();
   let resource;

@@ -169,6 +169,9 @@ test("program and args preserve environment, cwd, and non-zero exit", async () =
     const record = manager.dbFindRecord(testFixture.workspace, result.run_id);
     assert.equal(record.status, "exited");
     assert.equal(record.exit_code, 7);
+    const globalRecord = manager.dbFindRecordByRunId(result.run_id);
+    assert.equal(globalRecord.cwd, record.cwd);
+    assert.deepEqual(globalRecord.args, record.args);
   } finally {
     testFixture.restore();
   }
@@ -419,6 +422,32 @@ test("session isolation prevents cleanup from stopping another session", async (
     }
     if (second) {
       await manager.stopProcess({ cwd: testFixture.workspace, runId: second.run_id, sessionId: otherSession, includeKeep: true });
+    }
+    testFixture.restore();
+  }
+});
+
+test("explicit run_id stop resolves globally and distinguishes ownership errors", async () => {
+  const testFixture = fixture();
+  const otherSession = `session-other-${manager.sha256Text(testFixture.root)}`;
+  let resource;
+  try {
+    resource = await startBackgroundLongRunningResource(testFixture.workspace, testFixture.sessionId, { timeoutMs: null });
+    await assert.rejects(
+      manager.stopProcess({ runId: resource.run_id, sessionId: otherSession, includeKeep: true }),
+      (error) => error.message === `run_id 不属于当前受控会话：${resource.run_id}`,
+    );
+    assert.equal(manager.processAlive(resource.pid), true);
+    await assert.rejects(
+      manager.stopProcess({ runId: "missing-run-id", sessionId: testFixture.sessionId, includeKeep: true }),
+      (error) => error.message === "找不到 run_id 对应的受管进程：missing-run-id",
+    );
+    const stopped = await manager.stopProcess({ runId: resource.run_id, sessionId: testFixture.sessionId, includeKeep: true });
+    assert.deepEqual(stopped.stopped.map((item) => item.run_id), [resource.run_id]);
+    assert.equal(manager.processAlive(resource.pid), false);
+  } finally {
+    if (resource && manager.processAlive(resource.pid)) {
+      await manager.stopProcess({ runId: resource.run_id, sessionId: testFixture.sessionId, includeKeep: true });
     }
     testFixture.restore();
   }

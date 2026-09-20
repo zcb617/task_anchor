@@ -273,7 +273,11 @@ async function executeTool(argumentsObject, hooks = {}) {
   if (!["run", "stop", "list", "cleanup", "output"].includes(operation)) {
     throw new resourceManager.ResourceError("operation 只能是 run、stop、list、cleanup 或 output。");
   }
-  const cwd = requireCwd(argumentsObject);
+  const hasRunId = typeof argumentsObject.run_id === "string" && argumentsObject.run_id.trim();
+  const cwdRequired = operation !== "output" && !(operation === "stop" && hasRunId);
+  const cwd = cwdRequired || Object.prototype.hasOwnProperty.call(argumentsObject, "cwd")
+    ? requireCwd(argumentsObject)
+    : null;
   const common = {
     // 当前工作目录。
     cwd,
@@ -319,10 +323,13 @@ async function executeTool(argumentsObject, hooks = {}) {
     if (typeof argumentsObject.run_id !== "string" || !argumentsObject.run_id.trim()) {
       throw new resourceManager.ResourceError("output 操作必须提供 run_id。");
     }
-    const record = resourceManager.findRecord(cwd, argumentsObject.run_id);
-    const owner = resourceManager.resolveOwner(cwd, argumentsObject.session_id, argumentsObject.task_id);
-    if (!record || !resourceManager.matchesOwner(record, owner.ownerKey, resourceManager.workspaceKey(cwd))) {
+    const record = resourceManager.findRecordByRunId(argumentsObject.run_id);
+    if (!record) {
       throw new resourceManager.ResourceError(`找不到 run_id 对应的受管进程：${argumentsObject.run_id}`);
+    }
+    const owner = resourceManager.resolveOwner(record.cwd, argumentsObject.session_id, argumentsObject.task_id);
+    if (!resourceManager.matchesOwner(record, owner.ownerKey, record.workspace_key)) {
+      throw new resourceManager.ResourceError(`run_id 不属于当前受控会话：${argumentsObject.run_id}`);
     }
     const running = resourceManager.processAlive(Number(record.pid));
     const result = {

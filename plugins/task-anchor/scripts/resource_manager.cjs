@@ -282,6 +282,14 @@ function dbFindRecord(cwd, runId) {
   return row ? dbRecordFromRow(row) : null;
 }
 
+/** 按全局唯一运行 ID读取 SQLite 账本记录，供跨工作目录的后续操作定位资源。 */
+function dbFindRecordByRunId(runId) {
+  const row = getDb().prepare(
+    "SELECT * FROM records WHERE run_id = ?",
+  ).get(runId);
+  return row ? dbRecordFromRow(row) : null;
+}
+
 /** 批量删除 SQLite 账本中的资源记录。 */
 function dbDeleteRecords(runIds) {
   if (!Array.isArray(runIds) || runIds.length === 0) {
@@ -756,6 +764,11 @@ function readOutputLines(logPath, lines) {
 function findRecord(cwd, runId) {
   const normalizedCwd = normalizePath(cwd);
   return dbFindRecord(normalizedCwd, runId);
+}
+
+/** 按全局唯一运行 ID查找 SQLite 账本记录，供后续 output 和 stop 操作定位资源。 */
+function findRecordByRunId(runId) {
+  return dbFindRecordByRunId(runId);
 }
 
 /** 订阅指定受管运行的后续输出数据。 */
@@ -1395,7 +1408,7 @@ function loggerForRecord(record) {
     : null;
 }
 
-/** 停止指定会话和工作区内的资源，显式 run_id 遵循 Codex 既有权限边界。 */
+/** 停止指定会话和工作区内的资源，显式 run_id 先全局定位再校验资源归属。 */
 async function stopProcess({
   cwd,
   runId = null,
@@ -1404,18 +1417,32 @@ async function stopProcess({
   taskId = null,
   includeKeep = true,
 }) {
-  const normalizedCwd = normalizePath(cwd);
+  const hasRunId = runId !== null && runId !== undefined;
+  const normalizedCwd = hasRunId ? null : normalizePath(cwd);
   let owner = null;
-  if (runId === null || EXPLICIT_RUN_ID_REQUIRES_OWNER) {
+  let workspace = null;
+  let records;
+  if (hasRunId) {
+    const record = dbFindRecordByRunId(runId);
+    if (!record) {
+      throw new ResourceError(`找不到 run_id 对应的受管进程：${runId}`);
+    }
+    owner = resolveOwner(record.cwd, sessionId, taskId);
+    if (!matchesOwner(record, owner.ownerKey, record.workspace_key)) {
+      throw new ResourceError(`run_id 不属于当前受控会话：${runId}`);
+    }
+    workspace = record.workspace_key;
+    records = [record];
+  } else {
     owner = resolveOwner(normalizedCwd, sessionId, taskId);
+    workspace = workspaceKey(normalizedCwd);
+    records = dbLoadRecords(normalizedCwd);
   }
-  const workspace = workspaceKey(normalizedCwd);
-  const records = dbLoadRecords(normalizedCwd);
   const selected = [];
   for (const record of records) {
     let matched = false;
-    if (runId !== null && runId !== undefined) {
-      matched = record.run_id === runId && (!owner || matchesOwner(record, owner.ownerKey, workspace));
+    if (hasRunId) {
+      matched = record.run_id === runId;
     } else if (name !== null && name !== undefined) {
       matched = Boolean(owner) && record.name === name && matchesOwner(record, owner.ownerKey, workspace);
     } else {
@@ -1547,6 +1574,7 @@ module.exports = {
   dbRemoveRecord,
   dbLoadRecords,
   dbFindRecord,
+  dbFindRecordByRunId,
   dbDeleteRecords,
   contextPath,
   lockPathFor,
@@ -1574,6 +1602,7 @@ module.exports = {
   readOutputLines,
   subscribeOutput,
   findRecord,
+  findRecordByRunId,
   isPosixShellBackgroundCommand,
   startProcess,
   matchesOwner,
