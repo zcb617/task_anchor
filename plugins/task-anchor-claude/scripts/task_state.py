@@ -1316,7 +1316,7 @@ def guard_pre_tool_use(
             "permissionDecision": "deny",
             "permissionDecisionReason": (
                 f"Process keyword {matched_keyword!r} requires "
-                "mcp__plugin_task-anchor_task-anchor__managed_exec. Start the process with operation \"run\"; afterwards, to read its output/logs, call operation \"output\" with the run_id returned by run and a positive integer \"lines\"."
+                "mcp__plugin_task-anchor_task-anchor__managed_exec. Start the process with operation \"run\" and keep the returned run_id. To read its output/logs, call operation \"output\" with run_id and a positive integer \"lines\"; follow is optional and cwd is not needed. To stop by run_id, call operation \"stop\" with run_id; include_keep is optional and cwd is not needed. cwd is only used as the process working directory or for workspace-scoped list, cleanup, and stop-by-name operations. session_id is injected by the Hook; do not pass it."
             ),
         },
     }

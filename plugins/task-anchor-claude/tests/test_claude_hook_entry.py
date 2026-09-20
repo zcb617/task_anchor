@@ -436,6 +436,13 @@ class ClaudeHookEntryTests(unittest.TestCase):
                     "mcp__plugin_task-anchor_task-anchor__managed_exec",
                     result["hookSpecificOutput"]["permissionDecisionReason"],
                 )
+                reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+                self.assertIn('operation "output"', reason)
+                self.assertIn("run_id", reason)
+                self.assertIn('"lines"', reason)
+                self.assertIn("cwd is not needed", reason)
+                self.assertIn('operation "stop"', reason)
+                self.assertIn("include_keep", reason)
 
     def test_pre_tool_use_matches_nested_command_fields(self) -> None:
         """验证 toolInput 和 arguments 中的命令仍按进程关键词拦截。"""

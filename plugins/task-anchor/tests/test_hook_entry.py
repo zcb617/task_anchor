@@ -200,7 +200,14 @@ class HookEntryTests(unittest.TestCase):
         self.assertEqual(
             result["hookSpecificOutput"]["permissionDecision"], "deny"
         )
-        self.assertIn("managed_exec", result["hookSpecificOutput"]["permissionDecisionReason"])
+        reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("managed_exec", reason)
+        self.assertIn('operation "output"', reason)
+        self.assertIn("run_id", reason)
+        self.assertIn('"lines"', reason)
+        self.assertIn("cwd is not needed", reason)
+        self.assertIn('operation "stop"', reason)
+        self.assertIn("include_keep", reason)
 
     def test_managed_exec_binding_audits_environment_injection(self) -> None:
         """验证 Codex managed_exec 绑定注入环境并只审计环境摘要标记。"""

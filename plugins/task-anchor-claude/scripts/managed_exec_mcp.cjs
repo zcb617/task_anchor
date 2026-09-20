@@ -21,7 +21,7 @@ const TOOL_SCHEMA = {
       type: "string",
       enum: ["run", "stop", "list", "cleanup", "output"],
       default: "run",
-      description: "run 启动命令；stop 停止指定资源；list 查看登记；cleanup 清理默认资源；output 读取已启动进程的输出/日志。启动进程用 run；之后需要查看该进程输出或日志时用 output，并传 run 返回的 run_id 和正整数 lines。",
+      description: "run 启动进程并返回 run_id，cwd 指定启动命令的工作目录，省略时使用当前工作目录；output 按 run_id 读取已启动进程的输出/日志，必须传 run_id 和正整数 lines，可选 follow，不需要 cwd；stop 按 run_id 停止进程，可选 include_keep，不需要 cwd；stop 按 name、list、cleanup 按工作区范围处理资源。",
     },
     // 直接启动的可执行程序。
     program: { type: "string", description: "可执行程序，例如 npm、python、java。" },
@@ -36,7 +36,7 @@ const TOOL_SCHEMA = {
     // 是否保持宿主 shell 参数语义。
     shell: { type: "boolean", default: false },
     // 子进程工作目录。
-    cwd: { type: "string", description: "工作目录，默认当前工作目录。" },
+    cwd: { type: "string", description: "启动进程时指定工作目录，或用于 list、cleanup、stop 按 name 的工作区范围；output 和 stop 按 run_id 定位时不需要 cwd。" },
     // 单次命令的毫秒级时间上限。
     timeout_ms: { type: ["integer", "null"], default: 1800000 },
     // Stop 时清理还是保留资源。
@@ -47,9 +47,9 @@ const TOOL_SCHEMA = {
       description: "默认 cleanup：Stop 时关闭；keep：Stop 时保留。",
     },
     // keep 资源用于显式 stop 的名称。
-    name: { type: "string", description: "资源名称，便于后续 stop。" },
+    name: { type: "string", description: "资源名称；只有 stop 按名称停止时使用，并按 cwd 工作区范围查找。" },
     // 显式停止目标资源的唯一 ID，output 操作按此读取日志。
-    run_id: { type: "string", description: "受管运行的唯一标识。output 操作必填，取 run 操作返回值中的 run_id；stop 操作按此指定目标。" },
+    run_id: { type: "string", description: "受管运行的唯一标识，由 run 返回；output 必须传入，stop 按 run_id 停止时传入，这两种按 ID 操作都不需要 cwd。" },
     // output 操作读取末尾的日志行数，必须是正整数。
     lines: { type: "integer", description: "output 操作必填，读取进程合并输出日志末尾的行数，必须是正整数。" },
     // output 操作是否持续订阅后续日志输出。
@@ -57,7 +57,7 @@ const TOOL_SCHEMA = {
     // 当前任务标识。
     task_id: { type: "string", description: "通常不需要，默认从 Task Anchor 当前上下文解析。" },
     // stop 是否连 keep 资源一并停止。
-    include_keep: { type: "boolean", default: true },
+    include_keep: { type: "boolean", default: true, description: "仅对 stop 有效；按 run_id 或 name 停止时可选，默认包含 keep 资源。" },
     // 传给子进程的环境变量对象。
     env: {
       type: "object",
