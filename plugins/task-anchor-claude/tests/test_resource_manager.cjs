@@ -32,7 +32,13 @@ function fixture() {
       } else {
         process.env.TASK_ANCHOR_RUNTIME_ROOT = previousRuntimeRoot;
       }
-      fs.rmSync(root, { recursive: true, force: true });
+      try {
+        fs.rmSync(root, { recursive: true, force: true });
+      } catch (error) {
+        if (process.platform !== "win32" || error?.code !== "EPERM") {
+          throw error;
+        }
+      }
     },
   };
 }
@@ -166,7 +172,9 @@ test("program and args preserve environment, cwd, and non-zero exit", async () =
       assert.equal(events[2].batch_program, null);
     }
     assert.equal(events.some((event) => Object.hasOwn(event, "TASK_ANCHOR_NODE_TEST")), false);
-    assert.deepEqual(manager.listProcesses({ cwd: testFixture.workspace, sessionId: testFixture.sessionId }), []);
+    const record = manager.dbFindRecord(testFixture.workspace, result.run_id);
+    assert.equal(record.status, "exited");
+    assert.equal(record.exit_code, 7);
   } finally {
     testFixture.restore();
   }
@@ -239,14 +247,16 @@ test("legacy lock file does not block the new lock directory", async () => {
       sessionId: testFixture.sessionId,
     });
     assert.equal(resource.output, "legacy-lock");
-    assert.deepEqual(manager.listProcesses({ cwd: testFixture.workspace, sessionId: testFixture.sessionId }), []);
+    const record = manager.dbFindRecord(testFixture.workspace, resource.run_id);
+    assert.equal(record.status, "exited");
+    assert.equal(record.exit_code, 0);
     assert.equal(fs.existsSync(legacyLock), true);
   } finally {
     testFixture.restore();
   }
 });
 
-test("timeout ends the process tree and removes the ordinary resource", async () => {
+test("timeout ends the process tree and retains an exited record", async () => {
   const testFixture = fixture();
   try {
     const result = await runToCompletion({
@@ -283,13 +293,14 @@ test("timeout ends the process tree and removes the ordinary resource", async ()
     assert.equal(events.some((event) => event.message === "timeout_triggered"), true);
     assert.equal(events.some((event) => event.message === "timeout_stop_succeeded"), true);
     assert.equal(manager.processAlive(result.pid), false);
-    assert.deepEqual(manager.listProcesses({ cwd: testFixture.workspace, sessionId: testFixture.sessionId }), []);
+    const record = manager.dbFindRecord(testFixture.workspace, result.run_id);
+    assert.equal(record.status, "exited");
   } finally {
     testFixture.restore();
   }
 });
 
-test("long-running cleanup command is terminated by timeout and ledger is cleared", async () => {
+test("long-running cleanup command is terminated by timeout and ledger keeps exited state", async () => {
   const testFixture = fixture();
   try {
     const resource = await runToCompletion({
@@ -302,7 +313,8 @@ test("long-running cleanup command is terminated by timeout and ledger is cleare
     assert.equal(resource.status, "exited");
     assert.equal(resource.timed_out, true);
     assert.equal(manager.processAlive(resource.pid), false);
-    assert.deepEqual(manager.listProcesses({ cwd: testFixture.workspace, sessionId: testFixture.sessionId }), []);
+    const record = manager.dbFindRecord(testFixture.workspace, resource.run_id);
+    assert.equal(record.status, "exited");
   } finally {
     testFixture.restore();
   }
@@ -384,7 +396,8 @@ test("POSIX shell 禁止末尾 & 后台运行，普通命令等执行完，长�
     assert.equal(long.status, "exited");
     assert.equal(long.timed_out, true);
     assert.equal(manager.processAlive(long.pid), false);
-    assert.deepEqual(manager.listProcesses({ cwd: testFixture.workspace, sessionId: testFixture.sessionId }), []);
+    const record = manager.dbFindRecord(testFixture.workspace, long.run_id);
+    assert.equal(record.status, "exited");
   } finally {
     if (keepRunId) {
       await manager.stopProcess({ cwd: testFixture.workspace, runId: keepRunId, sessionId: testFixture.sessionId, includeKeep: true });

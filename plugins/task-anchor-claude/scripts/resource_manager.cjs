@@ -5,6 +5,7 @@ const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { DatabaseSync } = require("node:sqlite");
 const { TaskAnchorLogger } = require("./task_anchor_logger.cjs");
 
 // 资源账本格式版本，用于兼容现有 Python Hook 读取的数据。
@@ -31,6 +32,10 @@ const EXPLICIT_RUN_ID_REQUIRES_OWNER = true;
 const LIVE_PROCESSES = new Map();
 // 每个受管运行的输出订阅回调集合，用于 output follow 模式。
 const OUTPUT_LISTENERS = new Map();
+// 当前 Node 进程复用的 SQLite 账本连接。
+let LEDGER_DB = null;
+// 当前 SQLite 账本连接对应的绝对路径。
+let LEDGER_DB_PATH = null;
 // Windows 需要经由命令解释器启动的批处理包装程序扩展名。
 const WINDOWS_BATCH_EXTENSIONS = new Set([".bat", ".cmd"]);
 
@@ -112,18 +117,13 @@ function workspaceKey(cwd) {
   return sha256Text(workspaceIdentity(cwd));
 }
 
-/** 返回 Task Anchor 运行时根目录，遵循现有环境变量和平台约定。 */
+/** 返回 Task Anchor 运行时根目录，默认统一位于家目录 .task_anchor，支持环境变量覆盖。 */
 function runtimeRoot() {
   const override = process.env.TASK_ANCHOR_RUNTIME_ROOT;
   if (typeof override === "string" && override.trim()) {
     return path.resolve(override.trim().replace(/^~(?=$|[\\/])/, os.homedir()));
   }
-  if (currentPlatform() === PLATFORM_WINDOWS) {
-    const base = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
-    return path.join(base, "TaskAnchor", "runtime");
-  }
-  const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
-  return path.join(base, "task-anchor");
+  return path.join(os.homedir(), ".task_anchor");
 }
 
 /** 返回工作区专属运行时目录，隔离不同项目的资源账本。 */
@@ -134,6 +134,161 @@ function workspaceRuntimeDirectory(cwd) {
 /** 返回与 Python manager 兼容的资源账本路径。 */
 function ledgerPath(cwd) {
   return path.join(workspaceRuntimeDirectory(cwd), "resources.json");
+}
+
+/** 返回全局 SQLite 账本路径，与运行时根目录保持一致。 */
+function ledgerDbPath() {
+  return path.join(runtimeRoot(), "ledger.db");
+}
+
+/** 初始化 SQLite 账本连接的 WAL 模式和资源记录表。 */
+function initDb(db) {
+  db.exec(`
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE IF NOT EXISTS records (
+      run_id TEXT PRIMARY KEY,
+      schema_version INTEGER NOT NULL DEFAULT 1,
+      owner_key TEXT NOT NULL,
+      session_key TEXT,
+      task_id TEXT,
+      workspace_key TEXT NOT NULL,
+      cwd TEXT NOT NULL,
+      platform TEXT NOT NULL,
+      program TEXT,
+      args TEXT,
+      command TEXT NOT NULL,
+      pid INTEGER NOT NULL,
+      started_at TEXT NOT NULL,
+      started_at_epoch REAL NOT NULL,
+      stop_policy TEXT NOT NULL,
+      name TEXT,
+      log_path TEXT NOT NULL,
+      diagnostic_log_path TEXT,
+      status TEXT NOT NULL DEFAULT 'running',
+      exit_code INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+  return db;
+}
+
+/** 懒加载全局 SQLite 账本连接，并在运行时根目录变化时切换连接。 */
+function getDb() {
+  const databasePath = ledgerDbPath();
+  if (LEDGER_DB && LEDGER_DB_PATH !== databasePath) {
+    LEDGER_DB.close();
+    LEDGER_DB = null;
+    LEDGER_DB_PATH = null;
+  }
+  if (!LEDGER_DB) {
+    fs.mkdirSync(path.dirname(databasePath), { recursive: true });
+    LEDGER_DB = new DatabaseSync(databasePath);
+    LEDGER_DB_PATH = databasePath;
+    initDb(LEDGER_DB);
+  }
+  return LEDGER_DB;
+}
+
+/** 将 SQLite 查询行还原为兼容旧账本接口的资源记录对象。 */
+function dbRecordFromRow(row) {
+  let args = [];
+  if (typeof row.args === "string" && row.args) {
+    try {
+      const parsed = JSON.parse(row.args);
+      args = Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+      throw new ResourceError(`资源记录损坏：SQLite run_id=${row.run_id}`);
+    }
+  }
+  return { ...row, args };
+}
+
+/** 向 SQLite 账本插入一条受管资源记录。 */
+function dbInsertRecord(record) {
+  const db = getDb();
+  const statement = db.prepare(`
+    INSERT INTO records (
+      run_id, schema_version, owner_key, session_key, task_id, workspace_key, cwd,
+      platform, program, args, command, pid, started_at, started_at_epoch, stop_policy,
+      name, log_path, diagnostic_log_path, status, exit_code
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  statement.run(
+    record.run_id,
+    record.schema_version ?? SCHEMA_VERSION,
+    record.owner_key ?? null,
+    record.session_key ?? null,
+    record.task_id ?? null,
+    record.workspace_key ?? null,
+    record.cwd ?? null,
+    record.platform ?? null,
+    record.program ?? null,
+    JSON.stringify(Array.isArray(record.args) ? record.args : []),
+    record.command ?? null,
+    record.pid ?? 0,
+    record.started_at ?? null,
+    record.started_at_epoch ?? 0,
+    record.stop_policy ?? null,
+    record.name ?? null,
+    record.log_path ?? null,
+    record.diagnostic_log_path ?? null,
+    record.status ?? "running",
+    record.exit_code ?? null,
+  );
+}
+
+/** 更新 SQLite 账本中的指定记录并刷新更新时间。 */
+function dbUpdateRecord(runId, fields) {
+  const writableFields = new Set([
+    "schema_version", "owner_key", "session_key", "task_id", "workspace_key", "cwd",
+    "platform", "program", "args", "command", "pid", "started_at", "started_at_epoch",
+    "stop_policy", "name", "log_path", "diagnostic_log_path", "status", "exit_code",
+  ]);
+  const updates = [];
+  const values = [];
+  for (const [field, value] of Object.entries(fields || {})) {
+    if (!writableFields.has(field) || value === undefined) {
+      continue;
+    }
+    updates.push(`${field} = ?`);
+    values.push(field === "args" ? JSON.stringify(Array.isArray(value) ? value : []) : value ?? null);
+  }
+  updates.push("updated_at = datetime('now')");
+  values.push(runId);
+  getDb().prepare(`UPDATE records SET ${updates.join(", ")} WHERE run_id = ?`).run(...values);
+}
+
+/** 从 SQLite 账本删除一条资源记录。 */
+function dbRemoveRecord(runId) {
+  getDb().prepare("DELETE FROM records WHERE run_id = ?").run(runId);
+}
+
+/** 读取指定工作区的全部 SQLite 账本记录。 */
+function dbLoadRecords(cwd) {
+  const workspace = workspaceKey(cwd);
+  const rows = getDb().prepare(
+    "SELECT * FROM records WHERE workspace_key = ? ORDER BY started_at_epoch, created_at, run_id",
+  ).all(workspace);
+  return rows.map(dbRecordFromRow);
+}
+
+/** 按工作区和运行 ID读取 SQLite 账本记录。 */
+function dbFindRecord(cwd, runId) {
+  const workspace = workspaceKey(cwd);
+  const row = getDb().prepare(
+    "SELECT * FROM records WHERE workspace_key = ? AND run_id = ?",
+  ).get(workspace, runId);
+  return row ? dbRecordFromRow(row) : null;
+}
+
+/** 批量删除 SQLite 账本中的资源记录。 */
+function dbDeleteRecords(runIds) {
+  if (!Array.isArray(runIds) || runIds.length === 0) {
+    return;
+  }
+  const placeholders = runIds.map(() => "?").join(", ");
+  getDb().prepare(`DELETE FROM records WHERE run_id IN (${placeholders})`).run(...runIds);
 }
 
 /** 返回与 Python manager 兼容的活动上下文路径。 */
@@ -348,18 +503,29 @@ function resolveOwner(cwd, sessionId = null, taskId = null) {
   };
 }
 
-/** 读取资源账本并校验其顶层数组结构。 */
+/** 读取资源账本并返回指定工作区的 SQLite 记录。 */
 function loadRecords(cwd) {
-  const value = readJson(ledgerPath(cwd), []);
-  if (!Array.isArray(value)) {
-    throw new ResourceError("资源记录不是数组。");
-  }
-  return value.filter((item) => item && typeof item === "object" && !Array.isArray(item));
+  return dbLoadRecords(cwd);
 }
 
-/** 保存资源账本，使用与 Python manager 相同的字段集合。 */
+/** 保存资源账本，按记录差异同步指定工作区的 SQLite 数据。 */
 function saveRecords(cwd, records) {
-  writeJson(ledgerPath(cwd), records);
+  const currentRecords = dbLoadRecords(cwd);
+  const currentIds = new Set(currentRecords.map((record) => record.run_id));
+  const incomingIds = new Set(
+    records.filter((record) => record && typeof record.run_id === "string").map((record) => record.run_id),
+  );
+  dbDeleteRecords([...currentIds].filter((runId) => !incomingIds.has(runId)));
+  for (const record of records) {
+    if (!record || typeof record !== "object" || typeof record.run_id !== "string") {
+      continue;
+    }
+    if (currentIds.has(record.run_id)) {
+      dbUpdateRecord(record.run_id, record);
+    } else {
+      dbInsertRecord(record);
+    }
+  }
 }
 
 /** 判断指定 PID 是否仍然存在，不通过进程名猜测归属。 */
@@ -586,10 +752,10 @@ function readOutputLines(logPath, lines) {
   return content.split("\n").slice(-lines).join("\n");
 }
 
-/** 按工作目录和运行 ID 查找内部账本记录，供 output 读取日志。 */
+/** 按工作目录和运行 ID 查找 SQLite 账本记录，供 output 读取日志。 */
 function findRecord(cwd, runId) {
   const normalizedCwd = normalizePath(cwd);
-  return loadRecords(normalizedCwd).find((record) => record.run_id === runId) || null;
+  return dbFindRecord(normalizedCwd, runId);
 }
 
 /** 订阅指定受管运行的后续输出数据。 */
@@ -605,16 +771,9 @@ function subscribeOutput(runId, callback) {
   listeners.add(callback);
 }
 
-/** 从账本中移除已结束的资源记录，保证正常退出和超时都不残留。 */
+/** 从 SQLite 账本中移除指定资源记录。 */
 function removeRecord(cwd, runId) {
-  const filePath = ledgerPath(cwd);
-  return withFileLock(lockPathFor(filePath), () => {
-    const records = loadRecords(cwd);
-    const remaining = records.filter((item) => item.run_id !== runId);
-    if (remaining.length !== records.length) {
-      saveRecords(cwd, remaining);
-    }
-  });
+  dbRemoveRecord(runId);
 }
 
 /** 将 Node child 的 stdout/stderr 数据即时写入日志并转换为可等待的受管完成状态。 */
@@ -997,12 +1156,7 @@ async function startProcess({
       status: "running",
     };
     try {
-      const filePath = ledgerPath(normalizedCwd);
-      withFileLock(lockPathFor(filePath), () => {
-        const records = loadRecords(normalizedCwd);
-        records.push(record);
-        saveRecords(normalizedCwd, records);
-      });
+      dbInsertRecord(record);
     } catch (error) {
       logger.warning("ledger_write_failed", {
         run_id: runId,
@@ -1096,9 +1250,12 @@ async function startProcess({
       }
       if (!preserveLedgerOnTimeoutFailure) {
         try {
-          removeRecord(normalizedCwd, runId);
+          dbUpdateRecord(runId, {
+            status: "exited",
+            exit_code: completion && completion.code !== undefined ? completion.code : null,
+          });
         } catch (error) {
-          logger.warning("ledger_remove_failed", {
+          logger.warning("ledger_update_failed", {
             run_id: runId,
             error: error && error.message ? error.message : String(error),
           });
@@ -1253,8 +1410,7 @@ async function stopProcess({
     owner = resolveOwner(normalizedCwd, sessionId, taskId);
   }
   const workspace = workspaceKey(normalizedCwd);
-  const filePath = ledgerPath(normalizedCwd);
-  const records = withFileLock(lockPathFor(filePath), () => loadRecords(normalizedCwd));
+  const records = dbLoadRecords(normalizedCwd);
   const selected = [];
   for (const record of records) {
     let matched = false;
@@ -1318,10 +1474,7 @@ async function stopProcess({
     }
   }
   try {
-    withFileLock(lockPathFor(filePath), () => {
-      const current = loadRecords(normalizedCwd);
-      saveRecords(normalizedCwd, current.filter((record) => !succeededIds.has(record.run_id)));
-    });
+    dbDeleteRecords([...succeededIds]);
   } catch (error) {
     for (const [runId, logger] of loggerByRunId) {
       logger.warning("ledger_write_failed", {
@@ -1360,8 +1513,7 @@ function listProcesses({ cwd, sessionId = null, taskId = null }) {
   const normalizedCwd = normalizePath(cwd);
   const owner = resolveOwner(normalizedCwd, sessionId, taskId);
   const workspace = workspaceKey(normalizedCwd);
-  const filePath = ledgerPath(normalizedCwd);
-  const records = withFileLock(lockPathFor(filePath), () => loadRecords(normalizedCwd));
+  const records = dbLoadRecords(normalizedCwd);
   return records.filter((record) => matchesOwner(record, owner.ownerKey, workspace));
 }
 
@@ -1387,6 +1539,15 @@ module.exports = {
   runtimeRoot,
   workspaceRuntimeDirectory,
   ledgerPath,
+  ledgerDbPath,
+  getDb,
+  initDb,
+  dbInsertRecord,
+  dbUpdateRecord,
+  dbRemoveRecord,
+  dbLoadRecords,
+  dbFindRecord,
+  dbDeleteRecords,
   contextPath,
   lockPathFor,
   sessionKey,

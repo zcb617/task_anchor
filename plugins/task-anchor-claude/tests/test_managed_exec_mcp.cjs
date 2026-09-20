@@ -28,7 +28,13 @@ function fixture() {
       } else {
         process.env.TASK_ANCHOR_RUNTIME_ROOT = previousRuntimeRoot;
       }
-      fs.rmSync(root, { recursive: true, force: true });
+      try {
+        fs.rmSync(root, { recursive: true, force: true });
+      } catch (error) {
+        if (process.platform !== "win32" || error?.code !== "EPERM") {
+          throw error;
+        }
+      }
     },
   };
 }
@@ -197,7 +203,7 @@ test("operation=output validates lines and supports tail and follow", async () =
         program: process.execPath,
         args: [
           "-e",
-          "const n=String.fromCharCode(10); process.stdout.write('line-1'+n+'line-2'+n+'line-3'); setTimeout(() => process.stdout.write(n+'follow-line'), 120); setTimeout(() => process.exit(0), 220)",
+          "const n=String.fromCharCode(10); process.stdout.write('line-1'+n+'line-2'+n+'line-3'); setTimeout(() => process.stdout.write(n+'follow-line'), 300); setTimeout(() => process.exit(0), 800)",
         ],
         cwd: testFixture.workspace,
         timeout_ms: null,
@@ -276,6 +282,8 @@ test("tools/call returns the stable structured list and cleans timeout resources
     assert.equal(resource.status, "exited");
     assert.equal(resource.timed_out, true);
     assert.equal(manager.processAlive(resource.pid), false);
+    const retained = manager.dbFindRecord(testFixture.workspace, resource.run_id);
+    assert.equal(retained.status, "exited");
     const stopped = await mcp.executeTool({
       operation: "stop",
       run_id: resource.run_id,
@@ -283,7 +291,8 @@ test("tools/call returns the stable structured list and cleans timeout resources
       session_id: testFixture.sessionId,
       include_keep: true,
     });
-    assert.equal(stopped.stopped.length, 0);
+    assert.equal(stopped.stopped.length, 1);
+    assert.equal(manager.dbFindRecord(testFixture.workspace, resource.run_id), null);
   } finally {
     if (resource) {
       await mcp.executeTool({ operation: "stop", run_id: resource.run_id, cwd: testFixture.workspace, session_id: testFixture.sessionId, include_keep: true });

@@ -307,16 +307,10 @@ class ResourceManagerTests(unittest.TestCase):
             self.assertTrue(RESOURCE_MANAGER._process_alive(resource_b["pid"]))
         finally:
             RESOURCE_MANAGER.stop_process(
-                cwd=str(self.workspace),
-                run_id=resource_a["run_id"],
-                session_id=session_a,
-                include_keep=True,
+                cwd=str(self.workspace), run_id=resource_a["run_id"], include_keep=True
             )
             RESOURCE_MANAGER.stop_process(
-                cwd=str(self.workspace),
-                run_id=resource_b["run_id"],
-                session_id=session_b,
-                include_keep=True,
+                cwd=str(self.workspace), run_id=resource_b["run_id"], include_keep=True
             )
 
     def test_explicit_run_id_cannot_stop_another_session_resource(self) -> None:
@@ -467,12 +461,10 @@ class ResourceManagerTests(unittest.TestCase):
         self.assertEqual(result["status"], "exited")
         self.assertEqual(result["exit_code"], 0)
         self.assertIn("managed-ok", result["output"])
-        self.assertEqual(
-            RESOURCE_MANAGER.list_processes(
-                cwd=str(self.workspace), session_id=self.session_id
-            ),
-            [],
-        )
+        record = RESOURCE_MANAGER.find_record(str(self.workspace), result["run_id"])
+        self.assertIsNotNone(record)
+        self.assertEqual(record["status"], "exited")
+        self.assertEqual(record["exit_code"], 0)
 
     def test_posix_rejects_trailing_ampersand(self) -> None:
         """POSIX shell 末尾 & 直接抛业务错误，命令无法启动。"""
@@ -489,7 +481,7 @@ class ResourceManagerTests(unittest.TestCase):
             )
 
     def test_long_running_cleanup_command_times_out(self) -> None:
-        """长跑命令 cleanup + 短 timeout_ms 被超时，进程终止且账本清空。"""
+        """长跑命令 cleanup + 短 timeout_ms 被超时，进程终止且账本保留退出状态。"""
         result = self.run_to_completion(
             cwd=str(self.workspace),
             program=sys.executable,
@@ -501,12 +493,9 @@ class ResourceManagerTests(unittest.TestCase):
             self.assertEqual(result["status"], "exited")
             self.assertTrue(result["timed_out"])
             self.assertFalse(RESOURCE_MANAGER._process_alive(result["pid"]))
-            self.assertEqual(
-                RESOURCE_MANAGER.list_processes(
-                    cwd=str(self.workspace), session_id=self.session_id
-                ),
-                [],
-            )
+            record = RESOURCE_MANAGER.find_record(str(self.workspace), result["run_id"])
+            self.assertIsNotNone(record)
+            self.assertEqual(record["status"], "exited")
         finally:
             RESOURCE_MANAGER.stop_process(
                 cwd=str(self.workspace),
@@ -718,7 +707,8 @@ class ManagedExecMcpTests(unittest.TestCase):
                     "include_keep": True,
                 }
             )
-            self.assertEqual(result["stopped"], [])
+            self.assertEqual(len(result["stopped"]), 1)
+            self.assertEqual(result["stopped"][0]["status"], "already_stopped")
         finally:
             MCP.execute_tool(
                 {
