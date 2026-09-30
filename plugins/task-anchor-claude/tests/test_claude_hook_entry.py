@@ -470,6 +470,137 @@ class ClaudeHookEntryTests(unittest.TestCase):
                     result["hookSpecificOutput"]["permissionDecisionReason"],
                 )
 
+    def test_pre_tool_use_allows_process_keyword_as_plain_text(self) -> None:
+        """验证普通文本中的进程关键词不会被 PreToolUse 拦截。"""
+        for command in (
+            "echo java",
+            'echo "java 只是文本"',
+            'git commit -m "fix java NPE"',
+            "echo javascript",
+        ):
+            with self.subTest(command=command):
+                result = HOOK.handle_hook(
+                    self.payload(
+                        "PreToolUse",
+                        tool_name="Bash",
+                        tool_input={"command": command},
+                    ),
+                    self.data_root,
+                )
+                self.assertIsNone(result)
+
+    def test_pre_tool_use_intercepts_process_command_positions(self) -> None:
+        """验证真正处于命令位置的进程命令仍要求 managed_exec。"""
+        for command in (
+            "java -jar app.jar",
+            "dir && java -version",
+            "cmd /c java -version",
+            'bash -c "java -jar app.jar"',
+            "JAVA_HOME=/opt/java mvn compile",
+            "echo $(java -version)",
+        ):
+            with self.subTest(command=command):
+                result = HOOK.handle_hook(
+                    self.payload(
+                        "PreToolUse",
+                        tool_name="Bash",
+                        tool_input={"command": command},
+                    ),
+                    self.data_root,
+                )
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+                self.assertIn(
+                    "mcp__plugin_task-anchor_task-anchor__managed_exec",
+                    result["hookSpecificOutput"]["permissionDecisionReason"],
+                )
+
+    def test_pre_tool_use_parse_failure_falls_back_to_substring(self) -> None:
+        """验证未闭合命令引号使用保守关键词回退。"""
+        blocked = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="Bash",
+                tool_input={"command": 'echo "java'},
+            ),
+            self.data_root,
+        )
+        self.assertIsNotNone(blocked)
+        assert blocked is not None
+        self.assertEqual(blocked["hookSpecificOutput"]["permissionDecision"], "deny")
+        allowed = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="Bash",
+                tool_input={"command": 'echo "hello'},
+            ),
+            self.data_root,
+        )
+        self.assertIsNone(allowed)
+
+    def test_pre_tool_use_checks_each_command_field_independently(self) -> None:
+        """验证多个命令字段分别解析时不会遗漏进程命令。"""
+        result = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="Bash",
+                tool_input={"command": "echo ok", "script": "java -jar app.jar"},
+            ),
+            self.data_root,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_read_post_compact_reload_count_accepts_explicit_config_dir(self) -> None:
+        """验证条数函数按传入目录读取配置：有配置走配置，没配置走默认 20。"""
+        with_config = self.root / "with-config"
+        config_path = with_config / ".task_anchor" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
+            json.dumps({"reloadCount": 10}), encoding="utf-8"
+        )
+
+        self.assertEqual(STATE.read_post_compact_reload_count(with_config), 10)
+        self.assertEqual(
+            STATE.read_post_compact_reload_count(self.root / "without-config"),
+            20,
+        )
+
+    def test_excluded_project_skips_interception_but_binds_managed_exec(self) -> None:
+        """验证排除名单只跳过拦截，managed_exec 绑定不受影响。"""
+        self.config_path.write_text(
+            json.dumps({"excludeProjects": [str(self.workspace)]}),
+            encoding="utf-8",
+        )
+
+        intercept_result = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="Bash",
+                tool_input={"command": "java -jar app.jar"},
+            ),
+            self.data_root,
+        )
+        self.assertIsNone(intercept_result)
+
+        bind_result = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="mcp__plugin_task-anchor_task-anchor__managed_exec",
+                tool_input={"operation": "run", "program": "node"},
+            ),
+            self.data_root,
+        )
+        self.assertIsNotNone(bind_result)
+        assert bind_result is not None
+        hook_output = bind_result["hookSpecificOutput"]
+        self.assertEqual(hook_output["permissionDecision"], "allow")
+        self.assertEqual(
+            hook_output["updatedInput"]["session_id"], self.session_id
+        )
+
     def test_pre_tool_use_allows_non_command_tools_without_command_text(self) -> None:
         """验证 Read 和 Write 不因缺少命令文本进入进程命令拦截。"""
         for tool_name, tool_input in (

@@ -19,6 +19,7 @@ SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 import resource_manager
+import process_command_parser
 from task_anchor_logger import TaskAnchorLogger
 
 SKILL_MARKER = "$task-anchor"
@@ -93,30 +94,6 @@ MUTATION_TOOL_TOKENS = {
     "write",
 }
 FILE_RESOURCE_TOKENS = {"directory", "file", "folder", "path"}
-PROCESS_COMMAND_KEYWORDS = (
-    "java",
-    "python",
-    "node",
-    "npm",
-    "npx",
-    "pnpm",
-    "yarn",
-    "mvn",
-    "maven",
-    "gradle",
-    "go",
-    "cargo",
-    "dotnet",
-    "docker",
-    "podman",
-    "adb",
-    "ffmpeg",
-    "deno",
-    "bun",
-    "php",
-    "ruby",
-    "perl",
-)
 COMMAND_TEXT_KEYS = (
     "command",
     "cmd",
@@ -214,10 +191,13 @@ def warning(message: str) -> dict[str, Any]:
     return {"continue": True, "systemMessage": message}
 
 
-def read_post_compact_reload_count() -> int:
+def read_post_compact_reload_count(config_dir: Path | None = None) -> int:
     """读取 Codex PostCompact 提醒条数配置，异常时返回默认值。"""
+    if config_dir is None:
+        raw_config_dir = os.environ.get("TASK_ANCHOR_CONFIG_DIR")
+        config_dir = Path(raw_config_dir) if raw_config_dir else Path.home()
     try:
-        config_path = Path.home() / ".task_anchor" / "config.json"
+        config_path = config_dir / ".task_anchor" / "config.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError):
         return POST_COMPACT_DEFAULT_RELOAD_COUNT
@@ -1160,8 +1140,8 @@ def _bind_managed_exec_to_session(
     }
 
 
-def _command_text(data: dict[str, Any]) -> str:
-    """提取 Hook 输入中的命令字符串，不解析命令结构。"""
+def _command_texts(data: dict[str, Any]) -> list[str]:
+    """提取 Hook 输入中的命令字符串列表，不解析命令结构。"""
 
     parts: list[str] = []
 
@@ -1176,15 +1156,7 @@ def _command_text(data: dict[str, Any]) -> str:
             visit(value.get(key), depth + 1)
 
     visit(data)
-    return " ".join(parts)
-
-
-def _matched_process_keyword(command_text: str) -> str | None:
-    normalized = command_text.lower()
-    return next(
-        (keyword for keyword in PROCESS_COMMAND_KEYWORDS if keyword in normalized),
-        None,
-    )
+    return parts
 
 
 def _is_excluded_project(cwd: object) -> bool:
@@ -1193,7 +1165,9 @@ def _is_excluded_project(cwd: object) -> bool:
     if not isinstance(cwd, str) or not cwd.strip():
         return False
     try:
-        config_path = Path.home() / ".task_anchor" / "config.json"
+        raw_config_dir = os.environ.get("TASK_ANCHOR_CONFIG_DIR")
+        config_dir = Path(raw_config_dir) if raw_config_dir else Path.home()
+        config_path = config_dir / ".task_anchor" / "config.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError):
         return False
@@ -1223,10 +1197,13 @@ def guard_pre_tool_use(
 ) -> dict[str, Any] | None:
     """限制 FastCtx 工具，并要求进程型命令通过 managed_exec 执行。"""
 
+    tool_name = _tool_name(data)
+    if _is_managed_exec_tool(tool_name):
+        return _bind_managed_exec_to_session(data, data_root)
+
     if _is_excluded_project(data.get("cwd")):
         return None
 
-    tool_name = _tool_name(data)
     if _is_fastctx_tool(tool_name):
         if _is_fastctx_read_only_tool(tool_name):
             return None
@@ -1265,11 +1242,11 @@ def guard_pre_tool_use(
                 f"{READ_ONLY_SKILL_MARKER} blocks mutation-capable tools; "
                 f"invoke {WRITE_SKILL_MARKER} to allow modifications."
             )
-    if _is_managed_exec_tool(tool_name):
-        return _bind_managed_exec_to_session(data, data_root)
-
-    command_text = _command_text(data)
-    matched_keyword = _matched_process_keyword(command_text)
+    matched_keyword: str | None = None
+    for command_text in _command_texts(data):
+        matched_keyword = process_command_parser.matched_process_keyword(command_text)
+        if matched_keyword is not None:
+            break
     if matched_keyword is None:
         return None
 

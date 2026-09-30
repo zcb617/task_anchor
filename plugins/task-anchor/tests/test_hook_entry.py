@@ -38,8 +38,14 @@ class HookEntryTests(unittest.TestCase):
         self.other_workspace = self.data_root / "workspace-b"
         self.workspace.mkdir()
         self.other_workspace.mkdir()
+        self.previous_config_dir = os.environ.get("TASK_ANCHOR_CONFIG_DIR")
+        os.environ["TASK_ANCHOR_CONFIG_DIR"] = str(self.data_root / "no-config")
 
     def tearDown(self) -> None:
+        if self.previous_config_dir is None:
+            os.environ.pop("TASK_ANCHOR_CONFIG_DIR", None)
+        else:
+            os.environ["TASK_ANCHOR_CONFIG_DIR"] = self.previous_config_dir
         if self.previous_runtime_root is None:
             os.environ.pop("TASK_ANCHOR_RUNTIME_ROOT", None)
         else:
@@ -208,6 +214,60 @@ class HookEntryTests(unittest.TestCase):
         self.assertIn("cwd is not needed", reason)
         self.assertIn('operation "stop"', reason)
         self.assertIn("include_keep", reason)
+
+    def test_pre_tool_use_allows_process_keyword_as_plain_text(self) -> None:
+        """验证普通文本中的进程关键词不会被 PreToolUse 拦截。"""
+        for command in (
+            "echo java",
+            'echo "java 只是文本"',
+            'git commit -m "fix java NPE"',
+            "echo javascript",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(
+                    HOOK.handle_hook(self.pre_tool_use("exec", {"cmd": command}), self.data_root)
+                )
+
+    def test_pre_tool_use_intercepts_process_command_positions(self) -> None:
+        """验证真正处于命令位置的进程命令仍要求 managed_exec。"""
+        for command in (
+            "java -jar app.jar",
+            "dir && java -version",
+            "cmd /c java -version",
+            'bash -c "java -jar app.jar"',
+            "JAVA_HOME=/opt/java mvn compile",
+            "echo $(java -version)",
+        ):
+            with self.subTest(command=command):
+                result = HOOK.handle_hook(
+                    self.pre_tool_use("exec", {"cmd": command}), self.data_root
+                )
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+                self.assertIn("managed_exec", result["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_pre_tool_use_parse_failure_falls_back_to_substring(self) -> None:
+        """验证未闭合命令引号使用保守关键词回退。"""
+        blocked = HOOK.handle_hook(
+            self.pre_tool_use("exec", {"cmd": 'echo "java'}), self.data_root
+        )
+        self.assertIsNotNone(blocked)
+        assert blocked is not None
+        self.assertEqual(blocked["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(
+            HOOK.handle_hook(self.pre_tool_use("exec", {"cmd": 'echo "hello'}), self.data_root)
+        )
+
+    def test_pre_tool_use_checks_each_command_field_independently(self) -> None:
+        """验证多个命令字段分别解析时不会遗漏进程命令。"""
+        result = HOOK.handle_hook(
+            self.pre_tool_use("exec", {"cmd": "echo ok", "script": "java -jar app.jar"}),
+            self.data_root,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_managed_exec_binding_audits_environment_injection(self) -> None:
         """验证 Codex managed_exec 绑定注入环境并只审计环境摘要标记。"""
@@ -411,8 +471,8 @@ class HookEntryTests(unittest.TestCase):
 
     def test_post_compact_uses_configured_reload_count_and_restores_task(self) -> None:
         """验证 Codex PostCompact 使用配置条数并保留任务恢复正文。"""
-        home = self.data_root / "home-reload-count"
-        config_path = home / ".task_anchor" / "config.json"
+        config_dir = Path(os.environ["TASK_ANCHOR_CONFIG_DIR"])
+        config_path = config_dir / ".task_anchor" / "config.json"
         config_path.parent.mkdir(parents=True)
         config_path.write_text(
             json.dumps({"excludeProjects": [], "reloadCount": 7}),
@@ -420,9 +480,8 @@ class HookEntryTests(unittest.TestCase):
         )
 
         task_prompt = "$task-anchor 使用配置条数恢复当前任务"
-        with patch.object(HOOK.Path, "home", return_value=home):
-            task_id = self.activate(task_prompt)
-            result = HOOK.handle_hook(self.post_compact(), self.data_root)
+        task_id = self.activate(task_prompt)
+        result = HOOK.handle_hook(self.post_compact(), self.data_root)
 
         self.assertIsNotNone(result)
         assert result is not None
@@ -436,8 +495,7 @@ class HookEntryTests(unittest.TestCase):
 
     def test_post_compact_invalid_reload_count_uses_default(self) -> None:
         """验证 Codex PostCompact 的缺失或非法条数回退默认值。"""
-        home = self.data_root / "home-invalid-reload-count"
-        config_path = home / ".task_anchor" / "config.json"
+        config_path = Path(os.environ["TASK_ANCHOR_CONFIG_DIR"]) / ".task_anchor" / "config.json"
         config_path.parent.mkdir(parents=True)
         task_prompt = "$task-anchor 非法配置仍恢复当前任务"
 
@@ -449,22 +507,67 @@ class HookEntryTests(unittest.TestCase):
             {"excludeProjects": [], "reloadCount": 7.0},
             {"excludeProjects": [], "reloadCount": "7"},
         )
-        with patch.object(HOOK.Path, "home", return_value=home):
-            task_id = self.activate(task_prompt)
-            for config in invalid_configs:
-                with self.subTest(config=config):
-                    config_path.write_text(json.dumps(config), encoding="utf-8")
-                    result = HOOK.handle_hook(self.post_compact(), self.data_root)
+        task_id = self.activate(task_prompt)
+        for config in invalid_configs:
+            with self.subTest(config=config):
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                result = HOOK.handle_hook(self.post_compact(), self.data_root)
 
-                    self.assertIsNotNone(result)
-                    assert result is not None
-                    hook_output = result["hookSpecificOutput"]
-                    self.assertEqual(hook_output["hookEventName"], "PostCompact")
-                    self.assertIsInstance(hook_output["additionalContext"], str)
-                    context = hook_output["additionalContext"]
-                    self.assertIn("最近的20条", context)
-                    self.assertIn(task_prompt, context)
-                    self.assertIn(f"task_id: {task_id}", context)
+                self.assertIsNotNone(result)
+                assert result is not None
+                hook_output = result["hookSpecificOutput"]
+                self.assertEqual(hook_output["hookEventName"], "PostCompact")
+                self.assertIsInstance(hook_output["additionalContext"], str)
+                context = hook_output["additionalContext"]
+                self.assertIn("最近的20条", context)
+                self.assertIn(task_prompt, context)
+                self.assertIn(f"task_id: {task_id}", context)
+
+    def test_read_post_compact_reload_count_accepts_explicit_config_dir(self) -> None:
+        """验证条数函数按传入目录读取配置：有配置走配置，没配置走默认 20。"""
+        with_config = self.data_root / "with-config"
+        config_path = with_config / ".task_anchor" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
+            json.dumps({"reloadCount": 10}), encoding="utf-8"
+        )
+
+        self.assertEqual(HOOK.read_post_compact_reload_count(with_config), 10)
+        self.assertEqual(
+            HOOK.read_post_compact_reload_count(self.data_root / "without-config"),
+            20,
+        )
+
+    def test_excluded_project_skips_interception_but_binds_managed_exec(self) -> None:
+        """验证排除名单只跳过拦截，managed_exec 绑定不受影响。"""
+        config_dir = Path(os.environ["TASK_ANCHOR_CONFIG_DIR"])
+        config_path = config_dir / ".task_anchor" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            json.dumps({"excludeProjects": [str(self.workspace)]}),
+            encoding="utf-8",
+        )
+
+        intercept_result = HOOK.handle_hook(
+            self.pre_tool_use("exec", {"cmd": "java -jar app.jar"}),
+            self.data_root,
+        )
+        self.assertIsNone(intercept_result)
+
+        bind_result = HOOK.handle_hook(
+            self.pre_tool_use(
+                "mcp__task_anchor__managed_exec",
+                {"program": "node", "args": []},
+            ),
+            self.data_root,
+        )
+        self.assertIsNotNone(bind_result)
+        assert bind_result is not None
+        hook_output = bind_result["hookSpecificOutput"]
+        self.assertEqual(hook_output["permissionDecision"], "allow")
+        self.assertEqual(
+            hook_output["updatedInput"]["session_id"], self.session_id
+        )
 
     def test_post_compact_without_anchor_emits_continuity_reminder(self) -> None:
         """验证没有锚定任务时仍向 Codex 注入固定连续性提醒。"""
