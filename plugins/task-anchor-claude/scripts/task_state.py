@@ -92,15 +92,18 @@ MUTATION_TOOL_TOKENS = {
     "write",
 }
 FILE_RESOURCE_TOKENS = {"directory", "file", "folder", "path"}
-COMMAND_TEXT_KEYS = (
-    "command",
-    "cmd",
-    "shell_command",
-    "command_line",
-    "script",
-    "program",
-)
+COMMAND_TEXT_KEYS = ("command", "cmd")
 NESTED_COMMAND_KEYS = ("tool_input", "toolInput", "arguments", "input")
+# 各已知执行工具允许读取的真实命令字段，避免把辅助文本当作命令检测。
+COMMAND_TOOL_FIELDS = {
+    "bash": ("command",),
+    "exec": ("cmd", "command"),
+    "exec_command": ("cmd",),
+    "cmd": ("command", "cmd"),
+    "powershell": ("command", "cmd"),
+    "shell": ("command", "cmd"),
+    "local_shell": ("command", "cmd"),
+}
 
 
 class StorageError(RuntimeError):
@@ -1168,22 +1171,22 @@ def _bind_managed_exec_to_session(
 
 
 def _command_texts(data: dict[str, Any]) -> list[str]:
-    """提取 Hook 输入中的命令字符串列表，不解析命令结构。"""
+    """仅提取已知执行工具参数容器中的真实命令字段。"""
 
-    parts: list[str] = []
-
-    def visit(value: Any, depth: int = 0) -> None:
-        if not isinstance(value, dict) or depth > 2:
-            return
-        for key in COMMAND_TEXT_KEYS:
-            item = value.get(key)
-            if isinstance(item, str):
-                parts.append(item)
-        for key in NESTED_COMMAND_KEYS:
-            visit(value.get(key), depth + 1)
-
-    visit(data)
-    return parts
+    fields = COMMAND_TOOL_FIELDS.get(_tool_name(data).strip().lower())
+    if fields is None:
+        return []
+    command_input: dict[str, Any] = data
+    for key in NESTED_COMMAND_KEYS:
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            command_input = nested
+            break
+    for key in fields:
+        item = command_input.get(key)
+        if isinstance(item, str):
+            return [item]
+    return []
 
 
 def _is_excluded_project(cwd: object) -> bool:

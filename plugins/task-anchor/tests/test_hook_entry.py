@@ -236,7 +236,7 @@ class HookEntryTests(unittest.TestCase):
             "cmd /c java -version",
             'bash -c "java -jar app.jar"',
             "JAVA_HOME=/opt/java mvn compile",
-            "echo $(java -version)",
+            "cd /work && node app.js",
         ):
             with self.subTest(command=command):
                 result = HOOK.handle_hook(
@@ -247,27 +247,54 @@ class HookEntryTests(unittest.TestCase):
                 self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
                 self.assertIn("managed_exec", result["hookSpecificOutput"]["permissionDecisionReason"])
 
-    def test_pre_tool_use_parse_failure_falls_back_to_substring(self) -> None:
-        """验证未闭合命令引号使用保守关键词回退。"""
-        blocked = HOOK.handle_hook(
-            self.pre_tool_use("exec", {"cmd": 'echo "java'}), self.data_root
-        )
-        self.assertIsNotNone(blocked)
-        assert blocked is not None
-        self.assertEqual(blocked["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertIsNone(
-            HOOK.handle_hook(self.pre_tool_use("exec", {"cmd": 'echo "hello'}), self.data_root)
-        )
+    def test_pre_tool_use_allows_parse_failure(self) -> None:
+        """验证解析失败的命令不会回退到全文关键词匹配。"""
+        for command in ('echo "java', 'echo "hello', 'java -jar "broken'):
+            with self.subTest(command=command):
+                self.assertIsNone(
+                    HOOK.handle_hook(self.pre_tool_use("exec", {"cmd": command}), self.data_root)
+                )
 
-    def test_pre_tool_use_checks_each_command_field_independently(self) -> None:
-        """验证多个命令字段分别解析时不会遗漏进程命令。"""
-        result = HOOK.handle_hook(
-            self.pre_tool_use("exec", {"cmd": "echo ok", "script": "java -jar app.jar"}),
-            self.data_root,
+    def test_pre_tool_use_ignores_non_command_fields(self) -> None:
+        """验证执行工具只读取显式命令字段，不扫描辅助字段。"""
+        inputs = (
+            {"cmd": "echo ok", "script": "java -jar app.jar"},
+            {"cmd": "echo ok", "program": "node app.js", "command_line": "npm run dev"},
         )
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+        for tool_input in inputs:
+            with self.subTest(tool_input=tool_input):
+                self.assertIsNone(
+                    HOOK.handle_hook(self.pre_tool_use("exec", tool_input), self.data_root)
+                )
+
+    def test_pre_tool_use_allows_unsupported_scripts(self) -> None:
+        """验证不支持的脚本结构和未知包装方式均放行。"""
+        commands = (
+            "cat > demo.md <<'EOF'\n```java\nhello\n```\nEOF",
+            "echo $(java -version)",
+            "echo ok\njava -version",
+            "runner java -jar app.jar",
+            'echo "java',
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNone(
+                    HOOK.handle_hook(self.pre_tool_use("exec", {"cmd": command}), self.data_root)
+                )
+
+    def test_pre_tool_use_ignores_command_text_in_other_tools(self) -> None:
+        """验证非执行工具的命令样式字段不会触发进程检测。"""
+        inputs = (
+            ("Read", {"command": "java -jar app.jar", "file_path": "demo.md"}),
+            ("Write", {"content": "```java\nhello\n```", "script": "node app.js", "file_path": "demo.md"}),
+            ("Edit", {"command": "java -jar app.jar", "new_string": "java", "file_path": "demo.md"}),
+            ("unknown_tool", {"command": "java -jar app.jar"}),
+        )
+        for tool_name, tool_input in inputs:
+            with self.subTest(tool_name=tool_name):
+                self.assertIsNone(
+                    HOOK.handle_hook(self.pre_tool_use(tool_name, tool_input), self.data_root)
+                )
 
     def test_managed_exec_binding_audits_environment_injection(self) -> None:
         """验证 Codex managed_exec 绑定注入环境并只审计环境摘要标记。"""
