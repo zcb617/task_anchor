@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import sqlite3
 import shutil
 import sys
 import tempfile
@@ -61,11 +62,23 @@ class ResourceManagerTests(unittest.TestCase):
                 pass
         for thread in self._background_threads:
             thread.join(timeout=10)
+        RESOURCE_MANAGER.close_db()
         if self.previous_runtime_root is None:
             os.environ.pop("TASK_ANCHOR_RUNTIME_ROOT", None)
         else:
             os.environ["TASK_ANCHOR_RUNTIME_ROOT"] = self.previous_runtime_root
-        shutil.rmtree(self.root, ignore_errors=True)
+        shutil.rmtree(self.root)
+
+    def test_cached_database_can_close_repeatedly_and_reopen(self) -> None:
+        """验证缓存账本连接可重复关闭，并能重新创建独立连接。"""
+        conn = RESOURCE_MANAGER._get_db()
+        RESOURCE_MANAGER.close_db()
+        RESOURCE_MANAGER.close_db()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+        new_conn = RESOURCE_MANAGER._get_db()
+        self.assertIsNot(new_conn, conn)
+        self.assertEqual(new_conn.execute("SELECT 1").fetchone()[0], 1)
 
     def start_background_sleep(
         self,
@@ -383,7 +396,15 @@ class ResourceManagerTests(unittest.TestCase):
         self.assertEqual({event["stream"] for event in output_events}, {"stdout", "stderr"})
         self.assertIn("out-1", "".join(event["output"] for event in output_events))
         self.assertIn("err-2", "".join(event["output"] for event in output_events))
-        self.assertEqual(result["output"], "out-1err-2")
+        self.assertIn(result["output"], {"out-1err-2", "err-2out-1"})
+        self.assertEqual(
+            "".join(event["output"] for event in output_events if event["stream"] == "stdout"),
+            "out-1",
+        )
+        self.assertEqual(
+            "".join(event["output"] for event in output_events if event["stream"] == "stderr"),
+            "err-2",
+        )
 
     def test_waiting_command_is_removed_after_exit(self) -> None:
         result = self.run_to_completion(
@@ -448,11 +469,12 @@ class ManagedExecMcpTests(unittest.TestCase):
         os.environ["TASK_ANCHOR_RUNTIME_ROOT"] = str(self.root / "runtime")
 
     def tearDown(self) -> None:
+        MCP.resource_manager.close_db()
         if self.previous_runtime_root is None:
             os.environ.pop("TASK_ANCHOR_RUNTIME_ROOT", None)
         else:
             os.environ["TASK_ANCHOR_RUNTIME_ROOT"] = self.previous_runtime_root
-        shutil.rmtree(self.root, ignore_errors=True)
+        shutil.rmtree(self.root)
 
     def run_to_completion(self, arguments):
         """调用 MCP 工具并等待异步 completion 回调。"""

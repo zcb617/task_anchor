@@ -103,6 +103,8 @@ $task-anchor-write
 
 Codex 版通过 Node MCP 的 `managed_exec` 直接启动并登记真实命令，遵循上面的输出与生命周期语义；普通资源支持 `timeout_ms` 超时结束整棵进程树，`timeout_ms=null` 不自动超时。`stop_policy=keep` 资源必须设置 `name`，不受 Stop/SessionEnd 影响，须显式调用 `operation=stop` 停止。
 
+任务计划按双模式运行：本会话可调用 `update_plan` 时继续使用 Codex 原生计划；工具关闭、未暴露或明确不可调用时使用 `task_checklist` 备用清单。备用清单保存在 `~/.task_anchor/workspaces/<workspace_key>/tasks/<task_id>/checklist.json`，按 workspace、session、task 校验隔离，条目只有“待开始”和“已完成”两种状态。上下文压缩后沿用当前 task，清单全部完成不等于关闭 Task Anchor。
+
 ## 测试
 
 运行 Codex Python 测试：

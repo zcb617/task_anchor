@@ -159,15 +159,23 @@ def _init_db(conn: sqlite3.Connection) -> sqlite3.Connection:
     return conn
 
 
+def close_db() -> None:
+    """关闭当前缓存的 SQLite 账本连接并清空其路径缓存。"""
+    global _DB_CONNECTION, _DB_PATH
+    with _DB_LOCK:
+        if _DB_CONNECTION is not None:
+            _DB_CONNECTION.close()
+            _DB_CONNECTION = None
+        _DB_PATH = None
+
+
 def _get_db() -> sqlite3.Connection:
     """懒加载全局 SQLite 账本连接，并在运行时根目录变化时切换连接。"""
     global _DB_CONNECTION, _DB_PATH
     database_path = _ledger_db_path()
     with _DB_LOCK:
         if _DB_CONNECTION is not None and _DB_PATH != database_path:
-            _DB_CONNECTION.close()
-            _DB_CONNECTION = None
-            _DB_PATH = None
+            close_db()
         if _DB_CONNECTION is None:
             database_path.parent.mkdir(parents=True, exist_ok=True)
             _DB_CONNECTION = sqlite3.connect(

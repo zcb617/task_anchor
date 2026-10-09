@@ -61,6 +61,11 @@ MANAGED_EXEC_TOOL_NAMES = {
     "mcp__task_anchor__managed_exec",
     "mcp__task-anchor__managed_exec",
 }
+TASK_CHECKLIST_TOOL_NAMES = {
+    "task_checklist",
+    "mcp__task_anchor__task_checklist",
+    "mcp__task-anchor__task_checklist",
+}
 FASTCTX_TOOL_NAME_PREFIX = "mcp__fastctx__"
 FASTCTX_READ_ONLY_TOOL_NAMES = {
     "mcp__fastctx__inspect_local_file",
@@ -1008,6 +1013,9 @@ def restore_after_post_compact(
         "[Task Anchor 状态提醒]\n"
         f"- task_id: {task_id}\n"
         "- status: 1（进行中；自动完成状态无法验证）\n"
+        "- 若本会话可调用 update_plan，继续使用原生计划；若不可用，通过 task_checklist read 恢复当前任务清单。\n"
+        "- 清单路径以 task_checklist 工具返回的 path 为准，不扫描其他 task，也不创建新 task。\n"
+        "- 清单全部完成不等于关闭 Task Anchor；任务生命周期仍由显式任务操作管理。\n"
         "- 本提醒不要求作答，不改变任务状态，也不阻断当前任务。\n\n"
         f"[最初任务指令]\n{instruction}"
     )
@@ -1036,6 +1044,14 @@ def _is_managed_exec_tool(tool_name: str) -> bool:
     if normalized in {item.lower() for item in MANAGED_EXEC_TOOL_NAMES}:
         return True
     return normalized.endswith("__managed_exec")
+
+
+def _is_task_checklist_tool(tool_name: str) -> bool:
+    """识别备用任务清单工具的宿主别名，保证不同 MCP 前缀使用同一绑定规则。"""
+    normalized = tool_name.strip().lower()
+    if normalized in {item.lower() for item in TASK_CHECKLIST_TOOL_NAMES}:
+        return True
+    return normalized.endswith("__task_checklist")
 
 
 def _is_fastctx_tool(tool_name: str) -> bool:
@@ -1143,6 +1159,88 @@ def _bind_managed_exec_to_session(
     }
 
 
+def _bind_task_checklist_to_session(
+    data: dict[str, Any],
+    data_root: Path | None,
+) -> dict[str, Any]:
+    """在清单实际读写前校验当前会话、任务和工作区，并注入可信绑定参数。"""
+
+    current_session_id = read_session_id(data)
+    current_cwd = data.get("cwd")
+    tool_input = _managed_exec_input(data)
+    task_id: str | None = None
+    if data_root is None:
+        reason = "missing_data_root"
+    elif current_session_id is None:
+        reason = "missing_session_id"
+    elif not isinstance(current_cwd, str) or not current_cwd.strip():
+        reason = "missing_cwd"
+    elif tool_input is None:
+        reason = "missing_tool_input"
+    else:
+        reason = None
+
+    if reason is not None:
+        write_audit_event(data_root, data, "task_checklist_bind_rejected", task_id=task_id, reason=reason)
+        return _deny_read_only("task_checklist 缺少可信 Hook 上下文，已拒绝调用。")
+
+    assert data_root is not None
+    assert current_session_id is not None
+    assert isinstance(current_cwd, str)
+    _, original_input = tool_input
+    try:
+        with session_lock(session_directory(data_root, current_session_id)):
+            pending_transition = read_pending_transition(data_root, current_session_id)
+            if pending_transition is not None:
+                task_id = pending_transition.get("new_task_id")
+                reason = "pending_transition"
+            else:
+                task_id = read_current_task_id(data_root, current_session_id)
+                if task_id is None:
+                    reason = "missing_current_task"
+                else:
+                    _, metadata = load_task(data, data_root, current_session_id, task_id)
+                    if metadata.get("status") != TASK_STATUS_ACTIVE:
+                        reason = "inactive_task"
+                    else:
+                        explicit_session_id = original_input.get("session_id")
+                        explicit_task_id = original_input.get("task_id")
+                        explicit_cwd = original_input.get("cwd")
+                        if explicit_session_id is not None and explicit_session_id != current_session_id:
+                            reason = "foreign_session"
+                        elif explicit_task_id is not None and canonical_task_id(explicit_task_id) != task_id:
+                            reason = "foreign_task"
+                        elif explicit_cwd is not None and (
+                            not isinstance(explicit_cwd, str)
+                            or workspace_identity(explicit_cwd) != workspace_identity(current_cwd)
+                        ):
+                            reason = "foreign_workspace"
+                        else:
+                            updated_input = dict(original_input)
+                            updated_input["session_id"] = current_session_id
+                            updated_input["task_id"] = task_id
+                            updated_input["cwd"] = current_cwd
+                            write_audit_event(
+                                data_root,
+                                data,
+                                "task_checklist_bound",
+                                task_id=task_id,
+                            )
+                            return {
+                                "hookSpecificOutput": {
+                                    "hookEventName": PRE_TOOL_USE,
+                                    "permissionDecision": "allow",
+                                    "permissionDecisionReason": "bound task_checklist to the current task",
+                                    "updatedInput": updated_input,
+                                }
+                            }
+    except (StorageError, LockUnavailable, OSError) as exc:
+        reason = f"storage_error:{exc}"
+
+    write_audit_event(data_root, data, "task_checklist_bind_rejected", task_id=task_id, reason=reason)
+    return _deny_read_only("task_checklist 当前任务身份校验失败，已拒绝调用。")
+
+
 def _command_texts(data: dict[str, Any]) -> list[str]:
     """仅提取已知执行工具参数容器中的真实命令字段。"""
 
@@ -1203,6 +1301,8 @@ def guard_pre_tool_use(
     tool_name = _tool_name(data)
     if _is_managed_exec_tool(tool_name):
         return _bind_managed_exec_to_session(data, data_root)
+    if _is_task_checklist_tool(tool_name):
+        return _bind_task_checklist_to_session(data, data_root)
 
     if _is_excluded_project(data.get("cwd")):
         return None

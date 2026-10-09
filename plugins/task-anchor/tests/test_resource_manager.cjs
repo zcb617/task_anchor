@@ -27,6 +27,7 @@ function fixture() {
     workspace,
     sessionId,
     restore() {
+      manager.closeDb();
       if (previousRuntimeRoot === undefined) {
         delete process.env.TASK_ANCHOR_RUNTIME_ROOT;
       } else {
@@ -36,6 +37,185 @@ function fixture() {
     },
   };
 }
+
+test("cached ledger can close repeatedly and reopen", () => {
+  /** 验证缓存账本连接可重复关闭，并能在同一夹具中重新创建。 */
+  const testFixture = fixture();
+  try {
+    const db = manager.getDb();
+    manager.closeDb();
+    manager.closeDb();
+    assert.equal(db.isOpen, false);
+    const reopenedDb = manager.getDb();
+    assert.equal(reopenedDb.isOpen, true);
+    assert.notEqual(reopenedDb, db);
+    assert.deepEqual(manager.dbLoadRecords(testFixture.workspace), []);
+  } finally {
+    testFixture.restore();
+  }
+});
+
+test("Windows transient EPERM retries before entering lock", () => {
+  /** 验证 Windows 目录锁创建的瞬时 EPERM 会等待重试，并且回调只在真正持锁后执行。 */
+  const testFixture = fixture();
+  const lockPath = path.join(testFixture.root, "contention.lock.d");
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  const originalMkdirSync = fs.mkdirSync;
+  let attempts = 0;
+  let callbackCount = 0;
+  try {
+    Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+    fs.mkdirSync = function mockedMkdirSync(targetPath, options) {
+      if (targetPath === lockPath && (!options || options.recursive !== true)) {
+        attempts += 1;
+        if (attempts === 1) {
+          const error = new Error("directory handle is still closing");
+          error.code = "EPERM";
+          throw error;
+        }
+      }
+      return originalMkdirSync.call(this, targetPath, options);
+    };
+    const result = manager.withFileLock(lockPath, () => {
+      callbackCount += 1;
+      assert.equal(fs.existsSync(lockPath), true);
+      assert.equal(attempts, 2);
+      return "fixed-value";
+    });
+    assert.equal(result, "fixed-value");
+    assert.equal(callbackCount, 1);
+    assert.equal(fs.existsSync(lockPath), false);
+  } finally {
+    fs.mkdirSync = originalMkdirSync;
+    Object.defineProperty(process, "platform", originalPlatform);
+    testFixture.restore();
+  }
+});
+
+test("Windows persistent EPERM times out without callback", () => {
+  /** 验证 Windows 持续 EPERM 会按既有截止时间超时，且不会执行未持锁回调。 */
+  const testFixture = fixture();
+  const lockPath = path.join(testFixture.root, "contention.lock.d");
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  const originalMkdirSync = fs.mkdirSync;
+  const originalDateNow = Date.now;
+  const originalAtomicsWait = Atomics.wait;
+  let fakeNow = 1000;
+  let attempts = 0;
+  let callbackCount = 0;
+  let waits = 0;
+  try {
+    Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+    Date.now = () => fakeNow;
+    Atomics.wait = () => {
+      waits += 1;
+      return "timed-out";
+    };
+    fs.mkdirSync = function mockedMkdirSync(targetPath, options) {
+      if (targetPath === lockPath && (!options || options.recursive !== true)) {
+        attempts += 1;
+        fakeNow += 5000;
+        const error = new Error("directory handle is still closing");
+        error.code = "EPERM";
+        throw error;
+      }
+      return originalMkdirSync.call(this, targetPath, options);
+    };
+    assert.throws(
+      () => manager.withFileLock(lockPath, () => { callbackCount += 1; }),
+      (error) => error instanceof manager.ResourceError && error.message.includes("资源锁等待超时"),
+    );
+    assert.equal(callbackCount, 0);
+    assert.equal(attempts, 2);
+    assert.equal(waits, 1);
+    assert.equal(fs.existsSync(lockPath), false);
+  } finally {
+    fs.mkdirSync = originalMkdirSync;
+    Date.now = originalDateNow;
+    Atomics.wait = originalAtomicsWait;
+    Object.defineProperty(process, "platform", originalPlatform);
+    testFixture.restore();
+  }
+});
+
+test("Non-Windows EPERM fails without retry", () => {
+  /** 验证非 Windows 平台的 EPERM 仍立即报告资源锁创建失败，不进入重试。 */
+  const testFixture = fixture();
+  const lockPath = path.join(testFixture.root, "contention.lock.d");
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  const originalMkdirSync = fs.mkdirSync;
+  let attempts = 0;
+  let callbackCount = 0;
+  try {
+    Object.defineProperty(process, "platform", { ...originalPlatform, value: "linux" });
+    fs.mkdirSync = function mockedMkdirSync(targetPath, options) {
+      if (targetPath === lockPath && (!options || options.recursive !== true)) {
+        attempts += 1;
+        const error = new Error("permission denied");
+        error.code = "EPERM";
+        throw error;
+      }
+      return originalMkdirSync.call(this, targetPath, options);
+    };
+    assert.throws(
+      () => manager.withFileLock(lockPath, () => { callbackCount += 1; }),
+      (error) => error instanceof manager.ResourceError && error.message.includes("无法创建资源锁"),
+    );
+    assert.equal(attempts, 1);
+    assert.equal(callbackCount, 0);
+  } finally {
+    fs.mkdirSync = originalMkdirSync;
+    Object.defineProperty(process, "platform", originalPlatform);
+    testFixture.restore();
+  }
+});
+
+test("Other lock creation errors are not retried on Windows", () => {
+  /** 验证 Windows 的其他锁目录创建错误不会被错误放行或重试。 */
+  const testFixture = fixture();
+  const lockPath = path.join(testFixture.root, "contention.lock.d");
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  const originalMkdirSync = fs.mkdirSync;
+  let attempts = 0;
+  let callbackCount = 0;
+  try {
+    Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+    fs.mkdirSync = function mockedMkdirSync(targetPath, options) {
+      if (targetPath === lockPath && (!options || options.recursive !== true)) {
+        attempts += 1;
+        const error = new Error("permission denied");
+        error.code = "EACCES";
+        throw error;
+      }
+      return originalMkdirSync.call(this, targetPath, options);
+    };
+    assert.throws(
+      () => manager.withFileLock(lockPath, () => { callbackCount += 1; }),
+      (error) => error instanceof manager.ResourceError && error.message.includes("无法创建资源锁"),
+    );
+    assert.equal(attempts, 1);
+    assert.equal(callbackCount, 0);
+  } finally {
+    fs.mkdirSync = originalMkdirSync;
+    Object.defineProperty(process, "platform", originalPlatform);
+    testFixture.restore();
+  }
+});
+
+test("fixture releases database before removing its directory", () => {
+  /** 验证测试夹具删除临时目录前已释放缓存账本连接。 */
+  const testFixture = fixture();
+  try {
+    const db = manager.getDb();
+    testFixture.restore();
+    assert.equal(db.isOpen, false);
+    assert.equal(fs.existsSync(testFixture.root), false);
+  } finally {
+    if (fs.existsSync(testFixture.root)) {
+      testFixture.restore();
+    }
+  }
+});
 
 /** 为 Windows 批处理命令测试提供包含临时目录的 PATH。 */
 function windowsBatchEnvironment(directory) {
@@ -346,13 +526,16 @@ test("keep and null timeout resources obey cleanup and explicit stop rules", asy
     assert.equal(stopped.stopped.length, 1);
     assert.equal(manager.processAlive(keep.pid), false);
   } finally {
-    if (keep) {
-      await manager.stopProcess({ cwd: testFixture.workspace, runId: keep.run_id, sessionId: testFixture.sessionId, includeKeep: true });
+    try {
+      if (keep && manager.dbFindRecordByRunId(keep.run_id)) {
+        await manager.stopProcess({ cwd: testFixture.workspace, runId: keep.run_id, sessionId: testFixture.sessionId, includeKeep: true });
+      }
+      if (noTimeout && manager.dbFindRecordByRunId(noTimeout.run_id)) {
+        await manager.stopProcess({ cwd: testFixture.workspace, runId: noTimeout.run_id, sessionId: testFixture.sessionId, includeKeep: true });
+      }
+    } finally {
+      testFixture.restore();
     }
-    if (noTimeout) {
-      await manager.stopProcess({ cwd: testFixture.workspace, runId: noTimeout.run_id, sessionId: testFixture.sessionId, includeKeep: true });
-    }
-    testFixture.restore();
   }
 });
 
@@ -417,13 +600,16 @@ test("session isolation prevents cleanup from stopping another session", async (
     assert.equal(manager.processAlive(second.pid), true);
     assert.deepEqual(manager.listProcesses({ cwd: testFixture.workspace, sessionId: otherSession }).map((item) => item.run_id), [second.run_id]);
   } finally {
-    if (first) {
-      await manager.stopProcess({ cwd: testFixture.workspace, runId: first.run_id, sessionId: testFixture.sessionId, includeKeep: true });
+    try {
+      if (first && manager.dbFindRecordByRunId(first.run_id)) {
+        await manager.stopProcess({ cwd: testFixture.workspace, runId: first.run_id, sessionId: testFixture.sessionId, includeKeep: true });
+      }
+      if (second && manager.dbFindRecordByRunId(second.run_id)) {
+        await manager.stopProcess({ cwd: testFixture.workspace, runId: second.run_id, sessionId: otherSession, includeKeep: true });
+      }
+    } finally {
+      testFixture.restore();
     }
-    if (second) {
-      await manager.stopProcess({ cwd: testFixture.workspace, runId: second.run_id, sessionId: otherSession, includeKeep: true });
-    }
-    testFixture.restore();
   }
 });
 

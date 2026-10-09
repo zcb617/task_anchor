@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -17,12 +18,15 @@ function fixture() {
   const previousRuntimeRoot = process.env.TASK_ANCHOR_RUNTIME_ROOT;
   process.env.TASK_ANCHOR_RUNTIME_ROOT = path.join(root, "runtime");
   const sessionId = `mcp-session-${manager.sha256Text(root)}`;
-  manager.setActiveContext(workspace, sessionId, "mcp-task");
+  const taskId = crypto.randomUUID();
+  manager.setActiveContext(workspace, sessionId, taskId);
   return {
     root,
     workspace,
     sessionId,
+    taskId,
     restore() {
+      manager.closeDb();
       if (previousRuntimeRoot === undefined) {
         delete process.env.TASK_ANCHOR_RUNTIME_ROOT;
       } else {
@@ -57,8 +61,9 @@ test("initialize, ping, tools/list, and notifications follow JSON-RPC contract",
   assert.equal(initialize.result.protocolVersion, "2025-06-18");
   assert.deepEqual(mcp.handleRequest({ jsonrpc: "2.0", id: 2, method: "ping" }).result, {});
   const tools = mcp.handleRequest({ jsonrpc: "2.0", id: 3, method: "tools/list" });
-  assert.equal(tools.result.tools.length, 1);
+  assert.equal(tools.result.tools.length, 2);
   assert.equal(tools.result.tools[0].name, "managed_exec");
+  assert.equal(tools.result.tools[1].name, "task_checklist");
   const inputSchema = tools.result.tools[0].inputSchema;
   assert.match(inputSchema.properties.operation.description, /run_id/);
   assert.match(inputSchema.properties.operation.description, /output/);
@@ -76,6 +81,63 @@ test("initialize, ping, tools/list, and notifications follow JSON-RPC contract",
   assert.equal(runSchema.required.includes("diagnostic_log_path"), false);
   assert.equal(outputSchema.$defs.registeredResource.required.includes("diagnostic_log_path"), true);
   assert.equal(mcp.handleRequest({ jsonrpc: "2.0", method: "ping" }), null);
+});
+
+test("task_checklist MCP roundtrips the current task and keeps completion", async () => {
+  const testFixture = fixture();
+  try {
+    const read = await mcp.handleRequest({
+      jsonrpc: "2.0",
+      id: 7,
+      method: "tools/call",
+      params: {
+        name: "task_checklist",
+        arguments: { operation: "read", cwd: testFixture.workspace, session_id: testFixture.sessionId },
+      },
+    });
+    assert.equal(read.result.isError, false);
+    assert.equal(read.result.structuredContent.task_id, testFixture.taskId);
+    assert.equal(read.result.structuredContent.revision, 0);
+    const written = await mcp.handleRequest({
+      jsonrpc: "2.0",
+      id: 8,
+      method: "tools/call",
+      params: {
+        name: "task_checklist",
+        arguments: {
+          operation: "write",
+          cwd: testFixture.workspace,
+          session_id: testFixture.sessionId,
+          expected_revision: 0,
+          items: [{ id: "one", text: "完成清单", status: "待开始" }],
+        },
+      },
+    });
+    assert.equal(written.result.isError, false);
+    assert.equal(written.result.structuredContent.revision, 1);
+    assert.deepEqual(written.result.structuredContent.items, [
+      { id: "one", text: "完成清单", status: "待开始" },
+    ]);
+  } finally {
+    testFixture.restore();
+  }
+});
+
+test("task_checklist MCP errors use isError and unknown tools remain rejected", async () => {
+  const invalid = await mcp.handleRequest({
+    jsonrpc: "2.0",
+    id: 9,
+    method: "tools/call",
+    params: { name: "task_checklist", arguments: { operation: "read", cwd: "." } },
+  });
+  assert.equal(invalid.result.isError, true);
+  const unknown = mcp.handleRequest({
+    jsonrpc: "2.0",
+    id: 10,
+    method: "tools/call",
+    params: { name: "unknown_tool", arguments: {} },
+  });
+  assert.equal(unknown.error.code, -32602);
 });
 
 test("tool errors stay in structured content and do not terminate the service", async () => {
@@ -174,9 +236,15 @@ test("tools/call preserves program args, shell command, and environment", async 
 
 test("operation=output validates lines and supports tail and follow", async () => {
   const testFixture = fixture();
+  const releasePath = path.join(testFixture.root, "release-follow");
   let resource;
   let resolveCompletion;
   let rejectCompletion;
+  let resolveInitialOutput;
+  const initialOutputPromise = new Promise((resolve) => {
+    resolveInitialOutput = resolve;
+  });
+  let readinessTimer;
   const outputEvents = [];
   const completion = new Promise((resolve, reject) => {
     resolveCompletion = resolve;
@@ -208,20 +276,32 @@ test("operation=output validates lines and supports tail and follow", async () =
         program: process.execPath,
         args: [
           "-e",
-          "const n=String.fromCharCode(10); process.stdout.write('line-1'+n+'line-2'+n+'line-3'); setTimeout(() => process.stdout.write(n+'follow-line'), 120); setTimeout(() => process.exit(0), 220)",
+          "const fs=require('node:fs'); const releasePath=process.argv[1]; const n=String.fromCharCode(10); process.stdout.write('line-1'+n+'line-2'+n+'line-3'); const interval=setInterval(() => { if (fs.existsSync(releasePath)) { clearInterval(interval); process.stdout.write(n+'follow-line'); setTimeout(() => process.exit(0), 20); } }, 10)",
+          releasePath,
         ],
         cwd: testFixture.workspace,
-        timeout_ms: null,
+        timeout_ms: 10000,
         session_id: testFixture.sessionId,
       },
       {
-        onOutput: (event) => outputEvents.push(event),
+        onOutput: (event) => {
+          outputEvents.push(event);
+          if (outputEvents.map((item) => item.output).join("").includes("line-3")) {
+            resolveInitialOutput();
+          }
+        },
         onCompletion: resolveCompletion,
         onError: (event) => rejectCompletion(new Error(event.error)),
       },
     );
     assert.equal(resource.status, "running");
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    const readyPromise = Promise.race([
+      initialOutputPromise.then(() => true),
+      new Promise((resolve) => {
+        readinessTimer = setTimeout(() => resolve(false), 5000);
+      }),
+    ]);
+    assert.equal(await readyPromise, true);
 
     const tail = await mcp.executeTool({
       operation: "output",
@@ -246,10 +326,14 @@ test("operation=output validates lines and supports tail and follow", async () =
     assert.equal(followed.status, "running");
     assert.equal(followed.follow, true);
     assert.equal(followed.output, "line-3");
+    fs.writeFileSync(releasePath, "go");
     const completed = await completion;
     assert.equal(completed.status, "exited");
     assert.equal(outputEvents.some((event) => event.output.includes("follow-line")), true);
   } finally {
+    if (readinessTimer) {
+      clearTimeout(readinessTimer);
+    }
     if (resource && manager.processAlive(resource.pid)) {
       await mcp.executeTool({
         operation: "stop",
@@ -369,9 +453,12 @@ test("tools/call returns the stable structured list and cleans timeout resources
     assert.equal(stopped.stopped.length, 1);
     assert.equal(manager.dbFindRecord(testFixture.workspace, resource.run_id), null);
   } finally {
-    if (resource) {
-      await mcp.executeTool({ operation: "stop", run_id: resource.run_id, cwd: testFixture.workspace, session_id: testFixture.sessionId, include_keep: true });
+    try {
+      if (resource && manager.dbFindRecordByRunId(resource.run_id)) {
+        await mcp.executeTool({ operation: "stop", run_id: resource.run_id, cwd: testFixture.workspace, session_id: testFixture.sessionId, include_keep: true });
+      }
+    } finally {
+      testFixture.restore();
     }
-    testFixture.restore();
   }
 });

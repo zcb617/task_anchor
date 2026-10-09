@@ -173,13 +173,20 @@ function initDb(db) {
   return db;
 }
 
+/** 关闭当前缓存的 SQLite 账本连接并清空其路径缓存。 */
+function closeDb() {
+  if (LEDGER_DB !== null) {
+    LEDGER_DB.close();
+    LEDGER_DB = null;
+  }
+  LEDGER_DB_PATH = null;
+}
+
 /** 懒加载全局 SQLite 账本连接，并在运行时根目录变化时切换连接。 */
 function getDb() {
   const databasePath = ledgerDbPath();
   if (LEDGER_DB && LEDGER_DB_PATH !== databasePath) {
-    LEDGER_DB.close();
-    LEDGER_DB = null;
-    LEDGER_DB_PATH = null;
+    closeDb();
   }
   if (!LEDGER_DB) {
     fs.mkdirSync(path.dirname(databasePath), { recursive: true });
@@ -331,7 +338,9 @@ function withFileLock(lockPath, callback) {
       fs.mkdirSync(lockPath);
       acquired = true;
     } catch (error) {
-      if (!error || error.code !== "EEXIST") {
+      // Windows 目录删除等待最后句柄关闭时，mkdir 可能短暂返回 EPERM。
+      const retryable = error && (error.code === "EEXIST" || (process.platform === "win32" && error.code === "EPERM"));
+      if (!retryable) {
         throw new ResourceError(`无法创建资源锁：${lockPath}：${error.message}`);
       }
       if (Date.now() >= deadline) {
@@ -1567,6 +1576,7 @@ module.exports = {
   workspaceRuntimeDirectory,
   ledgerPath,
   ledgerDbPath,
+  closeDb,
   getDb,
   initDb,
   dbInsertRecord,

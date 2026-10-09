@@ -42,6 +42,7 @@ class HookEntryTests(unittest.TestCase):
         os.environ["TASK_ANCHOR_CONFIG_DIR"] = str(self.data_root / "no-config")
 
     def tearDown(self) -> None:
+        HOOK.resource_manager.close_db()
         if self.previous_config_dir is None:
             os.environ.pop("TASK_ANCHOR_CONFIG_DIR", None)
         else:
@@ -164,6 +165,7 @@ class HookEntryTests(unittest.TestCase):
     def test_ordinary_prompt_is_ignored(self) -> None:
         self.assertIsNone(HOOK.handle_hook(self.user_prompt("普通对话"), self.data_root))
         self.assertFalse(HOOK.current_task_path(self.data_root, self.session_id).exists())
+        self.assertFalse((self.runtime_root / "workspaces").exists())
 
     def test_explicit_activation_creates_a_task_record(self) -> None:
         prompt = "$task-anchor 保留这条最初任务指令。"
@@ -347,6 +349,103 @@ class HookEntryTests(unittest.TestCase):
                     event["reason"],
                     {"missing_session_id", "missing_tool_input", "explicit_session_id"},
                 )
+
+    def test_checklist_hook_binds_current_identity(self) -> None:
+        """验证任务清单 Hook 为当前任务补齐可信 session、task 和 workspace。"""
+        task_id = self.activate("$task-anchor 清单绑定任务")
+        for tool_name in (
+            "task_checklist",
+            "mcp__task_anchor__task_checklist",
+            "mcp__task-anchor__task_checklist",
+            "vendor__task_checklist",
+        ):
+            for container_key in ("tool_input", "toolInput", "input"):
+                payload = self.pre_tool_use(tool_name, {"operation": "read"})
+                if container_key != "tool_input":
+                    payload[container_key] = payload.pop("tool_input")
+                result = HOOK.handle_hook(payload, self.data_root)
+                self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "allow")
+                updated = result["hookSpecificOutput"]["updatedInput"]
+                self.assertEqual(updated["session_id"], self.session_id)
+                self.assertEqual(updated["task_id"], task_id)
+                self.assertEqual(updated["cwd"], str(self.workspace))
+        self.assertEqual(self.audit_events()[-1]["status"], "task_checklist_bound")
+
+    def test_checklist_hook_rejects_foreign_session_task_workspace(self) -> None:
+        """验证任务清单不能跨 session、task 或 workspace 调用。"""
+        (self.other_workspace / ".git").mkdir()
+        task_id = self.activate("$task-anchor 清单隔离任务")
+        cases = (
+            ("foreign_session", {"session_id": "other-session"}, self.session_id, self.workspace),
+            ("foreign_task", {"task_id": str(uuid.uuid4())}, self.session_id, self.workspace),
+            ("foreign_workspace", {"cwd": str(self.other_workspace)}, self.session_id, self.workspace),
+        )
+        for reason, tool_input, session_id, cwd in cases:
+            with self.subTest(reason=reason):
+                result = HOOK.handle_hook(
+                    self.pre_tool_use("task_checklist", tool_input, session_id=session_id, cwd=cwd),
+                    self.data_root,
+                )
+                self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+                self.assertEqual(self.audit_events()[-1]["reason"], reason)
+        self.assertEqual(self.current_task_id(), task_id)
+
+    def test_checklist_hook_rejects_missing_inactive_or_pending_task(self) -> None:
+        """验证缺失、已结束和切换中的任务都不能读写备用清单。"""
+        missing = HOOK.handle_hook(
+            self.pre_tool_use("task_checklist", {"operation": "read"}),
+            self.data_root,
+        )
+        self.assertEqual(missing["hookSpecificOutput"]["permissionDecision"], "deny")
+        missing_context_cases = []
+        missing_data_root = self.pre_tool_use("task_checklist", {"operation": "read"})
+        missing_context_cases.append((missing_data_root, None))
+        missing_session = self.pre_tool_use("task_checklist", {"operation": "read"})
+        missing_session["session_id"] = None
+        missing_context_cases.append((missing_session, self.data_root))
+        missing_cwd = self.pre_tool_use("task_checklist", {"operation": "read"})
+        missing_cwd.pop("cwd")
+        missing_context_cases.append((missing_cwd, self.data_root))
+        missing_tool_input = self.pre_tool_use("task_checklist", {"operation": "read"})
+        missing_tool_input.pop("tool_input")
+        missing_context_cases.append((missing_tool_input, self.data_root))
+        for payload, data_root in missing_context_cases:
+            with self.subTest(missing_context=payload):
+                rejected = HOOK._bind_task_checklist_to_session(payload, data_root)
+                self.assertEqual(rejected["hookSpecificOutput"]["permissionDecision"], "deny")
+        task_id = self.activate("$task-anchor 清单状态任务")
+        metadata = self.task_metadata(task_id)
+        metadata["status"] = HOOK.TASK_STATUS_CLOSED
+        self.write_task_metadata(task_id, metadata)
+        inactive = HOOK.handle_hook(
+            self.pre_tool_use("task_checklist", {"operation": "read"}),
+            self.data_root,
+        )
+        self.assertEqual(inactive["hookSpecificOutput"]["permissionDecision"], "deny")
+        metadata["status"] = HOOK.TASK_STATUS_ACTIVE
+        self.write_task_metadata(task_id, metadata)
+        transition = {
+            "schema_version": HOOK.SCHEMA_VERSION,
+            HOOK.SESSION_KEY_FIELD: HOOK.session_key(self.session_id),
+            "new_task_id": str(uuid.uuid4()),
+            "old_task_ids": [],
+        }
+        HOOK.atomic_write_json(HOOK.transition_path(self.data_root, self.session_id), transition)
+        pending = HOOK.handle_hook(
+            self.pre_tool_use("task_checklist", {"operation": "read"}),
+            self.data_root,
+        )
+        self.assertEqual(pending["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_checklist_post_compact_keeps_current_task_and_mentions_fallback(self) -> None:
+        """验证压缩恢复保留当前任务，并提示原生计划不可用时读取备用清单。"""
+        task_id = self.activate("$task-anchor 压缩后继续清单任务")
+        result = HOOK.handle_hook(self.post_compact(), self.data_root)
+        context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(task_id, context)
+        self.assertIn("update_plan", context)
+        self.assertIn("task_checklist read", context)
+        self.assertIn("不等于关闭", context)
 
     def test_fastctx_replace_is_allowed_without_read_only_policy(self) -> None:
         """验证未启用只读策略时 FastCtx replace 工具允许执行。"""
@@ -1093,6 +1192,7 @@ class PluginContractTests(unittest.TestCase):
             / "openai.yaml"
         ).read_text(encoding="utf-8")
         self.assertIn("Codex 原生 TOLIST", skill)
+        self.assertIn("update_plan", skill)
         self.assertIn("$task-anchor-end", end_skill)
         self.assertIn("allow_implicit_invocation: false", metadata)
         self.assertIn("手工结束", end_skill)

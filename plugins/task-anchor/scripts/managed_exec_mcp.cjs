@@ -2,6 +2,7 @@
 
 const readline = require("node:readline");
 const resourceManager = require("./resource_manager.cjs");
+const taskChecklist = require("./task_checklist.cjs");
 
 // MCP 服务名称，保持旧 Python 服务的协议身份。
 const SERVER_NAME = "task-anchor";
@@ -9,7 +10,7 @@ const SERVER_NAME = "task-anchor";
 const SERVER_VERSION = "0.1.0";
 // MCP 协议版本，保持既有客户端协商契约。
 const PROTOCOL_VERSION = "2025-06-18";
-// 对外暴露的唯一工具名称。
+// 对外暴露的主工具名称。
 const TOOL_NAME = "managed_exec";
 
 // managed_exec 的输入参数协议，字段与旧 Python MCP 保持一致。
@@ -428,16 +429,34 @@ function handleRequest(request, hooks = {}) {
             // 结构化输出协议。
             outputSchema: TOOL_OUTPUT_SCHEMA,
           },
+          {
+            // 备用任务清单工具名称。
+            name: taskChecklist.TOOL_NAME,
+            // 备用计划按工作区、会话和任务隔离保存。
+            description: "按当前 workspace、session 和 task 隔离读取或更新备用任务清单。",
+            // 备用任务清单输入参数协议。
+            inputSchema: taskChecklist.TOOL_SCHEMA,
+          },
         ],
       },
     };
   }
   if (method === "tools/call") {
     const parameters = request.params;
-    if (!parameters || typeof parameters !== "object" || parameters.name !== TOOL_NAME) {
+    if (!parameters || typeof parameters !== "object" || ![TOOL_NAME, taskChecklist.TOOL_NAME].includes(parameters.name)) {
       return errorResponse(-32602, "未知的工具。", requestId);
     }
     const argumentsObject = parameters.arguments === undefined ? {} : parameters.arguments;
+    if (parameters.name === taskChecklist.TOOL_NAME) {
+      return Promise.resolve()
+        .then(() => taskChecklist.executeTool(argumentsObject))
+        .then((result) => ({ jsonrpc: "2.0", id: requestId, result: toolResult(result) }))
+        .catch((error) => ({
+          jsonrpc: "2.0",
+          id: requestId,
+          result: toolResult({ error: error.message }, true),
+        }));
+    }
     return executeTool(argumentsObject, hooks)
       .then((result) => ({ jsonrpc: "2.0", id: requestId, result: toolResult(result) }))
       .catch((error) => ({
