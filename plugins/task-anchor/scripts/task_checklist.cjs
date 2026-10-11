@@ -1,5 +1,6 @@
 "use strict";
 
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const resourceManager = require("./resource_manager.cjs");
@@ -30,10 +31,10 @@ const TOOL_SCHEMA = {
     operation: { type: "string", enum: ["read", "write"], description: "读取或整体替换当前任务清单。" },
     // 当前工作区路径，用于派生可信工作区隔离键。
     cwd: { type: "string", description: "当前任务所在工作目录。" },
-    // Hook 注入的可信会话标识。
-    session_id: { type: "string", description: "由 Task Anchor Hook 注入的内部会话标识，模型无需填写。" },
-    // 预期当前任务的 UUID，可用于防止任务边界误用。
-    task_id: { type: "string", description: "预期当前任务的标准小写 UUID，可选。" },
+    // 兼容性存储字段，不参与清单调用许可判断。
+    session_id: { type: "string", description: "兼容性存储字段，不参与调用许可判断。" },
+    // 兼容性存储字段，不参与清单调用许可判断。
+    task_id: { type: "string", description: "兼容性存储字段，不参与调用许可判断。" },
     // write 操作整体替换的任务条目数组。
     items: {
       type: "array",
@@ -67,7 +68,12 @@ function checklistPath(cwd, taskId) {
   if (!isTaskId(taskId)) {
     throw new CheckListError("task_id 必须是小写标准 UUID。");
   }
-  return path.join(resourceManager.workspaceRuntimeDirectory(cwd), "tasks", taskId, "checklist.json");
+  return path.join(resourceManager.runtimeRoot(), "workspaces", fullDirectoryKey(cwd), "tasks", taskId, "checklist.json");
+}
+
+/** 返回完整规范化目录的稳定存储键，避免同 Git 根下不同目录共享清单。 */
+function fullDirectoryKey(cwd) {
+  return resourceManager.sha256Text(resourceManager.normalizePath(cwd));
 }
 
 /** 判断任务 ID 是否为小写标准 UUID。 */
@@ -116,9 +122,7 @@ function validateChecklist(value, cwd, sessionId, taskId) {
   }
   if (
     value.schema_version !== 1
-    || value.workspace_key !== resourceManager.workspaceKey(cwd)
-    || value.session_key !== resourceManager.sessionKey(sessionId)
-    || value.task_id !== taskId
+    || value.workspace_key !== fullDirectoryKey(cwd)
     || !Number.isInteger(value.revision)
     || value.revision < 0
   ) {
@@ -136,7 +140,7 @@ function emptyChecklist(cwd, sessionId, taskId) {
   const now = resourceManager.utcNow();
   return {
     schema_version: 1,
-    workspace_key: resourceManager.workspaceKey(cwd),
+    workspace_key: fullDirectoryKey(cwd),
     session_key: resourceManager.sessionKey(sessionId),
     task_id: taskId,
     revision: 0,
@@ -188,39 +192,39 @@ function writeChecklist(filePath, cwd, sessionId, taskId, items, expectedRevisio
 /** 在上下文锁内校验当前 session、workspace 和 task，防止并发任务越界。 */
 function withTrustedContext(argumentsObject, callback) {
   const cwd = argumentsObject.cwd;
-  const sessionId = argumentsObject.session_id;
   if (typeof cwd !== "string" || !cwd.trim()) {
     throw new CheckListError("cwd 必须是非空字符串。");
   }
-  if (typeof sessionId !== "string" || !sessionId.trim()) {
-    throw new CheckListError("session_id 必须是非空字符串。");
-  }
-  const explicitTaskId = argumentsObject.task_id;
-  if (explicitTaskId !== undefined && !isTaskId(explicitTaskId)) {
-    throw new CheckListError("task_id 必须是小写标准 UUID。");
-  }
   const contextFile = resourceManager.contextPath(cwd);
   return resourceManager.withFileLock(resourceManager.lockPathFor(contextFile), () => {
-    const context = resourceManager.activeContext(cwd, sessionId);
-    if (!context || typeof context !== "object") {
-      throw new CheckListError("当前 session 没有可信活动任务上下文。");
+    const requestedSessionId = argumentsObject.session_id;
+    const internalSessionId = `directory:${resourceManager.normalizePath(cwd)}`;
+    let context = null;
+    try {
+      context = typeof requestedSessionId === "string" && requestedSessionId.trim()
+        ? resourceManager.activeContext(cwd, requestedSessionId)
+        : resourceManager.activeContext(cwd);
+    } catch (error) {
+      if (!(error instanceof resourceManager.ResourceError)) {
+        throw error;
+      }
     }
-    const derivedSessionKey = resourceManager.sessionKey(sessionId);
-    const derivedWorkspaceKey = resourceManager.workspaceKey(cwd);
-    if (context.session_key !== derivedSessionKey || context.workspace_key !== derivedWorkspaceKey) {
-      throw new CheckListError("活动任务上下文的 session 或 workspace 校验失败。");
-    }
-    const currentTaskId = context.task_id;
-    if (!isTaskId(currentTaskId)) {
-      throw new CheckListError("活动任务上下文的 task_id 无效。");
-    }
-    if (explicitTaskId !== undefined && explicitTaskId !== currentTaskId) {
-      throw new CheckListError("task_id 与当前活动任务不匹配。");
-    }
+    const contextTaskId = context && typeof context === "object" ? context.task_id : null;
+    const currentTaskId = isTaskId(contextTaskId)
+      ? contextTaskId
+      : fallbackTaskId(cwd);
     const filePath = checklistPath(cwd, currentTaskId);
-    const result = callback(cwd, sessionId, currentTaskId, filePath);
+    const result = callback(cwd, internalSessionId, currentTaskId, filePath);
     return { ...result, path: filePath };
   });
+}
+
+/** 为没有有效活动上下文的完整目录生成稳定的标准 UUID 任务分区。 */
+function fallbackTaskId(cwd) {
+  const hex = crypto.createHash("sha256").update(resourceManager.normalizePath(cwd), "utf8").digest("hex").slice(0, 32).split("");
+  hex[12] = "5";
+  hex[16] = "8";
+  return `${hex.slice(0, 8).join("")}-${hex.slice(8, 12).join("")}-${hex.slice(12, 16).join("")}-${hex.slice(16, 20).join("")}-${hex.slice(20, 32).join("")}`;
 }
 
 /** 执行 task_checklist 的 read/write 业务操作并返回清单路径与数据。 */
@@ -260,5 +264,6 @@ module.exports = {
   TOOL_SCHEMA,
   executeTool,
   checklistPath,
+  fullDirectoryKey,
   CheckListError,
 };

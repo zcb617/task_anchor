@@ -1163,17 +1163,11 @@ def _bind_task_checklist_to_session(
     data: dict[str, Any],
     data_root: Path | None,
 ) -> dict[str, Any]:
-    """在清单实际读写前校验当前会话、任务和工作区，并注入可信绑定参数。"""
+    """在清单实际读写前校验当前完整工作目录，并注入目录绑定参数。"""
 
-    current_session_id = read_session_id(data)
     current_cwd = data.get("cwd")
     tool_input = _managed_exec_input(data)
-    task_id: str | None = None
-    if data_root is None:
-        reason = "missing_data_root"
-    elif current_session_id is None:
-        reason = "missing_session_id"
-    elif not isinstance(current_cwd, str) or not current_cwd.strip():
+    if not isinstance(current_cwd, str) or not current_cwd.strip():
         reason = "missing_cwd"
     elif tool_input is None:
         reason = "missing_tool_input"
@@ -1181,64 +1175,71 @@ def _bind_task_checklist_to_session(
         reason = None
 
     if reason is not None:
-        write_audit_event(data_root, data, "task_checklist_bind_rejected", task_id=task_id, reason=reason)
+        write_audit_event(
+            data_root,
+            data,
+            "task_checklist_bind_rejected",
+            reason=reason,
+        )
         return _deny_read_only("task_checklist 缺少可信 Hook 上下文，已拒绝调用。")
 
-    assert data_root is not None
-    assert current_session_id is not None
     assert isinstance(current_cwd, str)
+    assert tool_input is not None
     _, original_input = tool_input
-    try:
-        with session_lock(session_directory(data_root, current_session_id)):
-            pending_transition = read_pending_transition(data_root, current_session_id)
-            if pending_transition is not None:
-                task_id = pending_transition.get("new_task_id")
-                reason = "pending_transition"
-            else:
-                task_id = read_current_task_id(data_root, current_session_id)
-                if task_id is None:
-                    reason = "missing_current_task"
-                else:
-                    _, metadata = load_task(data, data_root, current_session_id, task_id)
-                    if metadata.get("status") != TASK_STATUS_ACTIVE:
-                        reason = "inactive_task"
-                    else:
-                        explicit_session_id = original_input.get("session_id")
-                        explicit_task_id = original_input.get("task_id")
-                        explicit_cwd = original_input.get("cwd")
-                        if explicit_session_id is not None and explicit_session_id != current_session_id:
-                            reason = "foreign_session"
-                        elif explicit_task_id is not None and canonical_task_id(explicit_task_id) != task_id:
-                            reason = "foreign_task"
-                        elif explicit_cwd is not None and (
-                            not isinstance(explicit_cwd, str)
-                            or workspace_identity(explicit_cwd) != workspace_identity(current_cwd)
-                        ):
-                            reason = "foreign_workspace"
-                        else:
-                            updated_input = dict(original_input)
-                            updated_input["session_id"] = current_session_id
-                            updated_input["task_id"] = task_id
-                            updated_input["cwd"] = current_cwd
-                            write_audit_event(
-                                data_root,
-                                data,
-                                "task_checklist_bound",
-                                task_id=task_id,
-                            )
-                            return {
-                                "hookSpecificOutput": {
-                                    "hookEventName": PRE_TOOL_USE,
-                                    "permissionDecision": "allow",
-                                    "permissionDecisionReason": "bound task_checklist to the current task",
-                                    "updatedInput": updated_input,
-                                }
-                            }
-    except (StorageError, LockUnavailable, OSError) as exc:
-        reason = f"storage_error:{exc}"
+    updated_input = dict(original_input)
+    if "cwd" in original_input:
+        explicit_cwd = original_input["cwd"]
+        if (
+            not isinstance(explicit_cwd, str)
+            or not explicit_cwd.strip()
+            or os.path.normcase(os.path.realpath(os.path.abspath(explicit_cwd)))
+            != os.path.normcase(os.path.realpath(os.path.abspath(current_cwd)))
+        ):
+            write_audit_event(
+                data_root,
+                data,
+                "task_checklist_bind_rejected",
+                reason="foreign_workspace",
+            )
+            return _deny_read_only("task_checklist 当前目录身份校验失败，已拒绝调用。")
 
-    write_audit_event(data_root, data, "task_checklist_bind_rejected", task_id=task_id, reason=reason)
-    return _deny_read_only("task_checklist 当前任务身份校验失败，已拒绝调用。")
+    normalized_cwd = resource_manager.normalize_path(current_cwd)
+    internal_session_id = f"directory:{normalized_cwd}"
+    internal_task_hex = hashlib.sha256(normalized_cwd.encode("utf-8")).hexdigest()[:32]
+    internal_task_hex = (
+        internal_task_hex[:12]
+        + "5"
+        + internal_task_hex[13:16]
+        + "8"
+        + internal_task_hex[17:]
+    )
+    internal_task_id = (
+        f"{internal_task_hex[:8]}-{internal_task_hex[8:12]}-"
+        f"{internal_task_hex[12:16]}-{internal_task_hex[16:20]}-"
+        f"{internal_task_hex[20:32]}"
+    )
+    resource_manager.set_active_context(
+        current_cwd,
+        internal_session_id,
+        internal_task_id,
+    )
+    updated_input["session_id"] = internal_session_id
+    updated_input["task_id"] = internal_task_id
+    updated_input["cwd"] = current_cwd
+    write_audit_event(
+        data_root,
+        data,
+        "task_checklist_bound",
+        cwd=current_cwd,
+    )
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": PRE_TOOL_USE,
+            "permissionDecision": "allow",
+            "permissionDecisionReason": "bound task_checklist to the current directory",
+            "updatedInput": updated_input,
+        }
+    }
 
 
 def _command_texts(data: dict[str, Any]) -> list[str]:

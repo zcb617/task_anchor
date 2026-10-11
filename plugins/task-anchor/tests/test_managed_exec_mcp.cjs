@@ -128,7 +128,7 @@ test("task_checklist MCP errors use isError and unknown tools remain rejected", 
     jsonrpc: "2.0",
     id: 9,
     method: "tools/call",
-    params: { name: "task_checklist", arguments: { operation: "read", cwd: "." } },
+        params: { name: "task_checklist", arguments: { operation: "invalid", cwd: "." } },
   });
   assert.equal(invalid.result.isError, true);
   const unknown = mcp.handleRequest({

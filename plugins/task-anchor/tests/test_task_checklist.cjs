@@ -83,7 +83,7 @@ test("test_native_context_does_not_create_checklist", () => {
   }
 });
 
-test("test_two_tasks_have_distinct_checklists_and_reject_old_id", () => {
+test("test_two_tasks_have_distinct_checklists_and_ignore_old_id", () => {
   const testFixture = fixture();
   try {
     const oldTaskId = testFixture.taskId;
@@ -93,10 +93,8 @@ test("test_two_tasks_have_distinct_checklists_and_reject_old_id", () => {
     const current = checklist.executeTool(readArguments(testFixture));
     assert.notEqual(current.path, checklist.checklistPath(testFixture.workspace, oldTaskId));
     assert.deepEqual(JSON.parse(fs.readFileSync(checklist.checklistPath(testFixture.workspace, oldTaskId), "utf8")).items, []);
-    assert.throws(
-      () => checklist.executeTool(readArguments(testFixture, { task_id: oldTaskId })),
-      /不匹配/,
-    );
+    const oldIdRequest = checklist.executeTool(readArguments(testFixture, { task_id: oldTaskId }));
+    assert.equal(oldIdRequest.task_id, newTaskId);
     assert.equal(current.task_id, newTaskId);
   } finally {
     testFixture.restore();
@@ -114,28 +112,47 @@ test("test_sessions_and_workspaces_are_isolated", () => {
     const first = checklist.executeTool(readArguments(testFixture, { session_id: testFixture.sessionId }));
     const second = checklist.executeTool(readArguments(testFixture, { session_id: otherSession }));
     assert.notEqual(first.path, second.path);
-    assert.throws(
-      () => checklist.executeTool(readArguments(testFixture, { session_id: otherSession, task_id: testFixture.taskId })),
-      /不匹配/,
-    );
+    const ignoredOldTask = checklist.executeTool(readArguments(testFixture, { session_id: otherSession, task_id: testFixture.taskId }));
+    assert.equal(ignoredOldTask.task_id, otherTaskId);
     manager.setActiveContext(otherWorkspace, testFixture.sessionId, crypto.randomUUID());
-    assert.throws(
-      () => checklist.executeTool(readArguments({ ...testFixture, workspace: otherWorkspace }, { session_id: otherSession })),
-      /可信活动任务上下文/,
+    const otherDirectory = checklist.executeTool(
+      readArguments({ ...testFixture, workspace: otherWorkspace }, { session_id: otherSession }),
     );
+    assert.notEqual(otherDirectory.path, first.path);
   } finally {
     testFixture.restore();
   }
 });
 
-test("test_missing_session_and_context_are_rejected", () => {
+test("test_missing_session_and_context_use_directory_fallback", () => {
   const testFixture = fixture();
   try {
-    assert.throws(() => checklist.executeTool({ operation: "read", cwd: testFixture.workspace }), /session_id/);
-    assert.throws(
-      () => checklist.executeTool(readArguments({ ...testFixture, sessionId: "missing-session" })),
-      /可信活动任务上下文/,
-    );
+    const withoutSession = checklist.executeTool({ operation: "read", cwd: testFixture.workspace });
+    const withoutContext = checklist.executeTool(readArguments({ ...testFixture, sessionId: "missing-session" }));
+    assert.equal(withoutContext.revision, 0);
+    assert.equal(withoutSession.revision, 0);
+  } finally {
+    testFixture.restore();
+  }
+});
+
+test("test_directory_fallback_path_is_stable_for_read_and_write", () => {
+  const testFixture = fixture();
+  const directoryWithoutContext = path.join(testFixture.root, "directory-without-context");
+  fs.mkdirSync(directoryWithoutContext);
+  try {
+    const first = checklist.executeTool({ operation: "read", cwd: directoryWithoutContext });
+    const second = checklist.executeTool({ operation: "read", cwd: directoryWithoutContext, task_id: "../../escape" });
+    assert.equal(first.path, second.path);
+    const written = checklist.executeTool({
+      operation: "write",
+      cwd: directoryWithoutContext,
+      expected_revision: 0,
+      items: [{ id: "fallback", text: "稳定目录", status: "待开始" }],
+    });
+    assert.equal(written.path, first.path);
+    assert.equal(written.revision, 1);
+    assert.deepEqual(checklist.executeTool({ operation: "read", cwd: directoryWithoutContext }).items, written.items);
   } finally {
     testFixture.restore();
   }
@@ -144,7 +161,9 @@ test("test_missing_session_and_context_are_rejected", () => {
 test("test_invalid_task_and_items_and_revision_are_rejected", () => {
   const testFixture = fixture();
   try {
-    assert.throws(() => checklist.executeTool(readArguments(testFixture, { task_id: "../../escape" })), /UUID/);
+    const invalidTask = checklist.executeTool(readArguments(testFixture, { task_id: "../../escape" }));
+    assert.equal(invalidTask.task_id, testFixture.taskId);
+    assert.equal(invalidTask.path, checklist.checklistPath(testFixture.workspace, testFixture.taskId));
     assert.throws(() => checklist.executeTool({ ...readArguments(testFixture, { operation: "write" }), expected_revision: -1, items: [] }), /非负整数/);
     assert.throws(() => checklist.executeTool({ ...readArguments(testFixture, { operation: "write" }), expected_revision: 0, items: [{ id: "x", text: "", status: "待开始" }] }), /text/);
     assert.throws(() => checklist.executeTool({ ...readArguments(testFixture, { operation: "write" }), expected_revision: 0, items: [{ id: "x", text: "x", status: "进行中" }] }), /status/);
@@ -167,6 +186,10 @@ test("test_corrupt_metadata_is_not_overwritten", () => {
     checklist.executeTool(readArguments(testFixture));
     const mismatched = JSON.parse(fs.readFileSync(filePath, "utf8"));
     mismatched.session_key = "0".repeat(64);
+    mismatched.task_id = crypto.randomUUID();
+    fs.writeFileSync(filePath, `${JSON.stringify(mismatched)}\n`, "utf8");
+    assert.equal(checklist.executeTool(readArguments(testFixture)).task_id, mismatched.task_id);
+    mismatched.workspace_key = "0".repeat(64);
     fs.writeFileSync(filePath, `${JSON.stringify(mismatched)}\n`, "utf8");
     const mismatchedBefore = fs.readFileSync(filePath);
     assert.throws(() => checklist.executeTool(readArguments(testFixture)), /身份/);
