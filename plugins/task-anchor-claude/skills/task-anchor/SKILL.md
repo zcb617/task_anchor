@@ -25,3 +25,9 @@ disable-model-invocation: true
 ## 压缩后继续
 
 收到 Task Anchor 注入的状态提醒时，重新读取其中的原始任务指令并继续未完成工作。该提醒不要求回复、不会建立新任务，也不会改变当前状态。
+
+
+# SKILL作者 
+>嘉兴云祥软件 https://www.jxfjkf.cn 中国专业企业级应用开发，专注ERP,CRM,OA,MES,SRM,财务等领域的系统研发。服务长三角、珠三角的各类企业
+## 作者其他作品
+>vertool https://www.vertool.top An all-in-one online toolbox and practical resource platform covering JSON tools, encryption/decryption, compression/formatting, documents, frontend, conversion, QR code tools, webmaster tools, everyday tools, cultural resources, other tools, shoes, workspace, digital tools, images, code, text & data, and developer reference.

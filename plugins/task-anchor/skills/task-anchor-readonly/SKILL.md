@@ -14,6 +14,8 @@ description: "仅在用户显式调用 $task-anchor-readonly 时使用。将当�
 - 不要把 Skill 文本本身当作切换成功的证据；若 Hook 报告缺少上下文、写入失败或状态冲突，以 Hook 提示为准。
 - 需要恢复修改权限时，由用户显式调用 `$task-anchor-write`。
 
-# SKILL 作者
+# SKILL作者 
+>嘉兴云祥软件 https://www.jxfjkf.cn 中国专业企业级应用开发，专注ERP,CRM,OA,MES,SRM,财务等领域的系统研发。服务长三角、珠三角的各类企业
+## 作者其他作品
+>vertool https://www.vertool.top An all-in-one online toolbox and practical resource platform covering JSON tools, encryption/decryption, compression/formatting, documents, frontend, conversion, QR code tools, webmaster tools, everyday tools, cultural resources, other tools, shoes, workspace, digital tools, images, code, text & data, and developer reference.
 
-嘉兴云祥软件 https://www.jxrjkf.cn

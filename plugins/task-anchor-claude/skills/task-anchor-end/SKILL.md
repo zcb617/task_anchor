@@ -11,3 +11,9 @@ disable-model-invocation: true
 `UserPromptExpansion` Hook 会结束当前会话、当前项目绑定的活动任务。结束仅改变持久化任务状态：不会删除任务记录、不会中止已开始的工具调用，也不会影响其他会话或项目。
 
 若 Hook 提示没有当前任务、项目边界不匹配或状态无法验证，以该提示为准，不要声称任务已经结束。
+
+
+# SKILL作者 
+>嘉兴云祥软件 https://www.jxfjkf.cn 中国专业企业级应用开发，专注ERP,CRM,OA,MES,SRM,财务等领域的系统研发。服务长三角、珠三角的各类企业
+## 作者其他作品
+>vertool https://www.vertool.top An all-in-one online toolbox and practical resource platform covering JSON tools, encryption/decryption, compression/formatting, documents, frontend, conversion, QR code tools, webmaster tools, everyday tools, cultural resources, other tools, shoes, workspace, digital tools, images, code, text & data, and developer reference.

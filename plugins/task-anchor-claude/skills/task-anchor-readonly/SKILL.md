@@ -11,3 +11,9 @@ disable-model-invocation: true
 `UserPromptExpansion` Hook 会把当前会话、当前项目切换为只读。启用后，Task Anchor 会在修改型工具和任意命令执行前拒绝请求；只读检查工具仍可使用。
 
 该门控不会影响其他会话或项目，也不会替代 Claude Code 本身的权限、沙箱或审批。若 Hook 报告上下文缺失、写入失败或状态冲突，以 Hook 提示为准。用户可用 `/task-anchor:task-anchor-write` 解除这一门控。
+
+
+# SKILL作者 
+>嘉兴云祥软件 https://www.jxfjkf.cn 中国专业企业级应用开发，专注ERP,CRM,OA,MES,SRM,财务等领域的系统研发。服务长三角、珠三角的各类企业
+## 作者其他作品
+>vertool https://www.vertool.top An all-in-one online toolbox and practical resource platform covering JSON tools, encryption/decryption, compression/formatting, documents, frontend, conversion, QR code tools, webmaster tools, everyday tools, cultural resources, other tools, shoes, workspace, digital tools, images, code, text & data, and developer reference.
