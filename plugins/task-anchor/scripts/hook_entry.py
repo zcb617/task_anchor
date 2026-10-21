@@ -66,6 +66,11 @@ TASK_CHECKLIST_TOOL_NAMES = {
     "mcp__task_anchor__task_checklist",
     "mcp__task-anchor__task_checklist",
 }
+TASK_QUERY_TOOL_NAMES = {
+    "get_last_task",
+    "list_tasks",
+    "get_task",
+}
 FASTCTX_TOOL_NAME_PREFIX = "mcp__fastctx__"
 FASTCTX_READ_ONLY_TOOL_NAMES = {
     "mcp__fastctx__inspect_local_file",
@@ -298,6 +303,19 @@ def canonical_task_id(value: Any) -> str | None:
     return str(parsed) if str(parsed) == value else None
 
 
+def parse_task_created_at(value: Any) -> datetime:
+    """解析任务创建时间并确保其带有时区，供存储校验和排序共用。"""
+    if not isinstance(value, str):
+        raise StorageError("Task Anchor 的任务创建时间无效，已停止处理。")
+    try:
+        created_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise StorageError("Task Anchor 的任务创建时间无效，已停止处理。") from exc
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        raise StorageError("Task Anchor 的任务创建时间必须包含时区，已停止处理。")
+    return created_at
+
+
 def read_json_object(path: Path, message: str) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -502,6 +520,7 @@ def validate_metadata(
         raise StorageError("Task Anchor 的任务指令校验值无效，已停止恢复。")
     if not is_sha256_digest(metadata.get(WORKSPACE_SHA256_FIELD)):
         raise StorageError("Task Anchor 的既有任务记录没有项目边界绑定，已停止恢复。")
+    parse_task_created_at(metadata.get("created_at"))
     if type(metadata.get("status")) is not int or metadata["status"] not in {
         TASK_STATUS_ACTIVE,
         TASK_STATUS_CLOSED,
@@ -536,6 +555,37 @@ def read_all_task_metadata(
         validate_metadata(metadata, session_id, task_id)
         records[task_id] = metadata
     return records
+
+
+def sorted_task_metadata(records: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """按任务创建时间和真实 task_id 倒序排列当前会话任务。"""
+    ordered: list[tuple[datetime, str, dict[str, Any]]] = []
+    for task_id, metadata in records.items():
+        created_at = parse_task_created_at(metadata.get("created_at"))
+        ordered.append((created_at, task_id, metadata))
+    ordered.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [metadata for _, _, metadata in ordered]
+
+
+def task_metadata_summary(metadata: dict[str, Any]) -> dict[str, Any]:
+    """生成查询工具使用的任务摘要，避免暴露存储字段和指令摘要。"""
+    summary: dict[str, Any] = {
+        # 任务唯一身份，只读取已有任务记录中的真实 ID。
+        "task_id": metadata["task_id"],
+        # 创建排序依据，保留存储中的带时区时间。
+        "created_at": metadata["created_at"],
+        # 任务当前业务状态，供读取与清单写入策略判断。
+        "status": metadata["status"],
+        # 创建任务时的项目边界摘要。
+        WORKSPACE_SHA256_FIELD: metadata[WORKSPACE_SHA256_FIELD],
+    }
+    if "closed_at" in metadata:
+        # 任务关闭发生时间，仅已关闭记录携带。
+        summary["closed_at"] = metadata["closed_at"]
+    if "closed_reason" in metadata:
+        # 任务生命周期结束原因，仅已关闭记录携带。
+        summary["closed_reason"] = metadata["closed_reason"]
+    return summary
 
 
 def read_current_task_id(data_root: Path, session_id: str) -> str | None:
@@ -941,7 +991,7 @@ def end_current_task(
     return None
 
 
-# 在上下文压缩后注入连续性提醒，并仅恢复校验通过的当前活动任务。
+# 在上下文压缩后按真实创建时间恢复当前会话最新任务。
 def restore_after_post_compact(
     data: dict[str, Any],
     data_root: Path | None,
@@ -975,8 +1025,9 @@ def restore_after_post_compact(
                     "请重新显式调用 $task-anchor。"
                 )
 
-            task_id = read_current_task_id(data_root, current_session_id)
-            if task_id is None:
+            records = read_all_task_metadata(data_root, current_session_id)
+            ordered_metadata = sorted_task_metadata(records)
+            if not ordered_metadata:
                 if has_legacy_session_layout(data_root, current_session_id):
                     write_audit_event(data_root, data, "legacy_layout_skipped")
                     return post_compact_warning(
@@ -985,6 +1036,9 @@ def restore_after_post_compact(
                     )
                 write_audit_event(data_root, data, "restore_no_current_task")
                 return post_compact_output()
+
+            metadata_summary = ordered_metadata[0]
+            task_id = metadata_summary["task_id"]
 
             instruction, metadata = load_task(
                 data,
@@ -1013,8 +1067,8 @@ def restore_after_post_compact(
         "[Task Anchor 状态提醒]\n"
         f"- task_id: {task_id}\n"
         "- status: 1（进行中；自动完成状态无法验证）\n"
-        "- 若本会话可调用 update_plan，继续使用原生计划；若不可用，通过 task_checklist read 恢复当前任务清单。\n"
-        "- 清单路径以 task_checklist 工具返回的 path 为准，不扫描其他 task，也不创建新 task。\n"
+        "- 若本会话可调用 update_plan，继续使用原生计划；若不可用，调用 get_last_task 获取任务和对应清单。\n"
+        "- 仅使用 get_last_task 返回的当前任务与清单，不扫描其他会话或任务，也不创建新任务。\n"
         "- 清单全部完成不等于关闭 Task Anchor；任务生命周期仍由显式任务操作管理。\n"
         "- 本提醒不要求作答，不改变任务状态，也不阻断当前任务。\n\n"
         f"[最初任务指令]\n{instruction}"
@@ -1052,6 +1106,23 @@ def _is_task_checklist_tool(tool_name: str) -> bool:
     if normalized in {item.lower() for item in TASK_CHECKLIST_TOOL_NAMES}:
         return True
     return normalized.endswith("__task_checklist")
+
+
+def _is_task_query_tool(tool_name: str) -> bool:
+    """只识别 Task Anchor 自身的三个任务查询工具，避免拦截其他插件同名工具。"""
+    normalized = tool_name.strip().lower()
+    if normalized in TASK_QUERY_TOOL_NAMES:
+        return True
+    return any(
+        normalized == f"{prefix}{query_name}"
+        for prefix in (
+            "mcp__task_anchor__",
+            "mcp__task-anchor__",
+            "mcp__plugin_task-anchor__",
+            "mcp__plugin_task-anchor_task-anchor__",
+        )
+        for query_name in TASK_QUERY_TOOL_NAMES
+    )
 
 
 def _is_fastctx_tool(tool_name: str) -> bool:
@@ -1159,31 +1230,39 @@ def _bind_managed_exec_to_session(
     }
 
 
-def _bind_task_checklist_to_session(
+def _bind_task_anchor_read_to_session(
     data: dict[str, Any],
     data_root: Path | None,
 ) -> dict[str, Any]:
-    """在清单实际读写前校验当前完整工作目录，并注入目录绑定参数。"""
+    """按真实会话选择任务，并向清单或查询工具注入受校验的快照。"""
 
+    tool_name = _tool_name(data).strip().lower()
+    is_checklist_tool = _is_task_checklist_tool(tool_name)
+    rejected_event = "task_checklist_bind_rejected" if is_checklist_tool else "task_query_bind_rejected"
     current_cwd = data.get("cwd")
+    current_session_id = read_session_id(data)
     tool_input = _managed_exec_input(data)
-    if not isinstance(current_cwd, str) or not current_cwd.strip():
-        reason = "missing_cwd"
+    missing_reason = None
+    if data_root is None:
+        missing_reason = "missing_data_root"
+    elif current_session_id is None:
+        missing_reason = "missing_session_id"
+    elif not isinstance(current_cwd, str) or not current_cwd.strip():
+        missing_reason = "missing_cwd"
     elif tool_input is None:
-        reason = "missing_tool_input"
-    else:
-        reason = None
+        missing_reason = "missing_tool_input"
 
-    if reason is not None:
+    if missing_reason is not None:
         write_audit_event(
             data_root,
             data,
-            "task_checklist_bind_rejected",
-            reason=reason,
+            rejected_event,
+            reason=missing_reason,
         )
-        return _deny_read_only("task_checklist 缺少可信 Hook 上下文，已拒绝调用。")
+        return _deny_read_only("Task Anchor 查询或清单工具缺少真实 session、cwd、PLUGIN_DATA 或 tool_input，已拒绝调用。")
 
     assert isinstance(current_cwd, str)
+    assert current_session_id is not None
     assert tool_input is not None
     _, original_input = tool_input
     updated_input = dict(original_input)
@@ -1203,40 +1282,94 @@ def _bind_task_checklist_to_session(
             )
             return _deny_read_only("task_checklist 当前目录身份校验失败，已拒绝调用。")
 
-    normalized_cwd = resource_manager.normalize_path(current_cwd)
-    internal_session_id = f"directory:{normalized_cwd}"
-    internal_task_hex = hashlib.sha256(normalized_cwd.encode("utf-8")).hexdigest()[:32]
-    internal_task_hex = (
-        internal_task_hex[:12]
-        + "5"
-        + internal_task_hex[13:16]
-        + "8"
-        + internal_task_hex[17:]
-    )
-    internal_task_id = (
-        f"{internal_task_hex[:8]}-{internal_task_hex[8:12]}-"
-        f"{internal_task_hex[12:16]}-{internal_task_hex[16:20]}-"
-        f"{internal_task_hex[20:32]}"
-    )
-    resource_manager.set_active_context(
-        current_cwd,
-        internal_session_id,
-        internal_task_id,
-    )
-    updated_input["session_id"] = internal_session_id
-    updated_input["task_id"] = internal_task_id
+    assert data_root is not None
+    selected_task_id: str | None = None
+    try:
+        with session_lock(session_directory(data_root, current_session_id)):
+            if read_pending_transition(data_root, current_session_id) is not None:
+                raise StorageError("Task Anchor 检测到未完成的任务切换，查询暂不可用。")
+
+            records = read_all_task_metadata(data_root, current_session_id)
+            ordered_metadata = sorted_task_metadata(records)
+            summaries = [task_metadata_summary(metadata) for metadata in ordered_metadata]
+            selected_metadata: dict[str, Any] | None = None
+
+            if tool_name.endswith("__get_task") or tool_name == "get_task":
+                selected_task_id = canonical_task_id(original_input.get("task_id"))
+                if selected_task_id is None:
+                    raise StorageError("get_task 必须提供小写标准 UUID task_id。")
+                selected_metadata = records.get(selected_task_id)
+                if selected_metadata is None:
+                    raise StorageError("指定 task_id 不属于当前 Task Anchor 会话。")
+            elif is_checklist_tool and "task_id" in original_input:
+                selected_task_id = canonical_task_id(original_input.get("task_id"))
+                if selected_task_id is None:
+                    raise StorageError("指定 task_id 必须是小写标准 UUID。")
+                selected_metadata = records.get(selected_task_id)
+                if selected_metadata is None:
+                    raise StorageError("指定 task_id 不属于当前 Task Anchor 会话。")
+            elif not (tool_name.endswith("__list_tasks") or tool_name == "list_tasks"):
+                selected_metadata = ordered_metadata[0] if ordered_metadata else None
+
+            selected_task = None
+            if selected_metadata is not None:
+                selected_task_id = selected_metadata["task_id"]
+                instruction, validated_metadata = load_task(
+                    data,
+                    data_root,
+                    current_session_id,
+                    selected_task_id,
+                )
+                selected_task = {
+                    **task_metadata_summary(validated_metadata),
+                    # 用户显式创建该任务时提供的原始指令。
+                    "initial_instruction": instruction,
+                }
+
+            # 自动注入当前真实会话身份，覆盖模型提供的会话值。
+            updated_input["session_id"] = current_session_id
+            # 自动注入 Hook 校验过的完整工作目录。
+            updated_input["cwd"] = current_cwd
+            updated_input["task_context"] = {
+                # 真实会话 ID 的 SHA-256 摘要。
+                "session_key": session_key(current_session_id),
+                # 当前会话所有任务的创建时间倒序摘要。
+                "tasks": summaries,
+                # 当前读取工具选定的任务及最初指令；无任务时为空。
+                "task": selected_task,
+            }
+            if is_checklist_tool and selected_task_id is not None:
+                updated_input["task_id"] = selected_task_id
+    except LockUnavailable:
+        write_audit_event(
+            data_root,
+            data,
+            rejected_event,
+            reason="session_lock_unavailable",
+        )
+        return _deny_read_only("Task Anchor 会话任务正在切换，查询暂不可用。")
+    except StorageError as exc:
+        write_audit_event(
+            data_root,
+            data,
+            rejected_event,
+            reason=str(exc),
+        )
+        return _deny_read_only(str(exc))
+
     updated_input["cwd"] = current_cwd
     write_audit_event(
         data_root,
         data,
-        "task_checklist_bound",
+        "task_checklist_bound" if is_checklist_tool else "task_query_bound",
         cwd=current_cwd,
+        task_id=selected_task_id,
     )
     return {
         "hookSpecificOutput": {
             "hookEventName": PRE_TOOL_USE,
             "permissionDecision": "allow",
-            "permissionDecisionReason": "bound task_checklist to the current directory",
+            "permissionDecisionReason": "bound Task Anchor read to the current session and task snapshot",
             "updatedInput": updated_input,
         }
     }
@@ -1302,8 +1435,8 @@ def guard_pre_tool_use(
     tool_name = _tool_name(data)
     if _is_managed_exec_tool(tool_name):
         return _bind_managed_exec_to_session(data, data_root)
-    if _is_task_checklist_tool(tool_name):
-        return _bind_task_checklist_to_session(data, data_root)
+    if _is_task_checklist_tool(tool_name) or _is_task_query_tool(tool_name):
+        return _bind_task_anchor_read_to_session(data, data_root)
 
     if _is_excluded_project(data.get("cwd")):
         return None

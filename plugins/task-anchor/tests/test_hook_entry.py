@@ -350,53 +350,51 @@ class HookEntryTests(unittest.TestCase):
                     {"missing_session_id", "missing_tool_input", "explicit_session_id"},
                 )
 
-    def test_checklist_hook_binds_current_directory(self) -> None:
-        """验证任务清单 Hook 只为当前完整工作目录补齐可信 cwd。"""
-        task_id = self.activate("$task-anchor 清单绑定任务")
-        internal_task_id: str | None = None
-        for tool_name in (
-            "task_checklist",
-            "mcp__task_anchor__task_checklist",
-            "mcp__task-anchor__task_checklist",
-            "vendor__task_checklist",
-        ):
-            for container_key in ("tool_input", "toolInput", "input"):
-                payload = self.pre_tool_use(tool_name, {"operation": "read"})
-                if container_key != "tool_input":
-                    payload[container_key] = payload.pop("tool_input")
-                result = HOOK.handle_hook(payload, self.data_root)
+    def test_task_anchor_read_tools_bind_real_session_and_explicit_task(self) -> None:
+        """验证清单和三个查询工具都绑定真实会话及 Hook 选择的任务快照。"""
+        old_task_id = self.activate("$task-anchor 历史任务")
+        latest_task_id = self.activate("$task-anchor 最新任务")
+        cases = (
+            ("task_checklist", {"operation": "read", "session_id": "forged-session", "task_context": {"task": None}}, latest_task_id),
+            ("mcp__task_anchor__get_last_task", {"task_context": {"session_key": "forged"}}, latest_task_id),
+            ("mcp__task-anchor__list_tasks", {"task_context": {"tasks": []}}, None),
+            ("mcp__plugin_task-anchor_task-anchor__get_task", {"task_id": old_task_id}, old_task_id),
+            ("mcp__plugin_task-anchor__get_last_task", {}, latest_task_id),
+            ("vendor__task_checklist", {"operation": "read"}, latest_task_id),
+        )
+        for tool_name, tool_input, selected_task_id in cases:
+            with self.subTest(tool_name=tool_name):
+                result = HOOK.handle_hook(self.pre_tool_use(tool_name, tool_input), self.data_root)
                 self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "allow")
                 updated = result["hookSpecificOutput"]["updatedInput"]
+                self.assertEqual(updated["session_id"], self.session_id)
                 self.assertEqual(updated["cwd"], str(self.workspace))
+                self.assertEqual(updated["task_context"]["session_key"], HOOK.session_key(self.session_id))
+                self.assertEqual(updated["task_context"]["task"]["task_id"] if selected_task_id else updated["task_context"]["task"], selected_task_id)
                 self.assertEqual(
-                    updated["session_id"],
-                    f"directory:{HOOK.resource_manager.normalize_path(str(self.workspace))}",
+                    {task["task_id"] for task in updated["task_context"]["tasks"]},
+                    {old_task_id, latest_task_id},
                 )
-                self.assertEqual(str(uuid.UUID(updated["task_id"])), updated["task_id"])
-                if internal_task_id is None:
-                    internal_task_id = updated["task_id"]
-                self.assertEqual(updated["task_id"], internal_task_id)
-        self.assertEqual(self.audit_events()[-1]["status"], "task_checklist_bound")
+        self.assertIn("task_query_bound", [event["status"] for event in self.audit_events()])
+        self.assertIsNone(HOOK.handle_hook(self.pre_tool_use("vendor__get_task", {}), self.data_root))
 
-    def test_checklist_hook_allows_session_task_and_rejects_workspace(self) -> None:
-        """验证任务清单忽略 session/task，仍拒绝不同完整工作目录。"""
+    def test_task_anchor_read_rejects_foreign_task_and_workspace(self) -> None:
+        """验证显式历史任务只能选当前会话记录且不得跨项目读取。"""
         (self.other_workspace / ".git").mkdir()
-        task_id = self.activate("$task-anchor 清单隔离任务")
-        cases = (
-            ("foreign_session", {"session_id": "other-session"}, self.session_id, self.workspace),
-            ("foreign_task", {"task_id": str(uuid.uuid4())}, self.session_id, self.workspace),
-            ("foreign_workspace", {"cwd": str(self.other_workspace)}, self.session_id, self.workspace),
+        task_id = self.activate("$task-anchor 当前任务")
+        other_session = "other-session"
+        self.assertIsNone(HOOK.handle_hook(self.user_prompt("$task-anchor 另一个会话任务", session_id=other_session), self.data_root))
+        other_task_id = self.current_task_id(other_session)
+        foreign_task = HOOK.handle_hook(
+            self.pre_tool_use("get_task", {"task_id": other_task_id}), self.data_root
         )
-        for reason, tool_input, session_id, cwd in cases:
-            with self.subTest(reason=reason):
-                result = HOOK.handle_hook(
-                    self.pre_tool_use("task_checklist", tool_input, session_id=session_id, cwd=cwd),
-                    self.data_root,
-                )
-                expected = "deny" if reason == "foreign_workspace" else "allow"
-                self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], expected)
-                if expected == "deny":
-                    self.assertEqual(self.audit_events()[-1]["reason"], reason)
+        self.assertEqual(foreign_task["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("不属于当前 Task Anchor 会话", foreign_task["hookSpecificOutput"]["permissionDecisionReason"])
+        foreign_workspace = HOOK.handle_hook(
+            self.pre_tool_use("task_checklist", {"operation": "read", "task_id": task_id}, cwd=self.other_workspace),
+            self.data_root,
+        )
+        self.assertEqual(foreign_workspace["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(self.current_task_id(), task_id)
 
     def test_checklist_hook_rejects_same_basename_in_different_full_directories(self) -> None:
@@ -421,48 +419,45 @@ class HookEntryTests(unittest.TestCase):
         self.assertEqual(self.audit_events()[-1]["reason"], "foreign_workspace")
         self.assertFalse(HOOK.current_task_path(self.data_root, self.session_id).exists())
 
-    def test_checklist_hook_ignores_task_state_and_requires_directory_input(self) -> None:
-        """验证清单绑定不读取任务状态，仅要求 Hook 提供有效 cwd 和工具输入。"""
-        missing = HOOK.handle_hook(
-            self.pre_tool_use("task_checklist", {"operation": "read"}),
-            self.data_root,
-        )
-        self.assertEqual(missing["hookSpecificOutput"]["permissionDecision"], "allow")
-        self.assertEqual(missing["hookSpecificOutput"]["updatedInput"]["cwd"], str(self.workspace))
-        missing_data_root = self.pre_tool_use("task_checklist", {"operation": "read"})
+    def test_task_queries_require_real_context_and_allow_empty_latest_and_list(self) -> None:
+        """验证查询上下文缺失时拒绝，空会话的 latest/list 返回空快照。"""
+        for tool_name, tool_input in (("get_last_task", {}), ("list_tasks", {})):
+            result = HOOK.handle_hook(self.pre_tool_use(tool_name, tool_input), self.data_root)
+            self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "allow")
+            snapshot = result["hookSpecificOutput"]["updatedInput"]["task_context"]
+            self.assertEqual(snapshot["tasks"], [])
+            self.assertIsNone(snapshot["task"])
+        missing_task_id = HOOK.handle_hook(self.pre_tool_use("get_task", {}), self.data_root)
+        self.assertEqual(missing_task_id["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("必须提供", missing_task_id["hookSpecificOutput"]["permissionDecisionReason"])
+
+        missing_data_root = self.pre_tool_use("get_last_task", {})
         self.assertEqual(
-            HOOK._bind_task_checklist_to_session(missing_data_root, None)["hookSpecificOutput"]["permissionDecision"],
-            "allow",
+            HOOK._bind_task_anchor_read_to_session(missing_data_root, None)["hookSpecificOutput"]["permissionDecision"],
+            "deny",
         )
-        missing_session = self.pre_tool_use("task_checklist", {"operation": "read"})
+        missing_session = self.pre_tool_use("get_last_task", {})
         missing_session["session_id"] = None
         self.assertEqual(
-            HOOK._bind_task_checklist_to_session(missing_session, self.data_root)["hookSpecificOutput"]["permissionDecision"],
-            "allow",
+            HOOK._bind_task_anchor_read_to_session(missing_session, self.data_root)["hookSpecificOutput"]["permissionDecision"],
+            "deny",
         )
-        missing_cwd = self.pre_tool_use("task_checklist", {"operation": "read"})
+        missing_cwd = self.pre_tool_use("get_last_task", {})
         missing_cwd.pop("cwd")
         self.assertEqual(
-            HOOK._bind_task_checklist_to_session(missing_cwd, self.data_root)["hookSpecificOutput"]["permissionDecision"],
+            HOOK._bind_task_anchor_read_to_session(missing_cwd, self.data_root)["hookSpecificOutput"]["permissionDecision"],
             "deny",
         )
-        missing_tool_input = self.pre_tool_use("task_checklist", {"operation": "read"})
+        missing_tool_input = self.pre_tool_use("get_last_task", {})
         missing_tool_input.pop("tool_input")
         self.assertEqual(
-            HOOK._bind_task_checklist_to_session(missing_tool_input, self.data_root)["hookSpecificOutput"]["permissionDecision"],
+            HOOK._bind_task_anchor_read_to_session(missing_tool_input, self.data_root)["hookSpecificOutput"]["permissionDecision"],
             "deny",
         )
-        task_id = self.activate("$task-anchor 清单状态任务")
-        metadata = self.task_metadata(task_id)
-        metadata["status"] = HOOK.TASK_STATUS_CLOSED
-        self.write_task_metadata(task_id, metadata)
-        inactive = HOOK.handle_hook(
-            self.pre_tool_use("task_checklist", {"operation": "read"}),
-            self.data_root,
-        )
-        self.assertEqual(inactive["hookSpecificOutput"]["permissionDecision"], "allow")
-        metadata["status"] = HOOK.TASK_STATUS_ACTIVE
-        self.write_task_metadata(task_id, metadata)
+
+    def test_query_tools_reject_pending_transition(self) -> None:
+        """验证待完成任务切换期间不向读取工具暴露未成功任务。"""
+        self.activate("$task-anchor 当前任务")
         transition = {
             "schema_version": HOOK.SCHEMA_VERSION,
             HOOK.SESSION_KEY_FIELD: HOOK.session_key(self.session_id),
@@ -470,20 +465,29 @@ class HookEntryTests(unittest.TestCase):
             "old_task_ids": [],
         }
         HOOK.atomic_write_json(HOOK.transition_path(self.data_root, self.session_id), transition)
-        pending = HOOK.handle_hook(
-            self.pre_tool_use("task_checklist", {"operation": "read"}),
-            self.data_root,
-        )
-        self.assertEqual(pending["hookSpecificOutput"]["permissionDecision"], "allow")
+        for tool_name, tool_input in (("get_last_task", {}), ("list_tasks", {}), ("task_checklist", {"operation": "read"})):
+            result = HOOK.handle_hook(self.pre_tool_use(tool_name, tool_input), self.data_root)
+            self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertIn("未完成的任务切换", result["hookSpecificOutput"]["permissionDecisionReason"])
 
-    def test_checklist_post_compact_keeps_current_task_and_mentions_fallback(self) -> None:
-        """验证压缩恢复保留当前任务，并提示原生计划不可用时读取备用清单。"""
+    def test_query_rejects_task_created_at_without_timezone(self) -> None:
+        """验证会话任务记录缺少时区时查询明确失败，不忽略损坏记录。"""
+        task_id = self.activate("$task-anchor 损坏时间记录")
+        metadata = self.task_metadata(task_id)
+        metadata["created_at"] = "2026-04-01T00:00:00"
+        self.write_task_metadata(task_id, metadata)
+        result = HOOK.handle_hook(self.pre_tool_use("get_last_task", {}), self.data_root)
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("必须包含时区", result["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_checklist_post_compact_keeps_current_task_and_mentions_query(self) -> None:
+        """验证压缩恢复提醒原生计划不可用时调用最新任务查询。"""
         task_id = self.activate("$task-anchor 压缩后继续清单任务")
         result = HOOK.handle_hook(self.post_compact(), self.data_root)
         context = result["hookSpecificOutput"]["additionalContext"]
         self.assertIn(task_id, context)
         self.assertIn("update_plan", context)
-        self.assertIn("task_checklist read", context)
+        self.assertIn("get_last_task", context)
         self.assertIn("不等于关闭", context)
 
     def test_fastctx_replace_is_allowed_without_read_only_policy(self) -> None:
@@ -633,6 +637,54 @@ class HookEntryTests(unittest.TestCase):
         self.assertIn("自动完成状态无法验证", context)
         self.assertIn("不要求作答，不改变任务状态，也不阻断当前任务", context)
         self.assertNotIn("$task-anchor-end", context)
+
+    def test_last_task_and_compaction_use_created_at_order(self) -> None:
+        """验证查询和压缩恢复都按创建时间选择任务，不依赖当前任务指针。"""
+        newest_task_id = self.activate("$task-anchor 创建时间最新任务")
+        pointed_task_id = self.activate("$task-anchor 指针所指任务")
+        newest_metadata = self.task_metadata(newest_task_id)
+        newest_metadata["created_at"] = "2026-04-02T00:00:00+00:00"
+        newest_metadata["status"] = HOOK.TASK_STATUS_ACTIVE
+        newest_metadata.pop("closed_at", None)
+        newest_metadata.pop("closed_reason", None)
+        self.write_task_metadata(newest_task_id, newest_metadata)
+        pointed_metadata = self.task_metadata(pointed_task_id)
+        pointed_metadata["created_at"] = "2026-04-01T00:00:00+00:00"
+        pointed_metadata["status"] = HOOK.TASK_STATUS_CLOSED
+        self.write_task_metadata(pointed_task_id, pointed_metadata)
+
+        latest = HOOK.handle_hook(self.pre_tool_use("get_last_task", {}), self.data_root)
+        self.assertEqual(
+            latest["hookSpecificOutput"]["updatedInput"]["task_context"]["task"]["task_id"],
+            newest_task_id,
+        )
+        restored = HOOK.handle_hook(self.post_compact(), self.data_root)
+        context = restored["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(self.task_instruction(newest_task_id), context)
+        self.assertNotIn(self.task_instruction(pointed_task_id), context)
+
+    def test_closed_latest_task_does_not_restore_older_active_task(self) -> None:
+        """验证创建时间最新任务已结束时，不回退恢复较早的活动任务。"""
+        older_task_id = self.activate("$task-anchor 较早活动任务")
+        latest_task_id = self.activate("$task-anchor 最新已结束任务")
+        older_metadata = self.task_metadata(older_task_id)
+        older_metadata["status"] = HOOK.TASK_STATUS_ACTIVE
+        older_metadata["created_at"] = "2026-04-01T00:00:00+00:00"
+        older_metadata.pop("closed_at", None)
+        older_metadata.pop("closed_reason", None)
+        self.write_task_metadata(older_task_id, older_metadata)
+        latest_metadata = self.task_metadata(latest_task_id)
+        latest_metadata["status"] = HOOK.TASK_STATUS_CLOSED
+        latest_metadata["created_at"] = "2026-04-02T00:00:00+00:00"
+        latest_metadata["closed_at"] = "2026-04-03T00:00:00+00:00"
+        self.write_task_metadata(latest_task_id, latest_metadata)
+
+        restored = HOOK.handle_hook(self.post_compact(), self.data_root)
+        context = restored["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(context, HOOK.POST_COMPACT_CONTINUITY_REMINDER)
+        self.assertNotIn(self.task_instruction(older_task_id), context)
+        self.assertNotIn(self.task_instruction(latest_task_id), context)
+        self.assertIn("restore_closed", [event["status"] for event in self.audit_events()])
 
     def test_post_compact_uses_configured_reload_count_and_restores_task(self) -> None:
         """验证 Codex PostCompact 使用配置条数并保留任务恢复正文。"""

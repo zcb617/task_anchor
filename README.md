@@ -103,7 +103,7 @@ $task-anchor-write
 
 Codex 版通过 Node MCP 的 `managed_exec` 直接启动并登记真实命令，遵循上面的输出与生命周期语义；普通资源支持 `timeout_ms` 超时结束整棵进程树，`timeout_ms=null` 不自动超时。`stop_policy=keep` 资源必须设置 `name`，不受 Stop/SessionEnd 影响，须显式调用 `operation=stop` 停止。
 
-任务计划按双模式运行：本会话可调用 `update_plan` 时继续使用 Codex 原生计划；工具关闭、未暴露或明确不可调用时使用 `task_checklist` 备用清单。备用清单保存在 `~/.task_anchor/workspaces/<workspace_key>/tasks/<task_id>/checklist.json`，按 workspace、session、task 校验隔离，条目只有“待开始”和“已完成”两种状态。上下文压缩后沿用当前 task，清单全部完成不等于关闭 Task Anchor。
+任务计划按双模式运行：本会话可调用 `update_plan` 时继续使用 Codex 原生计划；工具关闭、未暴露或明确不可调用时，先用 `get_last_task` 获取当前会话最新任务和清单，返回 `task: null` 时不自行创建任务。MCP 独立提供 `get_last_task`、`list_tasks`、`get_task` 三个读取工具：最新任务按创建时间倒序确定，`get_task` 通过必填 `task_id` 读取当前会话指定历史任务。清单按真实会话、工作区和任务 ID 隔离，保存于 `~/.task_anchor/workspaces/<workspace_key>/tasks/<task_id>/checklist.json`；`task_id` 只由用户显式调用 `$task-anchor` 创建，查询和清单写入不生成 ID。写入清单时使用查询返回的真实 `task_id` 和 `expected_revision`。用户可通过 `$task-anchor-end` 结束任务，结束后仍可查询历史任务和清单。
 
 ## 测试
 

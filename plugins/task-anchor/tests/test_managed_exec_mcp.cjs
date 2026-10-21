@@ -19,12 +19,26 @@ function fixture() {
   process.env.TASK_ANCHOR_RUNTIME_ROOT = path.join(root, "runtime");
   const sessionId = `mcp-session-${manager.sha256Text(root)}`;
   const taskId = crypto.randomUUID();
+  const task = {
+    task_id: taskId,
+    created_at: manager.utcNow(),
+    status: 1,
+    workspace_sha256: manager.workspaceKey(workspace),
+    initial_instruction: "MCP fixture task",
+  };
+  const { initial_instruction, ...summary } = task;
+  const taskContext = {
+    session_key: manager.sessionKey(sessionId),
+    tasks: [summary],
+    task,
+  };
   manager.setActiveContext(workspace, sessionId, taskId);
   return {
     root,
     workspace,
     sessionId,
     taskId,
+    taskContext,
     restore() {
       manager.closeDb();
       if (previousRuntimeRoot === undefined) {
@@ -61,9 +75,18 @@ test("initialize, ping, tools/list, and notifications follow JSON-RPC contract",
   assert.equal(initialize.result.protocolVersion, "2025-06-18");
   assert.deepEqual(mcp.handleRequest({ jsonrpc: "2.0", id: 2, method: "ping" }).result, {});
   const tools = mcp.handleRequest({ jsonrpc: "2.0", id: 3, method: "tools/list" });
-  assert.equal(tools.result.tools.length, 2);
+  assert.equal(tools.result.tools.length, 5);
   assert.equal(tools.result.tools[0].name, "managed_exec");
   assert.equal(tools.result.tools[1].name, "task_checklist");
+  assert.deepEqual(tools.result.tools.slice(2).map((tool) => tool.name), ["get_last_task", "list_tasks", "get_task"]);
+  for (const tool of tools.result.tools.slice(2)) {
+    assert.equal(tool.inputSchema.required.includes("session_id"), false);
+    assert.equal(tool.inputSchema.required.includes("task_context"), false);
+  }
+  assert.deepEqual(tools.result.tools[2].inputSchema.required, ["cwd"]);
+  assert.deepEqual(tools.result.tools[3].inputSchema.required, ["cwd"]);
+  assert.deepEqual(tools.result.tools[4].inputSchema.required, ["cwd", "task_id"]);
+  assert.deepEqual(tools.result.tools[4].inputSchema.required.includes("task_id"), true);
   const inputSchema = tools.result.tools[0].inputSchema;
   assert.match(inputSchema.properties.operation.description, /run_id/);
   assert.match(inputSchema.properties.operation.description, /output/);
@@ -92,7 +115,7 @@ test("task_checklist MCP roundtrips the current task and keeps completion", asyn
       method: "tools/call",
       params: {
         name: "task_checklist",
-        arguments: { operation: "read", cwd: testFixture.workspace, session_id: testFixture.sessionId },
+        arguments: { operation: "read", cwd: testFixture.workspace, session_id: testFixture.sessionId, task_context: testFixture.taskContext },
       },
     });
     assert.equal(read.result.isError, false);
@@ -108,6 +131,7 @@ test("task_checklist MCP roundtrips the current task and keeps completion", asyn
           operation: "write",
           cwd: testFixture.workspace,
           session_id: testFixture.sessionId,
+          task_context: testFixture.taskContext,
           expected_revision: 0,
           items: [{ id: "one", text: "完成清单", status: "待开始" }],
         },
@@ -118,6 +142,34 @@ test("task_checklist MCP roundtrips the current task and keeps completion", asyn
     assert.deepEqual(written.result.structuredContent.items, [
       { id: "one", text: "完成清单", status: "待开始" },
     ]);
+  } finally {
+    testFixture.restore();
+  }
+});
+
+test("independent task query tools return the injected session snapshot", async () => {
+  const testFixture = fixture();
+  const query = async (name, argumentsObject = {}) => mcp.handleRequest({
+    jsonrpc: "2.0",
+    id: 11,
+    method: "tools/call",
+    params: { name, arguments: { cwd: testFixture.workspace, session_id: testFixture.sessionId, task_context: testFixture.taskContext, ...argumentsObject } },
+  });
+  try {
+    const last = await query("get_last_task");
+    assert.equal(last.result.isError, false);
+    assert.equal(last.result.structuredContent.task.task_id, testFixture.taskId);
+    assert.equal(last.result.structuredContent.task.checklist.task_id, testFixture.taskId);
+    const listed = await query("list_tasks");
+    assert.equal(listed.result.isError, false);
+    assert.deepEqual(listed.result.structuredContent.tasks.map((task) => task.task_id), [testFixture.taskId]);
+    const selected = await query("get_task", { task_id: testFixture.taskId });
+    assert.equal(selected.result.isError, false);
+    assert.equal(selected.result.structuredContent.task.task_id, testFixture.taskId);
+    const missing = await query("get_task");
+    assert.equal(missing.result.isError, true);
+    const foreign = await query("get_task", { task_id: crypto.randomUUID() });
+    assert.equal(foreign.result.isError, true);
   } finally {
     testFixture.restore();
   }

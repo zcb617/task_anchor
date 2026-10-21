@@ -437,19 +437,23 @@ function handleRequest(request, hooks = {}) {
             // 备用任务清单输入参数协议。
             inputSchema: taskChecklist.TOOL_SCHEMA,
           },
+          ...taskChecklist.QUERY_TOOLS,
         ],
       },
     };
   }
   if (method === "tools/call") {
     const parameters = request.params;
-    if (!parameters || typeof parameters !== "object" || ![TOOL_NAME, taskChecklist.TOOL_NAME].includes(parameters.name)) {
+    const queryToolNames = taskChecklist.QUERY_TOOLS.map((tool) => tool.name);
+    if (!parameters || typeof parameters !== "object" || ![TOOL_NAME, taskChecklist.TOOL_NAME, ...queryToolNames].includes(parameters.name)) {
       return errorResponse(-32602, "未知的工具。", requestId);
     }
     const argumentsObject = parameters.arguments === undefined ? {} : parameters.arguments;
-    if (parameters.name === taskChecklist.TOOL_NAME) {
+    if (parameters.name === taskChecklist.TOOL_NAME || queryToolNames.includes(parameters.name)) {
       return Promise.resolve()
-        .then(() => taskChecklist.executeTool(argumentsObject))
+        .then(() => parameters.name === taskChecklist.TOOL_NAME
+          ? taskChecklist.executeTool(argumentsObject)
+          : taskChecklist.executeQuery(parameters.name, argumentsObject))
         .then((result) => ({ jsonrpc: "2.0", id: requestId, result: toolResult(result) }))
         .catch((error) => ({
           jsonrpc: "2.0",
