@@ -72,6 +72,8 @@ claude plugin validate plugins/task-anchor-claude --strict
 
 Claude Code 的 `managed_exec` 通过 Node MCP 直接启动真实命令并绑定当前会话和项目，遵循上面的输出与生命周期语义。普通资源到达 `timeout_ms` 会结束整个进程树，`timeout_ms=null` 不自动超时；`stop_policy=keep` 必须设置 `name`，不受 timeout_ms、Stop/SessionEnd 影响，须显式调用 `operation=stop` 关闭。
 
+Claude Code 也提供 `get_last_task`、`list_tasks`、`get_task` 三个独立查询工具，以及带 revision 保护的 `task_checklist` 备用清单。任务按 `created_at` 选取最新项，查询与清单按真实会话、任务 UUID 和项目隔离；显式结束会保留历史记录，已结束任务只读。
+
 插件状态保存在 `${CLAUDE_PLUGIN_DATA}`；插件更新不会抹掉这些数据。
 
 ## Codex

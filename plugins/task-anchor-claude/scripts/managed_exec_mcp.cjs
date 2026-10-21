@@ -2,6 +2,7 @@
 
 const readline = require("node:readline");
 const resourceManager = require("./resource_manager.cjs");
+const taskChecklist = require("./task_checklist.cjs");
 
 // MCP 服务名称，保持旧 Python 服务的协议身份。
 const SERVER_NAME = "task-anchor";
@@ -428,17 +429,43 @@ function handleRequest(request, hooks = {}) {
             // 结构化输出协议。
             outputSchema: TOOL_OUTPUT_SCHEMA,
           },
+          {
+            // 备用清单工具名称。
+            name: taskChecklist.TOOL_NAME,
+            // 任务清单读写业务说明。
+            description: "在当前真实会话的 Task Anchor 任务中读取或更新备用清单，并使用 revision 防止覆盖并发进度。",
+            // 清单读写参数协议。
+            inputSchema: taskChecklist.TOOL_SCHEMA,
+          },
+          ...taskChecklist.QUERY_TOOLS.map((tool) => ({
+            // 当前真实会话中的独立任务查询工具。
+            ...tool,
+          })),
         ],
       },
     };
   }
   if (method === "tools/call") {
     const parameters = request.params;
-    if (!parameters || typeof parameters !== "object" || parameters.name !== TOOL_NAME) {
+    if (!parameters || typeof parameters !== "object" || typeof parameters.name !== "string") {
       return errorResponse(-32602, "未知的工具。", requestId);
     }
     const argumentsObject = parameters.arguments === undefined ? {} : parameters.arguments;
-    return executeTool(argumentsObject, hooks)
+    let execution;
+    try {
+      if (parameters.name === TOOL_NAME) {
+        execution = executeTool(argumentsObject, hooks);
+      } else if (parameters.name === taskChecklist.TOOL_NAME) {
+        execution = taskChecklist.executeTool(argumentsObject);
+      } else if (taskChecklist.QUERY_TOOLS.some((tool) => tool.name === parameters.name)) {
+        execution = taskChecklist.executeQuery(parameters.name, argumentsObject);
+      } else {
+        return errorResponse(-32602, "未知的工具。", requestId);
+      }
+    } catch (error) {
+      execution = Promise.reject(error);
+    }
+    return Promise.resolve(execution)
       .then((result) => ({ jsonrpc: "2.0", id: requestId, result: toolResult(result) }))
       .catch((error) => ({
         jsonrpc: "2.0",

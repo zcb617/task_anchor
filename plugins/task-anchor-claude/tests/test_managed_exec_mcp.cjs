@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -17,11 +18,43 @@ function fixture() {
   const previousRuntimeRoot = process.env.TASK_ANCHOR_RUNTIME_ROOT;
   process.env.TASK_ANCHOR_RUNTIME_ROOT = path.join(root, "runtime");
   const sessionId = `mcp-session-${manager.sha256Text(root)}`;
-  manager.setActiveContext(workspace, sessionId, "mcp-task");
+  const taskId = crypto.randomUUID();
+  const task = {
+    // 查询测试使用的真实格式任务 UUID。
+    task_id: taskId,
+    // 任务创建时间，为最新任务排序提供依据。
+    created_at: manager.utcNow(),
+    // 任务当前保持进行中。
+    status: 1,
+    // 任务绑定到本测试工作区。
+    workspace_sha256: manager.workspaceKey(workspace),
+    // 任务创建时用户提供的指令原文。
+    initial_instruction: "MCP 查询测试任务",
+  };
+  const taskContext = {
+    // 当前真实测试会话的摘要。
+    session_key: manager.sessionKey(sessionId),
+    // 查询工具使用的会话任务摘要列表。
+    tasks: [{
+      // 当前会话内任务的真实 UUID。
+      task_id: taskId,
+      // 任务创建时间。
+      created_at: task.created_at,
+      // 任务当前业务状态。
+      status: task.status,
+      // 创建任务时绑定的工作区身份摘要。
+      workspace_sha256: task.workspace_sha256,
+    }],
+    // Hook 已校验身份的当前所选任务。
+    task,
+  };
+  manager.setActiveContext(workspace, sessionId, taskId);
   return {
     root,
     workspace,
     sessionId,
+    taskId,
+    taskContext,
     restore() {
       if (previousRuntimeRoot === undefined) {
         delete process.env.TASK_ANCHOR_RUNTIME_ROOT;
@@ -63,7 +96,7 @@ test("initialize, ping, tools/list, and notifications follow JSON-RPC contract",
   assert.equal(initialize.result.protocolVersion, "2025-06-18");
   assert.deepEqual(mcp.handleRequest({ jsonrpc: "2.0", id: 2, method: "ping" }).result, {});
   const tools = mcp.handleRequest({ jsonrpc: "2.0", id: 3, method: "tools/list" });
-  assert.equal(tools.result.tools.length, 1);
+  assert.equal(tools.result.tools.length, 5);
   assert.equal(tools.result.tools[0].name, "managed_exec");
   const inputSchema = tools.result.tools[0].inputSchema;
   assert.match(inputSchema.properties.operation.description, /run_id/);
@@ -81,7 +114,85 @@ test("initialize, ping, tools/list, and notifications follow JSON-RPC contract",
   assert.equal(Object.hasOwn(runSchema.properties, "diagnostic_log_path"), false);
   assert.equal(runSchema.required.includes("diagnostic_log_path"), false);
   assert.equal(outputSchema.$defs.registeredResource.required.includes("diagnostic_log_path"), true);
+  const listedTools = new Map(tools.result.tools.map((tool) => [tool.name, tool]));
+  assert.deepEqual([...listedTools.keys()], ["managed_exec", "task_checklist", "get_last_task", "list_tasks", "get_task"]);
+  assert.deepEqual(listedTools.get("get_last_task").inputSchema.required, ["cwd"]);
+  assert.deepEqual(listedTools.get("list_tasks").inputSchema.required, ["cwd"]);
+  assert.deepEqual(listedTools.get("get_task").inputSchema.required, ["cwd", "task_id"]);
+  assert.equal(listedTools.get("get_last_task").inputSchema.properties.session_id.type, "string");
+  assert.equal(listedTools.get("get_last_task").inputSchema.properties.task_context.type, "object");
   assert.equal(mcp.handleRequest({ jsonrpc: "2.0", method: "ping" }), null);
+});
+
+test("task queries and checklist route through MCP with real session task identity", async () => {
+  const testFixture = fixture();
+  const baseArguments = {
+    // Hook 校验过的当前工作目录。
+    cwd: testFixture.workspace,
+    // Hook 注入的当前真实会话。
+    session_id: testFixture.sessionId,
+    // Hook 注入的真实任务快照。
+    task_context: testFixture.taskContext,
+  };
+  const callTool = async (name, argumentsObject) => mcp.handleRequest({
+    // MCP 请求协议版本。
+    jsonrpc: "2.0",
+    // 当前测试请求编号。
+    id: 20,
+    // 调用注册的 MCP 工具。
+    method: "tools/call",
+    // 工具名称和真实 Hook 参数。
+    params: { name, arguments: argumentsObject },
+  });
+  try {
+    const latestResponse = await callTool("get_last_task", baseArguments);
+    assert.equal(latestResponse.result.isError, false);
+    assert.equal(latestResponse.result.structuredContent.task.task_id, testFixture.taskId);
+    assert.equal(latestResponse.result.structuredContent.task.initial_instruction, "MCP 查询测试任务");
+    assert.equal(latestResponse.result.structuredContent.task.checklist.task_id, testFixture.taskId);
+
+    const listResponse = await callTool("list_tasks", baseArguments);
+    assert.deepEqual(listResponse.result.structuredContent.tasks.map((task) => task.task_id), [testFixture.taskId]);
+    assert.equal(Object.hasOwn(listResponse.result.structuredContent.tasks[0], "initial_instruction"), false);
+
+    const taskResponse = await callTool("get_task", { ...baseArguments, task_id: testFixture.taskId });
+    assert.equal(taskResponse.result.structuredContent.task.task_id, testFixture.taskId);
+
+    const writtenResponse = await callTool("task_checklist", {
+      ...baseArguments,
+      operation: "write",
+      expected_revision: 0,
+      items: [{ id: "step-1", text: "完成 Claude 查询接入", status: "已完成" }],
+    });
+    assert.equal(writtenResponse.result.isError, false);
+    assert.equal(writtenResponse.result.structuredContent.revision, 1);
+    const readResponse = await callTool("task_checklist", { ...baseArguments, operation: "read" });
+    assert.equal(readResponse.result.structuredContent.task_id, testFixture.taskId);
+    assert.deepEqual(readResponse.result.structuredContent.items, [
+      { id: "step-1", text: "完成 Claude 查询接入", status: "已完成" },
+    ]);
+
+    const missingIdResponse = await callTool("get_task", baseArguments);
+    assert.equal(missingIdResponse.result.isError, true);
+    const foreignIdResponse = await callTool("get_task", {
+      ...baseArguments,
+      task_id: crypto.randomUUID(),
+    });
+    assert.equal(foreignIdResponse.result.isError, true);
+    const unknownToolResponse = mcp.handleRequest({
+      // MCP 请求协议版本。
+      jsonrpc: "2.0",
+      // 未注册工具调用编号。
+      id: 21,
+      // 调用工具接口。
+      method: "tools/call",
+      // 未知工具名称。
+      params: { name: "vendor__get_task", arguments: {} },
+    });
+    assert.equal(unknownToolResponse.error.code, -32602);
+  } finally {
+    testFixture.restore();
+  }
 });
 
 test("tool errors stay in structured content and do not terminate the service", async () => {
@@ -375,9 +486,12 @@ test("tools/call returns the stable structured list and cleans timeout resources
     assert.equal(stopped.stopped.length, 1);
     assert.equal(manager.dbFindRecord(testFixture.workspace, resource.run_id), null);
   } finally {
-    if (resource) {
-      await mcp.executeTool({ operation: "stop", run_id: resource.run_id, cwd: testFixture.workspace, session_id: testFixture.sessionId, include_keep: true });
+    try {
+      if (resource && manager.dbFindRecord(testFixture.workspace, resource.run_id)) {
+        await mcp.executeTool({ operation: "stop", run_id: resource.run_id, cwd: testFixture.workspace, session_id: testFixture.sessionId, include_keep: true });
+      }
+    } finally {
+      testFixture.restore();
     }
-    testFixture.restore();
   }
 });

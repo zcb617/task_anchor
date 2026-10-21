@@ -352,13 +352,16 @@ test("keep and null timeout resources obey cleanup and explicit stop rules", asy
     assert.equal(stopped.stopped.length, 1);
     assert.equal(manager.processAlive(keep.pid), false);
   } finally {
-    if (keep) {
-      await manager.stopProcess({ cwd: testFixture.workspace, runId: keep.run_id, sessionId: testFixture.sessionId, includeKeep: true });
+    try {
+      if (keep && manager.dbFindRecord(testFixture.workspace, keep.run_id)) {
+        await manager.stopProcess({ cwd: testFixture.workspace, runId: keep.run_id, sessionId: testFixture.sessionId, includeKeep: true });
+      }
+      if (noTimeout && manager.dbFindRecord(testFixture.workspace, noTimeout.run_id)) {
+        await manager.stopProcess({ cwd: testFixture.workspace, runId: noTimeout.run_id, sessionId: testFixture.sessionId, includeKeep: true });
+      }
+    } finally {
+      testFixture.restore();
     }
-    if (noTimeout) {
-      await manager.stopProcess({ cwd: testFixture.workspace, runId: noTimeout.run_id, sessionId: testFixture.sessionId, includeKeep: true });
-    }
-    testFixture.restore();
   }
 });
 
@@ -423,13 +426,16 @@ test("session isolation prevents cleanup from stopping another session", async (
     assert.equal(manager.processAlive(second.pid), true);
     assert.deepEqual(manager.listProcesses({ cwd: testFixture.workspace, sessionId: otherSession }).map((item) => item.run_id), [second.run_id]);
   } finally {
-    if (first) {
-      await manager.stopProcess({ cwd: testFixture.workspace, runId: first.run_id, sessionId: testFixture.sessionId, includeKeep: true });
+    try {
+      if (first && manager.dbFindRecord(testFixture.workspace, first.run_id)) {
+        await manager.stopProcess({ cwd: testFixture.workspace, runId: first.run_id, sessionId: testFixture.sessionId, includeKeep: true });
+      }
+      if (second && manager.dbFindRecord(testFixture.workspace, second.run_id)) {
+        await manager.stopProcess({ cwd: testFixture.workspace, runId: second.run_id, sessionId: otherSession, includeKeep: true });
+      }
+    } finally {
+      testFixture.restore();
     }
-    if (second) {
-      await manager.stopProcess({ cwd: testFixture.workspace, runId: second.run_id, sessionId: otherSession, includeKeep: true });
-    }
-    testFixture.restore();
   }
 });
 

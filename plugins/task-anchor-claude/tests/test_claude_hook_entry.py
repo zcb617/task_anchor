@@ -255,6 +255,278 @@ class ClaudeHookEntryTests(unittest.TestCase):
                     )
                 )
 
+    def test_task_queries_bind_real_session_and_preserve_explicit_history_id(self) -> None:
+        """验证三个任务查询覆写伪造快照，并允许读取当前会话历史任务。"""
+        self.expand("task-anchor:task-anchor", "创建历史任务")
+        old_task_id = self.current_task_id()
+        self.expand("task-anchor:task-anchor", "创建最新任务")
+        latest_task_id = self.current_task_id()
+
+        forged_input = {
+            "cwd": str(self.workspace),
+            "session_id": "model-forged-session",
+            "task_context": {"session_key": "0" * 64, "tasks": [], "task": None},
+        }
+        latest_result = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="mcp__plugin_task-anchor_task-anchor__get_last_task",
+                tool_input=forged_input,
+            ),
+            self.data_root,
+        )
+        self.assertEqual(latest_result["hookSpecificOutput"]["permissionDecision"], "allow")
+        latest_bound = latest_result["hookSpecificOutput"]["updatedInput"]
+        self.assertEqual(latest_bound["session_id"], self.session_id)
+        self.assertEqual(latest_bound["task_context"]["task"]["task_id"], latest_task_id)
+        self.assertEqual(latest_bound["task_context"]["task"]["initial_instruction"], "创建最新任务")
+
+        list_result = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="mcp__plugin_task-anchor_task-anchor__list_tasks",
+                tool_input=forged_input,
+            ),
+            self.data_root,
+        )
+        listed_context = list_result["hookSpecificOutput"]["updatedInput"]["task_context"]
+        self.assertEqual([task["task_id"] for task in listed_context["tasks"]], [latest_task_id, old_task_id])
+        self.assertIsNone(listed_context["task"])
+        self.assertNotIn("initial_instruction", listed_context["tasks"][0])
+
+        historical_result = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="mcp__plugin_task-anchor_task-anchor__get_task",
+                tool_input={**forged_input, "task_id": old_task_id},
+            ),
+            self.data_root,
+        )
+        historical_bound = historical_result["hookSpecificOutput"]["updatedInput"]
+        self.assertEqual(historical_bound["task_id"], old_task_id)
+        self.assertEqual(historical_bound["task_context"]["task"]["task_id"], old_task_id)
+        self.assertEqual(historical_bound["task_context"]["task"]["initial_instruction"], "创建历史任务")
+
+    def test_task_queries_reject_foreign_session_workspace_and_malformed_ids(self) -> None:
+        """验证任务查询拒绝跨会话 UUID、跨项目读取和非标准 UUID。"""
+        self.expand("task-anchor:task-anchor", "当前会话任务")
+        current_task_id = self.current_task_id()
+        other_session_id = f"session-{uuid.uuid4()}"
+        other_task_result = HOOK.handle_hook(
+            self.payload(
+                "UserPromptExpansion",
+                command_name="task-anchor:task-anchor",
+                command_args="其他会话任务",
+                session_id=other_session_id,
+            ),
+            self.data_root,
+        )
+        self.assertIsNone(other_task_result)
+        other_task_directory = STATE.tasks_directory(self.data_root, other_session_id)
+        foreign_task_id = next(path.name for path in other_task_directory.iterdir() if path.is_dir())
+
+        foreign_result = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="mcp__plugin_task-anchor_task-anchor__get_task",
+                tool_input={"task_id": foreign_task_id},
+            ),
+            self.data_root,
+        )
+        self.assertEqual(foreign_result["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        workspace_result = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                cwd=str(self.other_workspace),
+                tool_name="mcp__plugin_task-anchor_task-anchor__get_task",
+                tool_input={"cwd": str(self.other_workspace), "task_id": current_task_id},
+            ),
+            self.data_root,
+        )
+        self.assertEqual(workspace_result["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("跨项目", workspace_result["hookSpecificOutput"]["permissionDecisionReason"])
+
+        malformed_result = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="mcp__plugin_task-anchor_task-anchor__get_task",
+                tool_input={"task_id": "NOT-A-UUID"},
+            ),
+            self.data_root,
+        )
+        self.assertEqual(malformed_result["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_task_queries_empty_results_and_missing_context_fail_closed(self) -> None:
+        """验证空任务返回空快照且查询上下文缺失时拒绝读取。"""
+        for tool_name in (
+            "mcp__plugin_task-anchor_task-anchor__get_last_task",
+            "mcp__plugin_task-anchor_task-anchor__list_tasks",
+        ):
+            with self.subTest(tool_name=tool_name):
+                result = HOOK.handle_hook(
+                    self.payload("PreToolUse", tool_name=tool_name, tool_input={"cwd": str(self.workspace)}),
+                    self.data_root,
+                )
+                bound = result["hookSpecificOutput"]["updatedInput"]
+                self.assertEqual(bound["task_context"]["tasks"], [])
+                self.assertIsNone(bound["task_context"]["task"])
+
+        missing_id = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="mcp__plugin_task-anchor_task-anchor__get_task",
+                tool_input={"cwd": str(self.workspace)},
+            ),
+            self.data_root,
+        )
+        self.assertEqual(missing_id["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        missing_session = self.payload(
+            "PreToolUse",
+            tool_name="mcp__plugin_task-anchor_task-anchor__list_tasks",
+            tool_input={"cwd": str(self.workspace)},
+        )
+        missing_session.pop("session_id")
+        self.assertEqual(
+            HOOK.handle_hook(missing_session, self.data_root)["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
+
+        missing_cwd = self.payload(
+            "PreToolUse",
+            tool_name="mcp__plugin_task-anchor_task-anchor__list_tasks",
+            tool_input={},
+        )
+        missing_cwd.pop("cwd")
+        self.assertEqual(
+            HOOK.handle_hook(missing_cwd, self.data_root)["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
+
+        missing_input = self.payload(
+            "PreToolUse",
+            tool_name="mcp__plugin_task-anchor_task-anchor__list_tasks",
+        )
+        self.assertEqual(
+            HOOK.handle_hook(missing_input, self.data_root)["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
+        missing_data_root = HOOK.handle_hook(
+            self.payload(
+                "PreToolUse",
+                tool_name="mcp__plugin_task-anchor_task-anchor__list_tasks",
+                tool_input={"cwd": str(self.workspace)},
+            ),
+            None,
+        )
+        self.assertEqual(missing_data_root["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_task_queries_reject_pending_transition(self) -> None:
+        """验证任务切换待完成期间查询不会恢复或暴露待激活任务。"""
+        with patch.object(
+            STATE,
+            "read_pending_transition",
+            return_value={"new_task_id": str(uuid.uuid4())},
+        ):
+            result = HOOK.handle_hook(
+                self.payload(
+                    "PreToolUse",
+                    tool_name="mcp__plugin_task-anchor_task-anchor__get_last_task",
+                    tool_input={"cwd": str(self.workspace)},
+                ),
+                self.data_root,
+            )
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(result["hookSpecificOutput"].get("updatedInput"))
+
+    def test_latest_task_uses_created_at_for_both_compaction_events(self) -> None:
+        """验证 PostCompact 和 SessionStart compact 均依据 created_at 选择最新任务。"""
+        self.expand("task-anchor:task-anchor", "较早任务指令")
+        earlier_task_id = self.current_task_id()
+        self.expand("task-anchor:task-anchor", "当前指针任务指令")
+        pointed_task_id = self.current_task_id()
+
+        earlier_metadata_path = STATE.task_metadata_path(self.data_root, self.session_id, earlier_task_id)
+        earlier_metadata = json.loads(earlier_metadata_path.read_text(encoding="utf-8"))
+        earlier_metadata["status"] = STATE.TASK_STATUS_ACTIVE
+        earlier_metadata.pop("closed_at", None)
+        earlier_metadata.pop("closed_reason", None)
+        earlier_metadata["created_at"] = "2027-01-01T00:00:00+00:00"
+        earlier_metadata_path.write_text(json.dumps(earlier_metadata), encoding="utf-8")
+        pointed_metadata_path = STATE.task_metadata_path(self.data_root, self.session_id, pointed_task_id)
+        pointed_metadata = json.loads(pointed_metadata_path.read_text(encoding="utf-8"))
+        pointed_metadata["created_at"] = "2026-01-01T00:00:00+00:00"
+        pointed_metadata_path.write_text(json.dumps(pointed_metadata), encoding="utf-8")
+        self.assertEqual(self.current_task_id(), pointed_task_id)
+
+        post_compact = HOOK.handle_hook(
+            self.payload("PostCompact", trigger="auto"), self.data_root
+        )
+        post_context = post_compact["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(f"task_id: {earlier_task_id}", post_context)
+        self.assertIn("较早任务指令", post_context)
+        session_start = HOOK.handle_hook(
+            self.payload("SessionStart", source="compact"), self.data_root
+        )
+        self.assertIsInstance(session_start, str)
+        self.assertIn(f"task_id: {earlier_task_id}", session_start)
+        self.assertIn("较早任务指令", session_start)
+
+    def test_closed_latest_task_never_restores_an_older_active_task(self) -> None:
+        """验证两个压缩入口遇到最新任务已结束时不会回退恢复旧任务。"""
+        self.expand("task-anchor:task-anchor", "已被替换的旧任务")
+        self.expand("task-anchor:task-anchor", "最新但已结束的任务")
+        latest_task_id = self.current_task_id()
+        latest_metadata_path = STATE.task_metadata_path(self.data_root, self.session_id, latest_task_id)
+        latest_metadata = json.loads(latest_metadata_path.read_text(encoding="utf-8"))
+        latest_metadata["status"] = STATE.TASK_STATUS_CLOSED
+        latest_metadata["closed_at"] = "2026-02-01T00:00:00+00:00"
+        latest_metadata["closed_reason"] = STATE.CLOSED_REASON_MANUAL
+        latest_metadata_path.write_text(json.dumps(latest_metadata), encoding="utf-8")
+
+        post_compact = HOOK.handle_hook(
+            self.payload("PostCompact", trigger="manual"), self.data_root
+        )
+        post_context = post_compact["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(STATE.POST_COMPACT_CONTINUITY_REMINDER, post_context)
+        self.assertNotIn("[最初任务指令]", post_context)
+        self.assertNotIn("已被替换的旧任务", post_context)
+        session_start = HOOK.handle_hook(
+            self.payload("SessionStart", source="compact"), self.data_root
+        )
+        self.assertIsInstance(session_start, str)
+        self.assertIn(STATE.POST_COMPACT_CONTINUITY_REMINDER, session_start)
+        self.assertNotIn("task_id:", session_start)
+        self.assertNotIn("已被替换的旧任务", session_start)
+
+    def test_start_replaces_old_task_and_end_preserves_history(self) -> None:
+        """验证显式创建会关闭旧任务，显式结束仅关闭记录并保留历史。"""
+        self.expand("task-anchor:task-anchor", "生命周期旧任务")
+        old_task_id = self.current_task_id()
+        self.expand("task-anchor:task-anchor", "生命周期新任务")
+        new_task_id = self.current_task_id()
+        old_metadata = json.loads(
+            STATE.task_metadata_path(self.data_root, self.session_id, old_task_id).read_text(encoding="utf-8")
+        )
+        new_metadata = json.loads(
+            STATE.task_metadata_path(self.data_root, self.session_id, new_task_id).read_text(encoding="utf-8")
+        )
+        self.assertEqual(old_metadata["status"], STATE.TASK_STATUS_CLOSED)
+        self.assertEqual(new_metadata["status"], STATE.TASK_STATUS_ACTIVE)
+
+        self.assertIsNone(self.expand("task-anchor:task-anchor-end"))
+        ended_old = json.loads(
+            STATE.task_metadata_path(self.data_root, self.session_id, old_task_id).read_text(encoding="utf-8")
+        )
+        ended_new = json.loads(
+            STATE.task_metadata_path(self.data_root, self.session_id, new_task_id).read_text(encoding="utf-8")
+        )
+        self.assertEqual(ended_old["status"], STATE.TASK_STATUS_CLOSED)
+        self.assertEqual(ended_new["status"], STATE.TASK_STATUS_CLOSED)
+        self.assertTrue(STATE.task_instruction_path(self.data_root, self.session_id, old_task_id).is_file())
+        self.assertTrue(STATE.task_instruction_path(self.data_root, self.session_id, new_task_id).is_file())
+
     def test_post_compact_invalid_reload_count_uses_default(self) -> None:
         """验证 Claude Code PostCompact 的非法条数回退默认值。"""
         instruction = "非法配置仍恢复 Claude Code 当前任务"
@@ -835,14 +1107,9 @@ class ClaudeHookEntryTests(unittest.TestCase):
 
 
 class ClaudePluginContractTests(unittest.TestCase):
-    def test_manifest_and_marketplace_are_claude_code_layouts(self) -> None:
+    def test_manifest_is_self_contained_claude_code_layout(self) -> None:
         manifest = json.loads(
             (PLUGIN_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
-        )
-        marketplace = json.loads(
-            (PLUGIN_ROOT.parents[1] / ".claude-plugin" / "marketplace.json").read_text(
-                encoding="utf-8"
-            )
         )
         self.assertEqual(manifest["name"], "task-anchor")
         self.assertNotIn("skills", manifest)
@@ -851,7 +1118,7 @@ class ClaudePluginContractTests(unittest.TestCase):
         self.assertTrue((PLUGIN_ROOT / "skills").is_dir())
         self.assertTrue((PLUGIN_ROOT / "hooks" / "hooks.json").is_file())
         self.assertTrue((PLUGIN_ROOT / ".mcp.json").is_file())
-        self.assertEqual(marketplace["plugins"][0]["source"], "./plugins/task-anchor-claude")
+        self.assertTrue((PLUGIN_ROOT / "scripts" / "task_checklist.cjs").is_file())
 
     def test_claude_hook_events_and_skill_visibility_are_registered(self) -> None:
         config = json.loads((PLUGIN_ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))

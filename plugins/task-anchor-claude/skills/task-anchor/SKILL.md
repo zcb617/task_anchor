@@ -12,9 +12,11 @@ disable-model-invocation: true
 
 ## 推进规则
 
-1. 在开始实质工作前，使用 Claude Code 的计划能力建立并维护工作计划。
-2. 用户明确改变目标、约束或方向时，以较新的明确指令为准。
-3. 不要把普通交付、工具调用完成、计划清空、最终回复、`Stop` 或 `SessionEnd` 当作任务完成；任务只会被 `/task-anchor:task-anchor-end` 明确结束，或被下一个锚定任务取代。
+1. 宿主原生计划工具可用时，优先使用并维护原生计划；否则调用 `get_last_task` 读取当前任务、原始指令和清单。结果为 `task: null` 时不要自行创建任务。
+2. `get_last_task` 查询创建时间最新的任务，`list_tasks` 按创建时间倒序列出当前会话的任务摘要，`get_task` 使用当前会话内明确的 `task_id` 读取历史任务。前三个工具都不需要模型提供会话 ID；只有 `get_task` 需要任务 UUID。
+3. 没有原生计划能力时，使用 `task_checklist` 维护备用进度：通过 `operation: "read"` 读取，或用 `operation: "write"` 提交完整 `items` 和当前 `expected_revision`。写入后保留返回的真实 `task_id`、`revision` 和 `items`，后续更新沿用 revision 并保留已完成条目。
+4. 用户明确改变目标、约束或方向时，以较新的明确指令为准。
+5. 任务按 `created_at` 判断最新项；已结束任务只允许读取。普通交付、工具调用完成、计划清空、最终回复、`Stop` 或 `SessionEnd` 都不结束任务；只有显式调用 `/task-anchor:task-anchor-end`（`-end`）结束当前任务，或显式创建下一个锚定任务时，旧任务才结束。
 
 ## 受管命令执行
 
@@ -24,7 +26,7 @@ disable-model-invocation: true
 
 ## 压缩后继续
 
-收到 Task Anchor 注入的状态提醒时，重新读取其中的原始任务指令并继续未完成工作。该提醒不要求回复、不会建立新任务，也不会改变当前状态。
+收到 Task Anchor 注入的状态提醒时，先按原生计划工具是否可用选择原生计划或调用 `get_last_task` 恢复进度，再读取提醒中的原始任务指令并继续未完成工作。`get_last_task` 为空时不要自行创建任务；该提醒不要求回复、不会建立新任务，也不会改变当前状态。
 
 
 # SKILL作者 
